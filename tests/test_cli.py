@@ -697,6 +697,94 @@ class TestBuildCollectionEmbeddingFailure:
         assert any("semantic search disabled" in r.message for r in caplog.records)
 
 
+class TestBuildCollectionConfigFields:
+    """`_build_collection` must propagate every field `CollectionConfig.to_collection_kwargs` produces.
+
+    Regression tests for a bug where the CLI path hardcoded a subset of kwargs
+    (``source_dir``, ``read_only``, ``index_path``, ``embeddings_path``,
+    ``embedding_provider``, ``state_path``, ``indexed_frontmatter_fields``,
+    ``required_frontmatter``) and silently dropped the rest — including
+    ``exclude_patterns``, ``attachment_extensions``, and
+    ``max_attachment_size_mb``. All CLI subcommands (``index``, ``reindex``,
+    ``search``) that route through ``_build_collection`` were affected, so
+    ``MARKDOWN_VAULT_MCP_EXCLUDE`` was silently ignored on the CLI side even
+    though the serve path via ``_server_deps.make_collection_lifespan`` honored
+    it correctly.
+    """
+
+    def test_exclude_patterns_propagated_from_env(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``MARKDOWN_VAULT_MCP_EXCLUDE`` reaches ``Collection._exclude_patterns``."""
+        from markdown_vault_mcp.cli import _build_collection
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(vault))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_EXCLUDE", "**/*.log.md,.obsidian/**")
+
+        args = _build_parser().parse_args(["index"])
+        collection = _build_collection(args)
+
+        assert collection._exclude_patterns == ["**/*.log.md", ".obsidian/**"]
+
+    def test_attachment_fields_propagated_from_env(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``MARKDOWN_VAULT_MCP_ATTACHMENT_*`` env vars reach the Collection."""
+        from markdown_vault_mcp.cli import _build_collection
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(vault))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_ATTACHMENT_EXTENSIONS", ".pdf,.png,.jpg")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_MAX_ATTACHMENT_SIZE_MB", "25")
+
+        args = _build_parser().parse_args(["index"])
+        collection = _build_collection(args)
+
+        assert collection._attachment_extensions == [".pdf", ".png", ".jpg"]
+        assert collection._max_attachment_size_mb == 25.0
+
+    def test_exclude_patterns_are_functional_via_cli_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Behavioural regression: Collection built via the CLI actually excludes.
+
+        The bug was that ``_build_collection`` constructed the Collection
+        without ``exclude_patterns``, so
+        :meth:`~markdown_vault_mcp.collection.Collection._is_path_excluded`
+        always returned ``False`` — because ``self._exclude_patterns`` was
+        ``None``. Assert the exclusion logic is live end-to-end.
+        """
+        from markdown_vault_mcp.cli import _build_collection
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(vault))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_EXCLUDE", "**/*.log.md,.obsidian/**")
+
+        args = _build_parser().parse_args(["index"])
+        collection = _build_collection(args)
+
+        # These should be excluded via the newly-propagated patterns.
+        assert collection._is_path_excluded("sessions/2026-04-09/chat.log.md") is True
+        assert collection._is_path_excluded(".obsidian/workspace.json.md") is True
+
+        # And these should still pass through unaffected.
+        assert collection._is_path_excluded("notes/alpha.md") is False
+        assert collection._is_path_excluded("decisions/2026-04-09-auth.md") is False
+
+
 class TestCmdSearchJsonOutput:
     """Verify --json flag in _cmd_search produces valid parseable output."""
 

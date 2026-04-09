@@ -47,8 +47,11 @@ def _normalise_http_path(path: str | None) -> str:
 def _build_collection(args: argparse.Namespace) -> Collection:
     """Build a Collection from environment variables and CLI overrides.
 
-    CLI arguments ``--source-dir`` and ``--index-path`` override the
-    corresponding environment variables when provided.
+    Delegates to :meth:`~markdown_vault_mcp.config.CollectionConfig.to_collection_kwargs`
+    so the CLI path stays in sync with the server path in
+    :func:`~markdown_vault_mcp._server_deps.make_collection_lifespan`. CLI
+    arguments ``--source-dir`` and ``--index-path`` override the corresponding
+    environment variables when provided.
 
     Args:
         args: Parsed CLI arguments (may contain ``source_dir`` and
@@ -63,33 +66,26 @@ def _build_collection(args: argparse.Namespace) -> Collection:
         os.environ[f"{_ENV_PREFIX}_SOURCE_DIR"] = source_dir_override
 
     config = load_config()
+    kwargs = config.to_collection_kwargs()
 
-    # CLI --index-path overrides env var.
+    # CLI --index-path overrides env var / config default.
     index_path_override = getattr(args, "index_path", None)
-    index_path = Path(index_path_override) if index_path_override else config.index_path
+    if index_path_override:
+        kwargs["index_path"] = Path(index_path_override)
 
-    embedding_provider = None
+    # Resolve embedding provider if embeddings_path is configured.
     if config.embeddings_path is not None:
         try:
             from markdown_vault_mcp.providers import get_embedding_provider
 
-            embedding_provider = get_embedding_provider()
+            kwargs["embedding_provider"] = get_embedding_provider()
         except Exception:
             logger.warning(
                 "Could not load embedding provider; semantic search disabled",
                 exc_info=True,
             )
 
-    return Collection(
-        source_dir=config.source_dir,
-        read_only=config.read_only,
-        index_path=index_path,
-        embeddings_path=config.embeddings_path,
-        embedding_provider=embedding_provider,
-        state_path=config.state_path,
-        indexed_frontmatter_fields=config.indexed_frontmatter_fields,
-        required_frontmatter=config.required_frontmatter,
-    )
+    return Collection(**kwargs)
 
 
 def _cmd_serve(args: argparse.Namespace) -> None:
