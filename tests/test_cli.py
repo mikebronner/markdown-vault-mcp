@@ -743,13 +743,13 @@ class TestBuildCollectionConfigFields:
         vault.mkdir()
 
         monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(vault))
-        monkeypatch.setenv("MARKDOWN_VAULT_MCP_ATTACHMENT_EXTENSIONS", ".pdf,.png,.jpg")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_ATTACHMENT_EXTENSIONS", "pdf,png,jpg")
         monkeypatch.setenv("MARKDOWN_VAULT_MCP_MAX_ATTACHMENT_SIZE_MB", "25")
 
         args = _build_parser().parse_args(["index"])
         collection = _build_collection(args)
 
-        assert collection._attachment_extensions == [".pdf", ".png", ".jpg"]
+        assert collection._attachment_extensions == ["pdf", "png", "jpg"]
         assert collection._max_attachment_size_mb == 25.0
 
     def test_exclude_patterns_are_functional_via_cli_path(
