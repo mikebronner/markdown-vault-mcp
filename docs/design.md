@@ -212,7 +212,13 @@ for built-in names, or pass a custom instance.
 **Hash-based**, not git-based. Works with any directory, no git dependency.
 
 - **State file** (the JSON persistence layer for hash-based change detection):
-  `{relative_path: sha256_hash}` as JSON.
+  `{"version": 2, "indexed": {relative_path: sha256_hash}, "skipped": {relative_path: sha256_hash}}`
+  as JSON. The `skipped` map records files seen on disk but deliberately not
+  indexed (missing required frontmatter, excluded, unparseable), so they are
+  not re-reported as added — and their skips not re-logged — on every scan; a
+  skipped file is re-evaluated only when its content hash changes. The legacy
+  flat format (`{relative_path: sha256_hash}`) still loads, with all entries
+  treated as indexed.
 - **Default path**: `{source_dir}/.markdown_vault_mcp/state.json` (when
   `state_path=None`).
 - On `reindex()`: scan all files, compare hashes to stored state, re-parse and
@@ -240,12 +246,37 @@ Two methods manage the index:
 
 - **`build_index(force=False)`**: initial population. Scans `source_dir` and
   builds the FTS index. If the index already has data and `force=False`, this
-  is a no-op. `force=True` drops and rebuilds from scratch. When a persistent
-  `index_path` contains documents that now match `exclude_patterns`, they are
-  purged from the FTS and vector indexes after the scan.
+  is a no-op: the populated index is *adopted* as-is, even by a freshly
+  spawned process opening a persistent `index_path` — no rescan, no
+  re-upserts. Adoption purges documents that now match `exclude_patterns`
+  from the FTS and vector indexes, but does not pick up external file
+  changes (use `reindex()` for that). `force=True` drops and rebuilds from
+  scratch.
 - **`reindex()`**: incremental update. Uses `ChangeTracker` to detect
   adds/modifies/deletes since the last scan and applies only the delta.
   Applies `exclude_patterns` filtering and purges stale excluded documents.
+- **`build_embeddings(force=False)`**: vector-index convergence. Without
+  `force`, diffs the persisted vector index against the chunks currently in
+  the FTS index (chunk identity: the `(title, heading, content)` multiset
+  per document path) and reconciles: missing chunks are embedded and added,
+  vectors for documents no longer in the FTS index are removed, and
+  documents whose indexed content changed are re-embedded. After every call
+  the vector index mirrors the FTS chunk set exactly, logged as a single
+  summary line (`build_embeddings: +N added, -M removed, K up-to-date`).
+  Embedding work scales with the diff size, not the vault size. An empty
+  vector index (cold boot) builds everything; `force=True` discards and
+  rebuilds from scratch (e.g. after an embedding-model change).
+
+**Server startup**: the MCP server lifespan checks
+`Collection.has_indexed_documents()`. When the persistent index is already
+populated it runs `reindex()` (adopt + incremental delta for files changed
+while the server was down); only an empty index triggers a full
+`build_index()`. This keeps boot time independent of vault size and avoids
+SQLite write contention between concurrent server processes sharing one
+`index_path`. `build_embeddings()` then converges the vector index, so
+documents that entered the FTS index via the boot-time `reindex()` (written
+while no server was running) are embedded instead of silently accumulating
+as semantic-search drift.
 
 **Lazy initialization**: on first call to `search()`, `list()`, or `read()`,
 `Collection` lazily builds the FTS index from `source_dir` if no pre-built
@@ -279,8 +310,8 @@ pathological memory allocation from embedding providers (see issue #159).
 FastEmbed's ONNX inference uses a further inner batch size of 4 to keep
 per-call memory bounded — without this, the ONNX attention matrix for 64 long
 chunks can require >192 GB of allocation. The save happens once at the end so a
-mid-run crash does not leave a partial index that the skip-if-exists check
-treats as complete on the next startup.
+mid-run crash does not leave a partial index on disk; whatever was persisted
+last is simply converged against the FTS index on the next startup.
 
 ### Thread Safety
 
@@ -363,8 +394,9 @@ This ensures no work is lost on shutdown. The full lifecycle contract is:
 ```
 Collection(...)
   → sync_from_remote_before_index()   # git fetch + ff-only before first index
-  → build_index()                     # build FTS index
-  → build_embeddings()                # build vector index (when configured)
+  → build_index() or reindex()        # full build (empty index) or
+                                      # adopt + incremental delta (populated)
+  → build_embeddings()                # converge vector index to FTS (when configured)
   → start()                           # launch background pull loop
   → zero or more read/write operations
   → close()                           # stop pull loop, flush git, release SQLite
@@ -535,6 +567,7 @@ class ReindexResult:
     modified: int
     deleted: int
     unchanged: int
+    skipped: int = 0                  # files on disk deliberately not indexed
 
 @dataclass
 class CollectionStats:
@@ -558,6 +591,7 @@ class ChangeSet:
     modified: list[str]
     deleted: list[str]
     unchanged: int
+    skipped_unchanged: int = 0        # known-skipped files, content unchanged
 
 # --- Graph types ---
 
@@ -800,6 +834,7 @@ class Collection:
              pattern: str | None = None) -> list[NoteInfo]: ...
 
     # --- Index management ---
+    def has_indexed_documents(self) -> bool: ...
     def build_index(self, *, force: bool = False) -> IndexStats: ...
     def reindex(self) -> ReindexResult: ...
     def build_embeddings(self, *, force: bool = False) -> int: ...
@@ -988,12 +1023,16 @@ class ChangeTracker:
     def __init__(self, state_path: Path): ...
     def detect_changes(self, source_dir: Path,
                        glob_pattern: str = "**/*.md") -> ChangeSet: ...
-    def update_state(self, notes: list[ParsedNote]) -> None: ...
+    def update_state(self, notes: list[ParsedNote],
+                     skipped: dict[str, str] | None = None) -> None: ...
     def reset(self) -> None: ...
 ```
 
 `tracker.py` is entirely new code (no ifcraftcorpus equivalent). State file
-format: `{"Journal/note.md": "sha256hex", ...}` as JSON.
+format (version 2):
+`{"version": 2, "indexed": {"Journal/note.md": "sha256hex", ...}, "skipped": {"CLAUDE.md": "sha256hex", ...}}`
+as JSON. The legacy flat format (`{"Journal/note.md": "sha256hex", ...}`)
+still loads; all entries are treated as indexed.
 
 ### `mcp_server.py` -- Generic MCP Server
 

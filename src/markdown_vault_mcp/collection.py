@@ -20,7 +20,7 @@ import sqlite3
 import tempfile
 import threading
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -1147,12 +1147,66 @@ class Collection:
     # Index management
     # ------------------------------------------------------------------
 
+    def has_indexed_documents(self) -> bool:
+        """Return ``True`` if the FTS index already contains documents.
+
+        For a persistent ``index_path`` this reflects what previous processes
+        have indexed, so callers can choose an incremental :meth:`reindex`
+        over a full :meth:`build_index` at startup.
+
+        Returns:
+            ``True`` when at least one document is present in the index.
+        """
+        return self._fts.count_documents() > 0
+
+    def _purge_stale_excluded(self) -> int:
+        """Purge indexed documents that match ``exclude_patterns``.
+
+        Handles persistent indexes built before ``exclude_patterns`` were
+        configured (issue #255): matching rows are removed from the FTS
+        index and, when embeddings are configured, from the vector sidecar
+        (which is saved back to disk if anything was purged).
+
+        Returns:
+            Number of documents purged.
+        """
+        if not self._exclude_patterns:
+            return 0
+
+        # Load persisted vectors so stale entries are purged from the
+        # .npy sidecar too, keeping it consistent immediately (the next
+        # build_embeddings() convergence would also remove them).
+        if (
+            self._vectors is None
+            and self._embedding_provider is not None
+            and self._embeddings_path is not None
+        ):
+            self._load_vectors()
+
+        purged = 0
+        for row in self._fts.list_notes():
+            if self._is_path_excluded(row["path"]):
+                self._fts.delete_by_path(row["path"])
+                if self._vectors is not None:
+                    self._vectors.delete_by_path(row["path"])
+                purged += 1
+
+        if purged and self._vectors is not None and self._embeddings_path is not None:
+            self._vectors.save(self._embeddings_path)
+
+        return purged
+
     def build_index(self, *, force: bool = False) -> IndexStats:
         """Scan source_dir and build the FTS index.
 
         If the index already contains documents and *force* is ``False``,
-        this is a no-op.  ``force=True`` drops all existing data and rebuilds
-        from scratch.
+        this is a no-op: the existing (persistent) index is adopted as-is
+        instead of re-upserting every document.  This holds across process
+        restarts — a fresh ``Collection`` opening a populated ``index_path``
+        does not rescan the vault.  Adopting an existing index purges any
+        documents that now match ``exclude_patterns`` but does not pick up
+        external file changes; call :meth:`reindex` for that.  ``force=True``
+        drops all existing data and rebuilds from scratch.
 
         Args:
             force: When ``True``, drop and rebuild the index unconditionally.
@@ -1160,16 +1214,27 @@ class Collection:
         Returns:
             :class:`~markdown_vault_mcp.types.IndexStats` describing what was indexed.
         """
-        # Check if index already has data and we are not forcing.
-        if not force and self._initialized:
-            existing = self._fts.list_notes()
-            if existing:
-                logger.debug(
-                    "build_index: index already populated (%d docs), skipping",
-                    len(existing),
-                )
+        # Check if index already has data and we are not forcing.  The check
+        # consults the persistent index itself (not just the in-memory
+        # _initialized flag) so a freshly spawned process adopts an
+        # already-populated on-disk index instead of re-upserting everything.
+        if not force:
+            existing_count = self._fts.count_documents()
+            if existing_count:
+                if not self._initialized:
+                    existing_count -= self._purge_stale_excluded()
+                    self._initialized = True
+                    logger.info(
+                        "build_index: adopted populated index docs=%d",
+                        existing_count,
+                    )
+                else:
+                    logger.debug(
+                        "build_index: index already populated (%d docs), skipping",
+                        existing_count,
+                    )
                 return IndexStats(
-                    documents_indexed=len(existing),
+                    documents_indexed=existing_count,
                     chunks_indexed=0,
                     skipped=0,
                 )
@@ -1203,36 +1268,6 @@ class Collection:
                     "build_index: failed to index %s", note.path, exc_info=True
                 )
 
-        # Purge stale excluded docs from a persistent index that was built
-        # before exclude_patterns were configured (upgrade scenario, #255).
-        indexed_paths = {note.path for note in notes}
-        if self._exclude_patterns:
-            # Load persisted vectors so stale entries are purged from the
-            # .npy sidecar too (build_embeddings skips if count > 0).
-            if (
-                self._vectors is None
-                and self._embedding_provider is not None
-                and self._embeddings_path is not None
-            ):
-                self._load_vectors()
-
-            purged = 0
-            for row in self._fts.list_notes():
-                if row["path"] not in indexed_paths and self._is_path_excluded(
-                    row["path"]
-                ):
-                    self._fts.delete_by_path(row["path"])
-                    if self._vectors is not None:
-                        self._vectors.delete_by_path(row["path"])
-                    purged += 1
-
-            if (
-                purged
-                and self._vectors is not None
-                and self._embeddings_path is not None
-            ):
-                self._vectors.save(self._embeddings_path)
-
         # Count how many files were skipped due to required_frontmatter.
         # scan_directory logs skipped counts itself; we compute it by comparing
         # indexed count to total files on disk.
@@ -1242,8 +1277,26 @@ class Collection:
         # Resolve vault-wide wikilinks now that all documents are indexed.
         self._fts.resolve_vault_wikilinks()
 
+        # Record skipped files (excluded, missing frontmatter, unparseable)
+        # in tracker state too, so the first reindex() does not re-report
+        # them as added and re-log every skip.
+        indexed_paths = {note.path for note in notes}
+        skipped_state: dict[str, str] = {}
+        for abs_path in all_files:
+            if not abs_path.is_file():
+                continue
+            rel_str = abs_path.relative_to(self._source_dir).as_posix()
+            if rel_str in indexed_paths:
+                continue
+            try:
+                skipped_state[rel_str] = compute_file_hash(abs_path)
+            except OSError as exc:
+                logger.debug(
+                    "build_index: cannot hash skipped file %s (%s)", rel_str, exc
+                )
+
         # Update tracker state so reindex() knows the baseline.
-        self._tracker.update_state(notes)
+        self._tracker.update_state(notes, skipped=skipped_state)
 
         self._initialized = True
         if errored:
@@ -1289,11 +1342,12 @@ class Collection:
         # Phase 1: scan (outside lock — read-only filesystem walk + hashing).
         changes = self._tracker.detect_changes(self._source_dir)
         logger.info(
-            "reindex: %d added, %d modified, %d deleted, %d unchanged",
+            "reindex: %d added, %d modified, %d deleted, %d unchanged, %d skipped",
             len(changes.added),
             len(changes.modified),
             len(changes.deleted),
             changes.unchanged,
+            changes.skipped_unchanged,
         )
 
         # Pre-parse notes outside the lock to minimise lock hold time.
@@ -1303,18 +1357,39 @@ class Collection:
         # written content is indexed rather than the version that triggered
         # the change.  This is acceptable — the next reindex() call will
         # reconcile the difference.
+        # Files seen this scan but deliberately not indexed.  Recording their
+        # content hash in tracker state means an unchanged skipped file is
+        # neither re-parsed nor re-reported (or re-logged) on the next scan;
+        # it is only re-evaluated when its content changes.  Transient I/O
+        # errors are NOT recorded, so those files are retried on every scan.
+        newly_skipped: dict[str, str] = {}
+
+        def _record_skip(rel_path: str, abs_file: Path) -> None:
+            """Record a deterministically skipped file's current hash."""
+            try:
+                newly_skipped[rel_path] = compute_file_hash(abs_file)
+            except OSError as exc:
+                logger.debug("reindex: cannot hash skipped file %s (%s)", rel_path, exc)
+
         parsed: list[tuple[str, ParsedNote]] = []
         for path in changes.added + changes.modified:
+            abs_path = self._source_dir / path
+
             # Apply exclude_patterns — mirrors scan_directory behaviour.
             if self._is_path_excluded(path):
                 logger.debug("reindex: excluding %s (matched exclude pattern)", path)
+                _record_skip(path, abs_path)
                 continue
 
-            abs_path = self._source_dir / path
             try:
                 note = parse_note(abs_path, self._source_dir, self._chunk_strategy)
-            except (UnicodeDecodeError, OSError) as exc:
+            except OSError as exc:
+                # Possibly transient — do not record; retry on the next scan.
                 logger.warning("reindex: skipping %s — %s", path, exc)
+                continue
+            except UnicodeDecodeError as exc:
+                logger.warning("reindex: skipping %s — %s", path, exc)
+                _record_skip(path, abs_path)
                 continue
             except Exception as exc:
                 logger.warning(
@@ -1323,6 +1398,7 @@ class Collection:
                     exc,
                     exc_info=True,
                 )
+                _record_skip(path, abs_path)
                 continue
 
             # Apply required_frontmatter filter.
@@ -1334,6 +1410,7 @@ class Collection:
                     logger.info(
                         "reindex: skipping %s — missing frontmatter: %s", path, missing
                     )
+                    newly_skipped[path] = note.content_hash
                     continue
 
             parsed.append((path, note))
@@ -1348,28 +1425,12 @@ class Collection:
 
             # Purge stale excluded docs that were indexed before
             # exclude_patterns were enforced in reindex() (issue #255).
-            stale_excluded = 0
-            if self._exclude_patterns:
-                # Load persisted vectors so stale entries are purged from
-                # the .npy sidecar too (not just FTS).
-                if (
-                    self._vectors is None
-                    and self._embedding_provider is not None
-                    and self._embeddings_path is not None
-                ):
-                    self._load_vectors()
-
-                for row in self._fts.list_notes():
-                    if self._is_path_excluded(row["path"]):
-                        self._fts.delete_by_path(row["path"])
-                        if self._vectors is not None:
-                            self._vectors.delete_by_path(row["path"])
-                        stale_excluded += 1
-                if stale_excluded:
-                    logger.info(
-                        "reindex: purged %d stale excluded document(s)",
-                        stale_excluded,
-                    )
+            stale_excluded = self._purge_stale_excluded()
+            if stale_excluded:
+                logger.info(
+                    "reindex: purged %d stale excluded document(s)",
+                    stale_excluded,
+                )
 
             # Upsert parsed notes.
             indexed_added = 0
@@ -1424,24 +1485,36 @@ class Collection:
                 )
                 for r in self._fts.list_notes()
             ]
-            self._tracker.update_state(state_notes)
+            self._tracker.update_state(state_notes, skipped=newly_skipped)
 
         return ReindexResult(
             added=indexed_added,
             modified=indexed_modified,
             deleted=len(changes.deleted),
             unchanged=changes.unchanged,
+            skipped=changes.skipped_unchanged + len(newly_skipped),
         )
 
     def build_embeddings(self, *, force: bool = False) -> int:
-        """Build the vector index from all chunks currently in the FTS index.
+        """Build or converge the vector index against the FTS index.
+
+        Without ``force``, the persisted vector index is diffed against the
+        chunks currently in the FTS index and reconciled: chunks present in
+        the FTS index but missing from the vector index are embedded and
+        added, vectors for documents no longer in the FTS index are removed,
+        and documents whose indexed content changed are re-embedded.  After
+        every call the vector index mirrors the FTS chunk set exactly, so
+        external changes picked up by a boot-time :meth:`reindex` (while no
+        vector index was loaded) cannot accumulate as permanent
+        semantic-search drift.  Work scales with the size of the diff, not
+        the size of the vault.
 
         Args:
-            force: If ``True``, rebuild from scratch even if a vector index
-                already exists on disk.
+            force: If ``True``, discard any existing vectors and rebuild the
+                index from scratch (e.g. after changing the embedding model).
 
         Returns:
-            Total number of chunks embedded.
+            Total number of chunks in the vector index after the call.
 
         Raises:
             ValueError: If ``embedding_provider`` or ``embeddings_path`` is
@@ -1460,12 +1533,9 @@ class Collection:
         else:
             # Load persisted vectors (or create empty) so we can check count.
             self._load_vectors()
+            assert self._vectors is not None
             if self._vectors.count > 0:
-                logger.info(
-                    "build_embeddings: index already exists (%d chunks), skipping",
-                    self._vectors.count,
-                )
-                return self._vectors.count
+                return self._converge_embeddings()
             # Empty index — fall through to build from scratch.
 
         rows = self._fts.list_notes()
@@ -1525,6 +1595,88 @@ class Collection:
         else:
             logger.info("build_embeddings: nothing to embed")
         return total
+
+    def _converge_embeddings(self) -> int:
+        """Reconcile the loaded vector index with the FTS chunk set.
+
+        Chunk identity is the ``(title, heading, content)`` multiset per
+        document path — exactly the metadata stored alongside each vector
+        row.  Documents present only in the vector index are removed;
+        documents missing from it are embedded; documents whose chunk
+        multiset differs in any way (modified content, changed title) are
+        re-embedded in full.
+
+        Follows the two-phase locking discipline of
+        :meth:`_flush_dirty_embeddings`: the snapshot/diff and the fast
+        numpy mutations run under ``_write_lock``, while the (potentially
+        slow) embedding provider runs outside it.  The window between
+        phases is the same accepted TOCTOU as deferred flushes — any
+        concurrent change is reconciled by the next flush or boot.
+
+        Returns:
+            Total number of chunks in the vector index after convergence.
+        """
+        assert self._vectors is not None
+        assert self._embeddings_path is not None
+        assert self._embedding_provider is not None
+        vectors = self._vectors
+
+        def _signature(rows: list[dict]) -> Counter:
+            return Counter(
+                (r.get("title"), r.get("heading"), r.get("content")) for r in rows
+            )
+
+        # Phase 1: snapshot both sides and compute the diff under the lock.
+        with self._write_lock:
+            fts_by_path: dict[str, list[dict]] = defaultdict(list)
+            for row in self._fts.list_chunks():
+                fts_by_path[row["path"]].append(row)
+            vec_by_path = vectors.chunks_by_path()
+
+            stale_paths = [p for p in vec_by_path if p not in fts_by_path]
+            refresh_paths: list[str] = []
+            to_embed: list[dict] = []
+            up_to_date = 0
+            for path, rows in fts_by_path.items():
+                existing = vec_by_path.get(path)
+                if existing is None:
+                    to_embed.extend(rows)
+                elif _signature(rows) != _signature(existing):
+                    refresh_paths.append(path)
+                    to_embed.extend(rows)
+                else:
+                    up_to_date += len(rows)
+
+        # Phase 2: embed outside the lock — the provider can take seconds
+        # per batch and must not block foreground writes.  Bounded batches
+        # avoid pathological provider memory allocation (issue #159).
+        texts = [row["content"] for row in to_embed]
+        raw_vectors: list[list[float]] = []
+        for start in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
+            raw_vectors.extend(
+                self._embedding_provider.embed(
+                    texts[start : start + _EMBEDDING_BATCH_SIZE]
+                )
+            )
+
+        # Phase 3: apply fast numpy mutations and save under the lock.
+        with self._write_lock:
+            removed = 0
+            for path in stale_paths + refresh_paths:
+                removed += vectors.delete_by_path(path)
+            added = 0
+            if raw_vectors:
+                added = vectors.add_vectors(raw_vectors, to_embed)
+            if removed or added:
+                vectors.save(self._embeddings_path)
+
+        logger.info(
+            "build_embeddings: +%d added, -%d removed, %d up-to-date",
+            added,
+            removed,
+            up_to_date,
+        )
+        return vectors.count
 
     def embeddings_status(self) -> dict:
         """Return status information about the vector index.

@@ -137,12 +137,19 @@ class IndexStats:
 
 @dataclass
 class ReindexResult:
-    """Result of an incremental reindex."""
+    """Result of an incremental reindex.
+
+    ``skipped`` counts files present on disk that were deliberately not
+    indexed (missing required frontmatter, matching an exclude pattern, or
+    unparseable), whether newly skipped this scan or unchanged since they
+    were last skipped.
+    """
 
     added: int
     modified: int
     deleted: int
     unchanged: int
+    skipped: int = 0
 
 
 @dataclass
@@ -186,12 +193,18 @@ class CollectionStats:
 
 @dataclass
 class ChangeSet:
-    """Documents that changed since last index."""
+    """Documents that changed since last index.
+
+    ``skipped_unchanged`` counts files that were previously recorded as
+    skipped (never indexed) and whose content has not changed since; they
+    appear in no other bucket and need no re-evaluation.
+    """
 
     added: list[str]
     modified: list[str]
     deleted: list[str]
     unchanged: int
+    skipped_unchanged: int = 0
 
 
 @dataclass

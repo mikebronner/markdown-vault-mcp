@@ -69,17 +69,34 @@ def make_collection_lifespan(config: CollectionConfig) -> Any:
         # build_index() scans the freshest working tree.
         await asyncio.to_thread(collection.sync_from_remote_before_index)
 
-        # Build index eagerly so first tool call is fast.
-        stats = await asyncio.to_thread(collection.build_index)
-        logger.info(
-            "Index built: %d documents, %d chunks",
-            stats.documents_indexed,
-            stats.chunks_indexed,
-        )
+        # Build index eagerly so first tool call is fast.  When a persistent
+        # index is already populated from a previous process, adopt it and
+        # apply only the incremental delta (files changed while the server
+        # was down) instead of re-upserting every document — full rebuilds
+        # made boot time grow with vault size and caused SQLite lock
+        # contention between concurrent server instances.
+        if await asyncio.to_thread(collection.has_indexed_documents):
+            result = await asyncio.to_thread(collection.reindex)
+            logger.info(
+                "index_adopted added=%d modified=%d deleted=%d unchanged=%d",
+                result.added,
+                result.modified,
+                result.deleted,
+                result.unchanged,
+            )
+        else:
+            stats = await asyncio.to_thread(collection.build_index)
+            logger.info(
+                "index_built documents=%d chunks=%d",
+                stats.documents_indexed,
+                stats.chunks_indexed,
+            )
 
         # Build embeddings eagerly when an embedding provider is configured.
-        # build_embeddings() skips work if the vector index already exists on disk,
-        # so this is safe to call on every startup.
+        # build_embeddings() converges the persisted vector index to the FTS
+        # index: chunks added/changed while the server was down are embedded
+        # and vectors for deleted documents are dropped, so semantic search
+        # never drifts from keyword search.  Work scales with the diff size.
         if embedding_provider is not None:
             chunks_embedded = await asyncio.to_thread(collection.build_embeddings)
             logger.info("Embeddings ready: %d chunks", chunks_embedded)

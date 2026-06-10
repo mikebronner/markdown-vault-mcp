@@ -6,7 +6,7 @@ import concurrent.futures
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -414,6 +414,355 @@ class TestLazyInitialisation:
 
         assert isinstance(notes, list)
         assert len(notes) == 9
+
+
+# ---------------------------------------------------------------------------
+# Persistent index adoption across process restarts
+# ---------------------------------------------------------------------------
+
+
+class TestPersistentIndexAdoption:
+    """A fresh Collection on a populated index must not re-upsert everything.
+
+    Simulates a server process restart: build the index with one Collection
+    instance, then open a second instance against the same ``index_path`` and
+    ``state_path`` — as the MCP server lifespan does on every boot.
+    """
+
+    @pytest.fixture
+    def mini_vault(self, tmp_path: Path) -> Path:
+        """Small clean vault with three parseable documents."""
+        vault = tmp_path / "mini_vault"
+        vault.mkdir()
+        (vault / "alpha.md").write_text("# Alpha\n\nFirst note.\n")
+        (vault / "beta.md").write_text("# Beta\n\nSecond note.\n")
+        (vault / "gamma.md").write_text("# Gamma\n\nThird note.\n")
+        return vault
+
+    @staticmethod
+    def _count_upserts(col: Collection) -> list[object]:
+        """Wrap ``col._fts.upsert_note`` to record every upserted note."""
+        calls: list[object] = []
+        original = col._fts.upsert_note
+
+        def counting_upsert(note):
+            calls.append(note)
+            return original(note)
+
+        col._fts.upsert_note = counting_upsert  # type: ignore[method-assign]
+        return calls
+
+    def test_build_index_adopts_populated_index(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """build_index() on a populated persistent index skips re-upserting."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        stats1 = col1.build_index()
+        col1.close()
+        assert stats1.documents_indexed == 3
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        upserts = self._count_upserts(col2)
+        stats2 = col2.build_index()
+        col2.close()
+
+        assert stats2.documents_indexed == 3
+        assert stats2.chunks_indexed == 0
+        assert upserts == []
+        assert col2._initialized is True
+
+    def test_second_boot_unchanged_vault_does_not_reupsert(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """Boot reindex on an unchanged vault applies no upserts at all."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        upserts = self._count_upserts(col2)
+        assert col2.has_indexed_documents()
+
+        result = col2.reindex()
+        col2.close()
+
+        assert result.added == 0
+        assert result.modified == 0
+        assert result.deleted == 0
+        assert result.unchanged == 3
+        assert upserts == []
+
+    def test_second_boot_picks_up_offline_changes(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """Files changed while the server was down are reindexed incrementally."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+
+        # Mutate the vault "while the server is down".
+        (mini_vault / "alpha.md").write_text("# Alpha\n\nEdited offline.\n")
+        (mini_vault / "delta.md").write_text("# Delta\n\nAdded offline.\n")
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        upserts = self._count_upserts(col2)
+        result = col2.reindex()
+
+        assert result.added == 1
+        assert result.modified == 1
+        assert result.deleted == 0
+        assert result.unchanged == 2
+        # Exactly the two changed documents were upserted.
+        assert len(upserts) == 2
+
+        # The offline edits are searchable.
+        paths = [r.path for r in col2.search("offline")]
+        col2.close()
+        assert "alpha.md" in paths
+        assert "delta.md" in paths
+
+    def test_second_boot_detects_offline_deletion(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """A file deleted while the server was down is purged on boot reindex."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+
+        (mini_vault / "gamma.md").unlink()
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        result = col2.reindex()
+        paths = [row["path"] for row in col2._fts.list_notes()]
+        col2.close()
+
+        assert result.deleted == 1
+        assert result.unchanged == 2
+        assert "gamma.md" not in paths
+
+    def test_missing_state_file_with_populated_index_degrades(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """state.json gone but SQLite populated: no crash, full re-upsert."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+        state_path.unlink()
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        result = col2.reindex()
+        col2.close()
+
+        # ChangeTracker treats everything as added — acceptable degradation.
+        assert result.added == 3
+        assert result.deleted == 0
+
+    def test_force_rebuild_ignores_adoption(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """build_index(force=True) still rebuilds from scratch on a new instance."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        upserts = self._count_upserts(col2)
+        stats = col2.build_index(force=True)
+        col2.close()
+
+        assert stats.documents_indexed == 3
+        assert stats.chunks_indexed == 3
+        assert len(upserts) == 3
+
+
+# ---------------------------------------------------------------------------
+# Skipped-file tracking (required_frontmatter) across reindex scans
+# ---------------------------------------------------------------------------
+
+
+class TestSkippedFileTracking:
+    """Files skipped for missing frontmatter must not be re-reported per scan.
+
+    Regression tests for the warm-boot loop where every ``reindex()`` saw
+    frontmatter-skipped files as "added", re-parsed them, and re-logged the
+    skip (O(skipped files) wasted parsing per boot).
+    """
+
+    REQUIRED: ClassVar[list[str]] = ["name", "type"]
+
+    @pytest.fixture
+    def fm_vault(self, tmp_path: Path) -> Path:
+        """Vault with one valid document and one missing required frontmatter."""
+        vault = tmp_path / "fm_vault"
+        vault.mkdir()
+        (vault / "valid.md").write_text(
+            "---\nname: Valid\ntype: note\n---\n# Valid\n\nIndexed note.\n"
+        )
+        (vault / "CLAUDE.md").write_text("# Claude\n\nNo frontmatter here.\n")
+        return vault
+
+    def _make(self, vault: Path, tmp_path: Path) -> Collection:
+        """Build a Collection enforcing required frontmatter with shared state."""
+        return Collection(
+            source_dir=vault,
+            index_path=tmp_path / "index.db",
+            state_path=tmp_path / "state.json",
+            required_frontmatter=self.REQUIRED,
+        )
+
+    def test_skipped_file_not_rereported_on_second_reindex(
+        self, tmp_path: Path, fm_vault: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unchanged skipped file is neither re-parsed nor re-logged."""
+        col1 = self._make(fm_vault, tmp_path)
+        col1.build_index()
+        col1.close()
+
+        # Warm boot: adopt the index, run the boot reindex.
+        col2 = self._make(fm_vault, tmp_path)
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.collection"):
+            result = col2.reindex()
+
+        assert result.added == 0
+        assert result.modified == 0
+        assert result.deleted == 0
+        assert result.unchanged == 1
+        assert result.skipped == 1
+        assert not any("missing frontmatter" in r.message for r in caplog.records)
+
+        # And again — still quiet, still not reported as added.
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.collection"):
+            result2 = col2.reindex()
+        col2.close()
+
+        assert result2.added == 0
+        assert result2.skipped == 1
+        assert not any("missing frontmatter" in r.message for r in caplog.records)
+
+    def test_skipped_file_gaining_frontmatter_gets_indexed(
+        self, tmp_path: Path, fm_vault: Path
+    ) -> None:
+        """A skipped file that gains the required frontmatter is indexed."""
+        col = self._make(fm_vault, tmp_path)
+        col.build_index()
+
+        (fm_vault / "CLAUDE.md").write_text(
+            "---\nname: Claude\ntype: agent\n---\n# Claude\n\nNow valid.\n"
+        )
+
+        result = col.reindex()
+        paths = [row["path"] for row in col._fts.list_notes()]
+        col.close()
+
+        assert result.added == 1
+        assert result.skipped == 0
+        assert "CLAUDE.md" in paths
+
+    def test_changed_but_still_skipped_file_logged_once(
+        self, tmp_path: Path, fm_vault: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A changed-and-still-skipped file is re-logged once, then quiet."""
+        col = self._make(fm_vault, tmp_path)
+        col.build_index()
+
+        (fm_vault / "CLAUDE.md").write_text("# Claude\n\nStill no frontmatter.\n")
+
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.collection"):
+            result1 = col.reindex()
+        assert result1.skipped == 1
+        assert any("missing frontmatter" in r.message for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.collection"):
+            result2 = col.reindex()
+        col.close()
+
+        assert result2.skipped == 1
+        assert not any("missing frontmatter" in r.message for r in caplog.records)
+
+    def test_legacy_flat_state_file_migrates_cleanly(
+        self, tmp_path: Path, fm_vault: Path
+    ) -> None:
+        """An old flat-format state.json loads fine; skips settle after one scan."""
+        col1 = self._make(fm_vault, tmp_path)
+        col1.build_index()
+        col1.close()
+
+        # Rewrite state.json in the legacy flat format (indexed entries only).
+        state_path = tmp_path / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state_path.write_text(json.dumps(state["indexed"]), encoding="utf-8")
+
+        col2 = self._make(fm_vault, tmp_path)
+        # First scan re-evaluates the skipped file once (it is absent from
+        # legacy state), records it, and does not index it.
+        result1 = col2.reindex()
+        assert result1.added == 0
+        assert result1.unchanged == 1
+        assert result1.skipped == 1
+
+        # Second scan: the skip is remembered; nothing is re-evaluated.
+        result2 = col2.reindex()
+        col2.close()
+        assert result2.added == 0
+        assert result2.skipped == 1
+
+    def test_build_index_records_skipped_files_in_state(
+        self, tmp_path: Path, fm_vault: Path
+    ) -> None:
+        """build_index() persists skipped files so reindex() stays quiet."""
+        col = self._make(fm_vault, tmp_path)
+        col.build_index()
+        col.close()
+
+        state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+        assert state["version"] == 2
+        assert "valid.md" in state["indexed"]
+        assert "CLAUDE.md" in state["skipped"]
+        assert "CLAUDE.md" not in state["indexed"]
 
 
 # ---------------------------------------------------------------------------
@@ -2813,13 +3162,13 @@ class TestEmbeddingsStatus:
 
 
 class TestBuildEmbeddings:
-    def test_build_embeddings_skip_when_already_built(
+    def test_build_embeddings_noop_when_converged(
         self,
         vault_path: Path,
         tmp_path: Path,
         mock_provider: MockEmbeddingProvider,
     ) -> None:
-        """build_embeddings(force=False) skips rebuild when index already has chunks.
+        """build_embeddings(force=False) does no work when vectors match FTS.
 
         The first call embeds 9 chunks and saves to disk.  The second call (no
         force) must return the same count without re-embedding.
@@ -2959,6 +3308,220 @@ class TestBuildEmbeddings:
         # The .npy file must exist (saved at the end).
         npy_path = tmp_path / "embeddings.npy"
         assert npy_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# build_embeddings() convergence (boot-time embedding drift, issue: vector
+# index frozen while FTS index grows via boot reindex)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildEmbeddingsConvergence:
+    """build_embeddings() must converge the vector index to the FTS index.
+
+    Simulates the MCP server boot sequence: a fresh ``Collection`` over a
+    persistent ``index_path``/``embeddings_path`` runs ``reindex()`` (while
+    no vector index is loaded — exactly the lifespan code path) followed by
+    ``build_embeddings()``.  Files changed externally while "down" must be
+    reflected in the vector index after boot.
+    """
+
+    @staticmethod
+    def _boot(
+        vault_path: Path,
+        tmp_path: Path,
+        provider: MockEmbeddingProvider,
+    ) -> Collection:
+        """Replicate the server lifespan boot sequence."""
+        col = Collection(
+            source_dir=vault_path,
+            index_path=tmp_path / "index.db",
+            embeddings_path=tmp_path / "embeddings",
+            embedding_provider=provider,
+        )
+        if col.has_indexed_documents():
+            col.reindex()
+        else:
+            col.build_index()
+        col.build_embeddings()
+        return col
+
+    @staticmethod
+    def _track_embeds(
+        provider: MockEmbeddingProvider,
+    ) -> list[list[str]]:
+        """Record every batch of texts passed to provider.embed()."""
+        original_embed = provider.embed
+        calls: list[list[str]] = []
+
+        def tracking_embed(texts: list[str]) -> list[list[float]]:
+            calls.append(list(texts))
+            return original_embed(texts)
+
+        provider.embed = tracking_embed  # type: ignore[method-assign]
+        return calls
+
+    def test_boot_with_no_drift_does_no_embedding_work(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """Second boot with vectors == FTS embeds nothing and drops nothing."""
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        count1 = col1._load_vectors().count
+        col1.close()
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        assert calls == []
+        vectors = col2._load_vectors()
+        assert vectors.count == count1
+        assert vectors.count == col2._fts.count_chunks()
+        col2.close()
+
+    def test_boot_embeds_documents_added_while_down(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """Files written externally while no server runs get embedded at boot."""
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        count1 = col1._load_vectors().count
+        col1.close()
+
+        # External process (e.g. a hook) writes new notes while "down".
+        (vault_path / "hook_summary.md").write_text(
+            "# Hook Summary\n\nSession summary written by a hook.\n"
+        )
+        (vault_path / "hook_followup.md").write_text(
+            "# Hook Followup\n\nFollow-up note written by a hook.\n"
+        )
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        # Exactly the new chunks were embedded — nothing re-embedded.
+        embedded_texts = [t for batch in calls for t in batch]
+        assert len(embedded_texts) == 2
+        assert any("Session summary" in t for t in embedded_texts)
+        assert any("Follow-up note" in t for t in embedded_texts)
+
+        vectors = col2._load_vectors()
+        assert vectors.count == count1 + 2
+        assert vectors.count == col2._fts.count_chunks()
+        by_path = vectors.chunks_by_path()
+        assert "hook_summary.md" in by_path
+        assert "hook_followup.md" in by_path
+
+        # The new document is reachable via semantic search.  The mock
+        # provider's vectors are hash-based (no real semantics), so use a
+        # limit that returns every chunk and assert reachability only.
+        results = col2.search(
+            "Session summary written by a hook", mode="semantic", limit=50
+        )
+        assert any(r.path == "hook_summary.md" for r in results)
+        col2.close()
+
+    def test_boot_removes_vectors_for_documents_deleted_while_down(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """Vectors for files deleted externally are dropped at boot."""
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        vectors1 = col1._load_vectors()
+        doomed_chunks = len(vectors1.chunks_by_path()["simple.md"])
+        assert doomed_chunks > 0
+        count1 = vectors1.count
+        col1.close()
+
+        (vault_path / "simple.md").unlink()
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        assert calls == []
+        vectors = col2._load_vectors()
+        assert "simple.md" not in vectors.chunks_by_path()
+        assert vectors.count == count1 - doomed_chunks
+        assert vectors.count == col2._fts.count_chunks()
+        col2.close()
+
+    def test_boot_refreshes_vectors_for_documents_modified_while_down(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """Modified documents get fresh vectors; stale chunk vectors are gone."""
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        col1.close()
+
+        (vault_path / "simple.md").write_text(
+            "# Simple Document\n\nCompletely rewritten body about gardening.\n"
+        )
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        # Only the modified document's chunks were embedded.
+        embedded_texts = [t for batch in calls for t in batch]
+        assert len(embedded_texts) > 0
+        assert all("gardening" in t for t in embedded_texts)
+
+        vectors = col2._load_vectors()
+        rows = vectors.chunks_by_path()["simple.md"]
+        assert all("gardening" in r["content"] for r in rows)
+        # No stale vectors for the old content remain anywhere.
+        all_rows = [r for rs in vectors.chunks_by_path().values() for r in rs]
+        assert not any("Section Two" in r["content"] for r in all_rows)
+        assert vectors.count == col2._fts.count_chunks()
+        col2.close()
+
+    def test_boot_converges_legacy_drifted_vector_index(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """A historic vectors-subset-of-FTS state heals in a single boot.
+
+        Reproduces the observed 307/1379 drift in miniature: the persisted
+        vector index is missing several documents that the FTS index knows
+        about.  One boot must embed exactly the missing chunks.
+        """
+        from markdown_vault_mcp.vector_index import VectorIndex
+
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        fts_chunks = col1._fts.count_chunks()
+        col1.close()
+
+        # Corrupt the sidecar the way older code did: drop some documents'
+        # vectors while FTS keeps them.
+        embeddings_path = tmp_path / "embeddings"
+        vectors = VectorIndex.load(embeddings_path, mock_provider)
+        dropped = vectors.delete_by_path("simple.md")
+        dropped += vectors.delete_by_path("unicode.md")
+        assert dropped > 0
+        vectors.save(embeddings_path)
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        # Exactly the missing chunks were re-embedded.
+        embedded_texts = [t for batch in calls for t in batch]
+        assert len(embedded_texts) == dropped
+
+        converged = col2._load_vectors()
+        assert converged.count == fts_chunks
+        by_path = converged.chunks_by_path()
+        assert "simple.md" in by_path
+        assert "unicode.md" in by_path
+        col2.close()
 
 
 # ---------------------------------------------------------------------------
