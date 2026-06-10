@@ -170,7 +170,11 @@ def __getattr__(name: str) -> Any:
     except KeyError:
         msg = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(msg) from None
-    return getattr(importlib.import_module(module_name), name)
+    value = getattr(importlib.import_module(module_name), name)
+    # Cache so subsequent lookups hit the module __dict__ directly instead
+    # of re-entering __getattr__.
+    globals()[name] = value
+    return value
 
 
 def __dir__() -> list[str]:
