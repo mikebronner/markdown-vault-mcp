@@ -240,12 +240,23 @@ Two methods manage the index:
 
 - **`build_index(force=False)`**: initial population. Scans `source_dir` and
   builds the FTS index. If the index already has data and `force=False`, this
-  is a no-op. `force=True` drops and rebuilds from scratch. When a persistent
-  `index_path` contains documents that now match `exclude_patterns`, they are
-  purged from the FTS and vector indexes after the scan.
+  is a no-op: the populated index is *adopted* as-is, even by a freshly
+  spawned process opening a persistent `index_path` — no rescan, no
+  re-upserts. Adoption purges documents that now match `exclude_patterns`
+  from the FTS and vector indexes, but does not pick up external file
+  changes (use `reindex()` for that). `force=True` drops and rebuilds from
+  scratch.
 - **`reindex()`**: incremental update. Uses `ChangeTracker` to detect
   adds/modifies/deletes since the last scan and applies only the delta.
   Applies `exclude_patterns` filtering and purges stale excluded documents.
+
+**Server startup**: the MCP server lifespan checks
+`Collection.has_indexed_documents()`. When the persistent index is already
+populated it runs `reindex()` (adopt + incremental delta for files changed
+while the server was down); only an empty index triggers a full
+`build_index()`. This keeps boot time independent of vault size and avoids
+SQLite write contention between concurrent server processes sharing one
+`index_path`.
 
 **Lazy initialization**: on first call to `search()`, `list()`, or `read()`,
 `Collection` lazily builds the FTS index from `source_dir` if no pre-built
@@ -363,7 +374,8 @@ This ensures no work is lost on shutdown. The full lifecycle contract is:
 ```
 Collection(...)
   → sync_from_remote_before_index()   # git fetch + ff-only before first index
-  → build_index()                     # build FTS index
+  → build_index() or reindex()        # full build (empty index) or
+                                      # adopt + incremental delta (populated)
   → build_embeddings()                # build vector index (when configured)
   → start()                           # launch background pull loop
   → zero or more read/write operations
@@ -800,6 +812,7 @@ class Collection:
              pattern: str | None = None) -> list[NoteInfo]: ...
 
     # --- Index management ---
+    def has_indexed_documents(self) -> bool: ...
     def build_index(self, *, force: bool = False) -> IndexStats: ...
     def reindex(self) -> ReindexResult: ...
     def build_embeddings(self, *, force: bool = False) -> int: ...

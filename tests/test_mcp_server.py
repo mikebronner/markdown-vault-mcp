@@ -2455,6 +2455,95 @@ class TestLifespanAutoEmbeddings:
 
 
 # ---------------------------------------------------------------------------
+# Lifespan boot indexing (persistent index adoption, issue: slow boots)
+# ---------------------------------------------------------------------------
+
+
+class TestLifespanBootIndexing:
+    """Server restarts must not re-upsert an already-populated index."""
+
+    async def test_second_startup_does_not_reupsert(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """With a persistent index on disk, a restart applies zero upserts."""
+        from unittest.mock import patch
+
+        from markdown_vault_mcp.fts_index import FTSIndex
+
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(vault_path))
+        monkeypatch.delenv("MARKDOWN_VAULT_MCP_READ_ONLY", raising=False)
+        for var in _CLEAR_VARS:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_INDEX_PATH", str(tmp_path / "index.db"))
+        monkeypatch.setenv(
+            "MARKDOWN_VAULT_MCP_STATE_PATH", str(tmp_path / "state.json")
+        )
+
+        # First startup: full build into the persistent index.
+        server1 = create_server()
+        async with Client(server1) as client1:
+            r1 = await client1.call_tool_mcp("stats", {})
+        count1 = json.loads(r1.content[0].text)["document_count"]
+        assert count1 > 0
+
+        # Second startup: must adopt the on-disk index without upserting.
+        upsert_paths: list[str] = []
+        original_upsert = FTSIndex.upsert_note
+
+        def tracking_upsert(self: FTSIndex, note: Any) -> int:
+            upsert_paths.append(note.path)
+            return original_upsert(self, note)
+
+        with patch.object(FTSIndex, "upsert_note", tracking_upsert):
+            server2 = create_server()
+            async with Client(server2) as client2:
+                r2 = await client2.call_tool_mcp("stats", {})
+        count2 = json.loads(r2.content[0].text)["document_count"]
+
+        assert count2 == count1
+        assert upsert_paths == [], f"boot re-upserted {upsert_paths}"
+
+    async def test_second_startup_applies_offline_delta(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Files changed while the server was down are indexed on restart."""
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(vault_path))
+        monkeypatch.delenv("MARKDOWN_VAULT_MCP_READ_ONLY", raising=False)
+        for var in _CLEAR_VARS:
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_INDEX_PATH", str(tmp_path / "index.db"))
+        monkeypatch.setenv(
+            "MARKDOWN_VAULT_MCP_STATE_PATH", str(tmp_path / "state.json")
+        )
+
+        server1 = create_server()
+        async with Client(server1) as client1:
+            r1 = await client1.call_tool_mcp("stats", {})
+        count1 = json.loads(r1.content[0].text)["document_count"]
+
+        # Add a file "while the server is down".
+        (vault_path / "offline_note.md").write_text(
+            "# Offline Note\n\nWritten while the server was down.\n"
+        )
+
+        server2 = create_server()
+        async with Client(server2) as client2:
+            r2 = await client2.call_tool_mcp("stats", {})
+            search = await client2.call_tool("search", {"query": "offline"})
+        count2 = json.loads(r2.content[0].text)["document_count"]
+
+        assert count2 == count1 + 1
+        paths = [r["path"] for r in _parse_tool_data(search)]
+        assert "offline_note.md" in paths
+
+
+# ---------------------------------------------------------------------------
 # Bearer token auth configuration
 # ---------------------------------------------------------------------------
 

@@ -417,6 +417,207 @@ class TestLazyInitialisation:
 
 
 # ---------------------------------------------------------------------------
+# Persistent index adoption across process restarts
+# ---------------------------------------------------------------------------
+
+
+class TestPersistentIndexAdoption:
+    """A fresh Collection on a populated index must not re-upsert everything.
+
+    Simulates a server process restart: build the index with one Collection
+    instance, then open a second instance against the same ``index_path`` and
+    ``state_path`` — as the MCP server lifespan does on every boot.
+    """
+
+    @pytest.fixture
+    def mini_vault(self, tmp_path: Path) -> Path:
+        """Small clean vault with three parseable documents."""
+        vault = tmp_path / "mini_vault"
+        vault.mkdir()
+        (vault / "alpha.md").write_text("# Alpha\n\nFirst note.\n")
+        (vault / "beta.md").write_text("# Beta\n\nSecond note.\n")
+        (vault / "gamma.md").write_text("# Gamma\n\nThird note.\n")
+        return vault
+
+    @staticmethod
+    def _count_upserts(col: Collection) -> list[object]:
+        """Wrap ``col._fts.upsert_note`` to record every upserted note."""
+        calls: list[object] = []
+        original = col._fts.upsert_note
+
+        def counting_upsert(note):
+            calls.append(note)
+            return original(note)
+
+        col._fts.upsert_note = counting_upsert  # type: ignore[method-assign]
+        return calls
+
+    def test_build_index_adopts_populated_index(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """build_index() on a populated persistent index skips re-upserting."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        stats1 = col1.build_index()
+        col1.close()
+        assert stats1.documents_indexed == 3
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        upserts = self._count_upserts(col2)
+        stats2 = col2.build_index()
+        col2.close()
+
+        assert stats2.documents_indexed == 3
+        assert stats2.chunks_indexed == 0
+        assert upserts == []
+        assert col2._initialized is True
+
+    def test_second_boot_unchanged_vault_does_not_reupsert(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """Boot reindex on an unchanged vault applies no upserts at all."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        upserts = self._count_upserts(col2)
+        assert col2.has_indexed_documents()
+
+        result = col2.reindex()
+        col2.close()
+
+        assert result.added == 0
+        assert result.modified == 0
+        assert result.deleted == 0
+        assert result.unchanged == 3
+        assert upserts == []
+
+    def test_second_boot_picks_up_offline_changes(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """Files changed while the server was down are reindexed incrementally."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+
+        # Mutate the vault "while the server is down".
+        (mini_vault / "alpha.md").write_text("# Alpha\n\nEdited offline.\n")
+        (mini_vault / "delta.md").write_text("# Delta\n\nAdded offline.\n")
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        upserts = self._count_upserts(col2)
+        result = col2.reindex()
+
+        assert result.added == 1
+        assert result.modified == 1
+        assert result.deleted == 0
+        assert result.unchanged == 2
+        # Exactly the two changed documents were upserted.
+        assert len(upserts) == 2
+
+        # The offline edits are searchable.
+        paths = [r.path for r in col2.search("offline")]
+        col2.close()
+        assert "alpha.md" in paths
+        assert "delta.md" in paths
+
+    def test_second_boot_detects_offline_deletion(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """A file deleted while the server was down is purged on boot reindex."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+
+        (mini_vault / "gamma.md").unlink()
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        result = col2.reindex()
+        paths = [row["path"] for row in col2._fts.list_notes()]
+        col2.close()
+
+        assert result.deleted == 1
+        assert result.unchanged == 2
+        assert "gamma.md" not in paths
+
+    def test_missing_state_file_with_populated_index_degrades(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """state.json gone but SQLite populated: no crash, full re-upsert."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+        state_path.unlink()
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        result = col2.reindex()
+        col2.close()
+
+        # ChangeTracker treats everything as added — acceptable degradation.
+        assert result.added == 3
+        assert result.deleted == 0
+
+    def test_force_rebuild_ignores_adoption(
+        self, tmp_path: Path, mini_vault: Path
+    ) -> None:
+        """build_index(force=True) still rebuilds from scratch on a new instance."""
+        index_path = tmp_path / "index.db"
+        state_path = tmp_path / "state.json"
+
+        col1 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        col1.build_index()
+        col1.close()
+
+        col2 = _make_collection(
+            mini_vault, index_path=index_path, state_path=state_path
+        )
+        upserts = self._count_upserts(col2)
+        stats = col2.build_index(force=True)
+        col2.close()
+
+        assert stats.documents_indexed == 3
+        assert stats.chunks_indexed == 3
+        assert len(upserts) == 3
+
+
+# ---------------------------------------------------------------------------
 # Search tests
 # ---------------------------------------------------------------------------
 

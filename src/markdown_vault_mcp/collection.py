@@ -1147,12 +1147,65 @@ class Collection:
     # Index management
     # ------------------------------------------------------------------
 
+    def has_indexed_documents(self) -> bool:
+        """Return ``True`` if the FTS index already contains documents.
+
+        For a persistent ``index_path`` this reflects what previous processes
+        have indexed, so callers can choose an incremental :meth:`reindex`
+        over a full :meth:`build_index` at startup.
+
+        Returns:
+            ``True`` when at least one document is present in the index.
+        """
+        return self._fts.count_documents() > 0
+
+    def _purge_stale_excluded(self) -> int:
+        """Purge indexed documents that match ``exclude_patterns``.
+
+        Handles persistent indexes built before ``exclude_patterns`` were
+        configured (issue #255): matching rows are removed from the FTS
+        index and, when embeddings are configured, from the vector sidecar
+        (which is saved back to disk if anything was purged).
+
+        Returns:
+            Number of documents purged.
+        """
+        if not self._exclude_patterns:
+            return 0
+
+        # Load persisted vectors so stale entries are purged from the
+        # .npy sidecar too (build_embeddings skips if count > 0).
+        if (
+            self._vectors is None
+            and self._embedding_provider is not None
+            and self._embeddings_path is not None
+        ):
+            self._load_vectors()
+
+        purged = 0
+        for row in self._fts.list_notes():
+            if self._is_path_excluded(row["path"]):
+                self._fts.delete_by_path(row["path"])
+                if self._vectors is not None:
+                    self._vectors.delete_by_path(row["path"])
+                purged += 1
+
+        if purged and self._vectors is not None and self._embeddings_path is not None:
+            self._vectors.save(self._embeddings_path)
+
+        return purged
+
     def build_index(self, *, force: bool = False) -> IndexStats:
         """Scan source_dir and build the FTS index.
 
         If the index already contains documents and *force* is ``False``,
-        this is a no-op.  ``force=True`` drops all existing data and rebuilds
-        from scratch.
+        this is a no-op: the existing (persistent) index is adopted as-is
+        instead of re-upserting every document.  This holds across process
+        restarts — a fresh ``Collection`` opening a populated ``index_path``
+        does not rescan the vault.  Adopting an existing index purges any
+        documents that now match ``exclude_patterns`` but does not pick up
+        external file changes; call :meth:`reindex` for that.  ``force=True``
+        drops all existing data and rebuilds from scratch.
 
         Args:
             force: When ``True``, drop and rebuild the index unconditionally.
@@ -1160,16 +1213,27 @@ class Collection:
         Returns:
             :class:`~markdown_vault_mcp.types.IndexStats` describing what was indexed.
         """
-        # Check if index already has data and we are not forcing.
-        if not force and self._initialized:
-            existing = self._fts.list_notes()
-            if existing:
-                logger.debug(
-                    "build_index: index already populated (%d docs), skipping",
-                    len(existing),
-                )
+        # Check if index already has data and we are not forcing.  The check
+        # consults the persistent index itself (not just the in-memory
+        # _initialized flag) so a freshly spawned process adopts an
+        # already-populated on-disk index instead of re-upserting everything.
+        if not force:
+            existing_count = self._fts.count_documents()
+            if existing_count:
+                if not self._initialized:
+                    existing_count -= self._purge_stale_excluded()
+                    self._initialized = True
+                    logger.info(
+                        "build_index: adopted populated index docs=%d",
+                        existing_count,
+                    )
+                else:
+                    logger.debug(
+                        "build_index: index already populated (%d docs), skipping",
+                        existing_count,
+                    )
                 return IndexStats(
-                    documents_indexed=len(existing),
+                    documents_indexed=existing_count,
                     chunks_indexed=0,
                     skipped=0,
                 )
@@ -1202,36 +1266,6 @@ class Collection:
                 logger.warning(
                     "build_index: failed to index %s", note.path, exc_info=True
                 )
-
-        # Purge stale excluded docs from a persistent index that was built
-        # before exclude_patterns were configured (upgrade scenario, #255).
-        indexed_paths = {note.path for note in notes}
-        if self._exclude_patterns:
-            # Load persisted vectors so stale entries are purged from the
-            # .npy sidecar too (build_embeddings skips if count > 0).
-            if (
-                self._vectors is None
-                and self._embedding_provider is not None
-                and self._embeddings_path is not None
-            ):
-                self._load_vectors()
-
-            purged = 0
-            for row in self._fts.list_notes():
-                if row["path"] not in indexed_paths and self._is_path_excluded(
-                    row["path"]
-                ):
-                    self._fts.delete_by_path(row["path"])
-                    if self._vectors is not None:
-                        self._vectors.delete_by_path(row["path"])
-                    purged += 1
-
-            if (
-                purged
-                and self._vectors is not None
-                and self._embeddings_path is not None
-            ):
-                self._vectors.save(self._embeddings_path)
 
         # Count how many files were skipped due to required_frontmatter.
         # scan_directory logs skipped counts itself; we compute it by comparing
@@ -1348,28 +1382,12 @@ class Collection:
 
             # Purge stale excluded docs that were indexed before
             # exclude_patterns were enforced in reindex() (issue #255).
-            stale_excluded = 0
-            if self._exclude_patterns:
-                # Load persisted vectors so stale entries are purged from
-                # the .npy sidecar too (not just FTS).
-                if (
-                    self._vectors is None
-                    and self._embedding_provider is not None
-                    and self._embeddings_path is not None
-                ):
-                    self._load_vectors()
-
-                for row in self._fts.list_notes():
-                    if self._is_path_excluded(row["path"]):
-                        self._fts.delete_by_path(row["path"])
-                        if self._vectors is not None:
-                            self._vectors.delete_by_path(row["path"])
-                        stale_excluded += 1
-                if stale_excluded:
-                    logger.info(
-                        "reindex: purged %d stale excluded document(s)",
-                        stale_excluded,
-                    )
+            stale_excluded = self._purge_stale_excluded()
+            if stale_excluded:
+                logger.info(
+                    "reindex: purged %d stale excluded document(s)",
+                    stale_excluded,
+                )
 
             # Upsert parsed notes.
             indexed_added = 0
