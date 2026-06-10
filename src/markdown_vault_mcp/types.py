@@ -302,12 +302,17 @@ class ReindexResult:
         modified: Documents that changed since the last index.
         deleted: Documents removed since the last index.
         unchanged: Documents with no changes.
+        skipped: Files present on disk that were deliberately not indexed
+            (missing required frontmatter, matching an exclude pattern, or
+            unparseable), whether newly skipped this scan or unchanged since
+            they were last skipped (#665).
     """
 
     added: int
     modified: int
     deleted: int
     unchanged: int
+    skipped: int = 0
 
 
 @dataclass
@@ -388,12 +393,16 @@ class ChangeSet:
         modified: Paths of documents whose content changed.
         deleted: Paths of documents that no longer exist on disk.
         unchanged: Count of documents with no changes (not listed individually).
+        skipped_unchanged: Count of files previously recorded as skipped
+            (never indexed) whose content has not changed since; they appear
+            in no other bucket and need no re-evaluation (#665).
     """
 
     added: list[str]
     modified: list[str]
     deleted: list[str]
     unchanged: int
+    skipped_unchanged: int = 0
 
 
 @dataclass

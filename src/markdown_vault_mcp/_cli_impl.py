@@ -170,15 +170,17 @@ def _cmd_reindex(args: argparse.Namespace) -> None:
     vault.index.build_index()
     result = vault.index.reindex()
     logger.info(
-        "Reindex complete: %d added, %d modified, %d deleted, %d unchanged",
+        "Reindex complete: %d added, %d modified, %d deleted, %d unchanged, %d skipped",
         result.added,
         result.modified,
         result.deleted,
         result.unchanged,
+        result.skipped,
     )
     print(
         f"Reindex: {result.added} added, {result.modified} modified, "
-        f"{result.deleted} deleted, {result.unchanged} unchanged"
+        f"{result.deleted} deleted, {result.unchanged} unchanged, "
+        f"{result.skipped} skipped"
     )
     try:
         should_force = result.added > 0 or result.modified > 0 or result.deleted > 0

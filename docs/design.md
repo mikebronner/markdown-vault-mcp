@@ -342,7 +342,10 @@ for built-in names, or pass a custom instance.
 **Hash-based**, not git-based. Works with any directory, no git dependency.
 
 - **State file** (the JSON persistence layer for hash-based change detection):
-  `{relative_path: sha256_hash}` as JSON.
+  versioned format `{"version": 2, "indexed": {relative_path: sha256_hash},
+  "skipped": {relative_path: sha256_hash}}` as JSON (#665). The legacy flat
+  `{relative_path: sha256_hash}` format still loads — every entry is treated
+  as indexed — so upgrades need no migration step.
 - **Default path**: `{source_dir}/.markdown_vault_mcp/state.json` (when
   `state_path=None`).
 - On `reindex()`: scan all files, compare hashes to stored state, re-parse and
@@ -350,10 +353,22 @@ for built-in names, or pass a custom instance.
   `exclude_patterns` are skipped during re-parsing (mirroring `scan_directory`
   behaviour). Any previously indexed documents that now match `exclude_patterns`
   are purged from the FTS and vector indexes.
+- **Skipped-file memory (#665)**: deterministic skips — missing required
+  frontmatter, exclude-pattern matches, decode/parse errors — are recorded in
+  the `skipped` map with the file's content hash, during both full builds and
+  incremental reindexes. An unchanged skipped file is neither re-parsed nor
+  re-logged on later scans and is reported in the `skipped` count of
+  `ReindexResult` instead of `added`; it is re-evaluated (and indexed, if it
+  gained valid frontmatter) only when its content hash changes. Transient
+  `OSError` skips are deliberately *not* recorded, so those files retry on
+  every scan. A skipped file deleted from disk is dropped silently — it was
+  never indexed, so it is not counted as `deleted`.
 
-**Trigger model**: startup scan + explicit `reindex` tool call. No background
-polling in Phase 1. Architecture supports adding `watch_interval` or watchdog
-integration later without refactoring.
+**Trigger model**: boot reconciliation reindex (submitted by the server
+lifespan behind the initial build job, #665) + explicit `reindex` tool call
++ file watcher / git pull / webhook events. No background polling in Phase 1.
+Architecture supports adding `watch_interval` or watchdog integration later
+without refactoring.
 
 ### Incremental Reindex
 
@@ -550,7 +565,20 @@ Submission returns a `concurrent.futures.Future`; callers wait via
 `reindex()`, `build_embeddings()`) or fire-and-forget via the `*_async`
 counterparts (e.g. MCP-tool-level `reindex` and `build_embeddings`, both of
 which return `{"status": "queued"}` immediately and let the writer thread
-do the work). Follow-up submissions issued from inside the writer thread
+do the work).
+
+**Boot reconciliation (#665).** The server lifespan submits
+`reindex_async()` immediately after `build_index_async()`. On a warm
+restart the build short-circuits in O(1) via the FTS sentinel and scans
+nothing, so the queued `ReindexAll` job is what picks up files added,
+modified, or deleted while no server was running (the file watcher only
+sees future events). FIFO ordering guarantees build-before-reindex; on a
+cold boot the full build has just recorded tracker state — including
+skipped files — so the reindex degenerates to a hash scan with zero
+re-parses and zero re-upserts. While the boot reindex is pending or in
+flight the writer is non-drained, so the `_meta.index_stale` signal
+(#646) honestly reports `true` to early readers until offline changes are
+reconciled — no extra staleness bookkeeping is needed. Follow-up submissions issued from inside the writer thread
 itself succeed even during shutdown drain, so `ProcessDirtyPaths` can
 chain into `FlushDirtyEmbeddings` and both flush before the sentinel
 terminates the worker loop.
@@ -1086,6 +1114,7 @@ class ReindexResult:
     modified: int
     deleted: int
     unchanged: int
+    skipped: int = 0                  # deliberately not indexed (#665)
 
 @dataclass
 class VaultStats:
@@ -1109,6 +1138,7 @@ class ChangeSet:
     modified: list[str]
     deleted: list[str]
     unchanged: int
+    skipped_unchanged: int = 0        # recorded skips, content unchanged (#665)
 
 # --- Graph types ---
 
@@ -1584,12 +1614,16 @@ class ChangeTracker:
     def __init__(self, state_path: Path): ...
     def detect_changes(self, source_dir: Path,
                        glob_pattern: str = "**/*.md") -> ChangeSet: ...
-    def update_state(self, notes: list[ParsedNote]) -> None: ...
+    def update_state(self, notes: list[ParsedNote],
+                     skipped: dict[str, str] | None = None) -> None: ...
     def reset(self) -> None: ...
 ```
 
 `tracker.py` is entirely new code (no ifcraftcorpus equivalent). State file
-format: `{"Journal/note.md": "sha256hex", ...}` as JSON.
+format (version 2, #665): `{"version": 2, "indexed": {"Journal/note.md":
+"sha256hex", ...}, "skipped": {"CLAUDE.md": "sha256hex", ...}}` as JSON.
+The legacy flat `{"Journal/note.md": "sha256hex", ...}` format loads with
+every entry treated as indexed.
 
 ### `server.py` -- Generic MCP Server
 

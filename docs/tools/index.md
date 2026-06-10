@@ -235,9 +235,12 @@ build attempt.
 
 ### `reindex`
 
-Incrementally update the full-text search index to reflect file changes made outside this server. Only processes changed files — unchanged documents are skipped.
+Incrementally update the full-text search index to reflect file changes made outside this server. Only processes changed files — unchanged documents are skipped, and files deliberately excluded from the index (missing required frontmatter, exclude-pattern matches, unparseable content) are remembered across scans so they are not re-parsed or re-reported until their content changes (#665).
 
 If semantic search is configured, the queued reindex job re-embeds the changed documents on the writer thread. Poll `get_index_status` and watch the `dirty_embeddings` counter to observe completion.
+
+!!! note "Boot reconciliation"
+    The server lifespan automatically queues one incremental reindex at every startup (#665), so files added, modified, or deleted while no server was running are reconciled without a manual `reindex` call. Reads served before that job completes report `index_stale: true` in `_meta`.
 
 **Returns:** `{"status": "queued"}`. The reindex runs asynchronously on the single-owner :class:`IndexWriter` thread (#559); poll `get_server_info` or `get_index_status` for completion. `get_index_status` exposes `queue_depth`, `in_flight`, `dirty_paths`, and `dirty_embeddings` so you can observe progress without blocking.
 

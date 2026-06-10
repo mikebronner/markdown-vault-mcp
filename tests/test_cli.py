@@ -905,6 +905,7 @@ class TestCmdReindex:
         mock_result.modified = 1
         mock_result.deleted = 2
         mock_result.unchanged = 10
+        mock_result.skipped = 4
 
         mock_vault = MagicMock()
         mock_vault.index.reindex.return_value = mock_result
@@ -918,6 +919,7 @@ class TestCmdReindex:
         assert "1 modified" in captured.out
         assert "2 deleted" in captured.out
         assert "10 unchanged" in captured.out
+        assert "4 skipped" in captured.out
 
     @patch("markdown_vault_mcp._cli_impl._build_vault")
     def test_reindex_builds_embeddings_when_configured(
