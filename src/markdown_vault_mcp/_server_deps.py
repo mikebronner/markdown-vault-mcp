@@ -93,8 +93,10 @@ def make_collection_lifespan(config: CollectionConfig) -> Any:
             )
 
         # Build embeddings eagerly when an embedding provider is configured.
-        # build_embeddings() skips work if the vector index already exists on disk,
-        # so this is safe to call on every startup.
+        # build_embeddings() converges the persisted vector index to the FTS
+        # index: chunks added/changed while the server was down are embedded
+        # and vectors for deleted documents are dropped, so semantic search
+        # never drifts from keyword search.  Work scales with the diff size.
         if embedding_provider is not None:
             chunks_embedded = await asyncio.to_thread(collection.build_embeddings)
             logger.info("Embeddings ready: %d chunks", chunks_embedded)

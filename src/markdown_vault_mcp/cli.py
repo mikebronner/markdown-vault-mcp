@@ -197,10 +197,11 @@ def _cmd_reindex(args: argparse.Namespace) -> None:
         f"{result.skipped} skipped"
     )
     try:
-        should_force = result.added > 0 or result.modified > 0 or result.deleted > 0
-        n = collection.build_embeddings(force=should_force)
-        logger.info("Embedded %d chunks", n)
-        print(f"Embedded {n} chunks")
+        # build_embeddings() converges the vector index to the FTS index,
+        # embedding only the changed chunks — no force rebuild needed.
+        n = collection.build_embeddings()
+        logger.info("Embeddings ready: %d chunks", n)
+        print(f"Embeddings ready: {n} chunks")
     except ValueError:
         pass  # embeddings not configured
 

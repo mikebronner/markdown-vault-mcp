@@ -255,6 +255,17 @@ Two methods manage the index:
 - **`reindex()`**: incremental update. Uses `ChangeTracker` to detect
   adds/modifies/deletes since the last scan and applies only the delta.
   Applies `exclude_patterns` filtering and purges stale excluded documents.
+- **`build_embeddings(force=False)`**: vector-index convergence. Without
+  `force`, diffs the persisted vector index against the chunks currently in
+  the FTS index (chunk identity: the `(title, heading, content)` multiset
+  per document path) and reconciles: missing chunks are embedded and added,
+  vectors for documents no longer in the FTS index are removed, and
+  documents whose indexed content changed are re-embedded. After every call
+  the vector index mirrors the FTS chunk set exactly, logged as a single
+  summary line (`build_embeddings: +N added, -M removed, K up-to-date`).
+  Embedding work scales with the diff size, not the vault size. An empty
+  vector index (cold boot) builds everything; `force=True` discards and
+  rebuilds from scratch (e.g. after an embedding-model change).
 
 **Server startup**: the MCP server lifespan checks
 `Collection.has_indexed_documents()`. When the persistent index is already
@@ -262,7 +273,10 @@ populated it runs `reindex()` (adopt + incremental delta for files changed
 while the server was down); only an empty index triggers a full
 `build_index()`. This keeps boot time independent of vault size and avoids
 SQLite write contention between concurrent server processes sharing one
-`index_path`.
+`index_path`. `build_embeddings()` then converges the vector index, so
+documents that entered the FTS index via the boot-time `reindex()` (written
+while no server was running) are embedded instead of silently accumulating
+as semantic-search drift.
 
 **Lazy initialization**: on first call to `search()`, `list()`, or `read()`,
 `Collection` lazily builds the FTS index from `source_dir` if no pre-built
@@ -296,8 +310,8 @@ pathological memory allocation from embedding providers (see issue #159).
 FastEmbed's ONNX inference uses a further inner batch size of 4 to keep
 per-call memory bounded — without this, the ONNX attention matrix for 64 long
 chunks can require >192 GB of allocation. The save happens once at the end so a
-mid-run crash does not leave a partial index that the skip-if-exists check
-treats as complete on the next startup.
+mid-run crash does not leave a partial index on disk; whatever was persisted
+last is simply converged against the FTS index on the next startup.
 
 ### Thread Safety
 
@@ -382,7 +396,7 @@ Collection(...)
   → sync_from_remote_before_index()   # git fetch + ff-only before first index
   → build_index() or reindex()        # full build (empty index) or
                                       # adopt + incremental delta (populated)
-  → build_embeddings()                # build vector index (when configured)
+  → build_embeddings()                # converge vector index to FTS (when configured)
   → start()                           # launch background pull loop
   → zero or more read/write operations
   → close()                           # stop pull loop, flush git, release SQLite

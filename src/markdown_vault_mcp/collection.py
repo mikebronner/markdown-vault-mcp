@@ -20,7 +20,7 @@ import sqlite3
 import tempfile
 import threading
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -1174,7 +1174,8 @@ class Collection:
             return 0
 
         # Load persisted vectors so stale entries are purged from the
-        # .npy sidecar too (build_embeddings skips if count > 0).
+        # .npy sidecar too, keeping it consistent immediately (the next
+        # build_embeddings() convergence would also remove them).
         if (
             self._vectors is None
             and self._embedding_provider is not None
@@ -1495,14 +1496,25 @@ class Collection:
         )
 
     def build_embeddings(self, *, force: bool = False) -> int:
-        """Build the vector index from all chunks currently in the FTS index.
+        """Build or converge the vector index against the FTS index.
+
+        Without ``force``, the persisted vector index is diffed against the
+        chunks currently in the FTS index and reconciled: chunks present in
+        the FTS index but missing from the vector index are embedded and
+        added, vectors for documents no longer in the FTS index are removed,
+        and documents whose indexed content changed are re-embedded.  After
+        every call the vector index mirrors the FTS chunk set exactly, so
+        external changes picked up by a boot-time :meth:`reindex` (while no
+        vector index was loaded) cannot accumulate as permanent
+        semantic-search drift.  Work scales with the size of the diff, not
+        the size of the vault.
 
         Args:
-            force: If ``True``, rebuild from scratch even if a vector index
-                already exists on disk.
+            force: If ``True``, discard any existing vectors and rebuild the
+                index from scratch (e.g. after changing the embedding model).
 
         Returns:
-            Total number of chunks embedded.
+            Total number of chunks in the vector index after the call.
 
         Raises:
             ValueError: If ``embedding_provider`` or ``embeddings_path`` is
@@ -1521,12 +1533,9 @@ class Collection:
         else:
             # Load persisted vectors (or create empty) so we can check count.
             self._load_vectors()
+            assert self._vectors is not None
             if self._vectors.count > 0:
-                logger.info(
-                    "build_embeddings: index already exists (%d chunks), skipping",
-                    self._vectors.count,
-                )
-                return self._vectors.count
+                return self._converge_embeddings()
             # Empty index — fall through to build from scratch.
 
         rows = self._fts.list_notes()
@@ -1586,6 +1595,88 @@ class Collection:
         else:
             logger.info("build_embeddings: nothing to embed")
         return total
+
+    def _converge_embeddings(self) -> int:
+        """Reconcile the loaded vector index with the FTS chunk set.
+
+        Chunk identity is the ``(title, heading, content)`` multiset per
+        document path — exactly the metadata stored alongside each vector
+        row.  Documents present only in the vector index are removed;
+        documents missing from it are embedded; documents whose chunk
+        multiset differs in any way (modified content, changed title) are
+        re-embedded in full.
+
+        Follows the two-phase locking discipline of
+        :meth:`_flush_dirty_embeddings`: the snapshot/diff and the fast
+        numpy mutations run under ``_write_lock``, while the (potentially
+        slow) embedding provider runs outside it.  The window between
+        phases is the same accepted TOCTOU as deferred flushes — any
+        concurrent change is reconciled by the next flush or boot.
+
+        Returns:
+            Total number of chunks in the vector index after convergence.
+        """
+        assert self._vectors is not None
+        assert self._embeddings_path is not None
+        assert self._embedding_provider is not None
+        vectors = self._vectors
+
+        def _signature(rows: list[dict]) -> Counter:
+            return Counter(
+                (r.get("title"), r.get("heading"), r.get("content")) for r in rows
+            )
+
+        # Phase 1: snapshot both sides and compute the diff under the lock.
+        with self._write_lock:
+            fts_by_path: dict[str, list[dict]] = defaultdict(list)
+            for row in self._fts.list_chunks():
+                fts_by_path[row["path"]].append(row)
+            vec_by_path = vectors.chunks_by_path()
+
+            stale_paths = [p for p in vec_by_path if p not in fts_by_path]
+            refresh_paths: list[str] = []
+            to_embed: list[dict] = []
+            up_to_date = 0
+            for path, rows in fts_by_path.items():
+                existing = vec_by_path.get(path)
+                if existing is None:
+                    to_embed.extend(rows)
+                elif _signature(rows) != _signature(existing):
+                    refresh_paths.append(path)
+                    to_embed.extend(rows)
+                else:
+                    up_to_date += len(rows)
+
+        # Phase 2: embed outside the lock — the provider can take seconds
+        # per batch and must not block foreground writes.  Bounded batches
+        # avoid pathological provider memory allocation (issue #159).
+        texts = [row["content"] for row in to_embed]
+        raw_vectors: list[list[float]] = []
+        for start in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
+            raw_vectors.extend(
+                self._embedding_provider.embed(
+                    texts[start : start + _EMBEDDING_BATCH_SIZE]
+                )
+            )
+
+        # Phase 3: apply fast numpy mutations and save under the lock.
+        with self._write_lock:
+            removed = 0
+            for path in stale_paths + refresh_paths:
+                removed += vectors.delete_by_path(path)
+            added = 0
+            if raw_vectors:
+                added = vectors.add_vectors(raw_vectors, to_embed)
+            if removed or added:
+                vectors.save(self._embeddings_path)
+
+        logger.info(
+            "build_embeddings: +%d added, -%d removed, %d up-to-date",
+            added,
+            removed,
+            up_to_date,
+        )
+        return vectors.count
 
     def embeddings_status(self) -> dict:
         """Return status information about the vector index.

@@ -98,6 +98,48 @@ class TestVectorIndexAdd:
         assert index.count == 3
 
 
+class TestChunksByPath:
+    def test_chunks_by_path_groups_rows_in_storage_order(
+        self, mock_provider: MockEmbeddingProvider
+    ) -> None:
+        """chunks_by_path() groups metadata rows by document path."""
+        index = VectorIndex(mock_provider)
+        index.add(
+            ["a-intro", "b-only", "a-details"],
+            [
+                _make_meta("a.md", heading=None),
+                _make_meta("b.md", heading="Only"),
+                _make_meta("a.md", heading="Details"),
+            ],
+        )
+
+        grouped = index.chunks_by_path()
+
+        assert set(grouped) == {"a.md", "b.md"}
+        assert [r["heading"] for r in grouped["a.md"]] == [None, "Details"]
+        assert len(grouped["b.md"]) == 1
+        assert set(grouped["a.md"][0]) == _METADATA_KEYS
+
+    def test_chunks_by_path_returns_copies(
+        self, mock_provider: MockEmbeddingProvider
+    ) -> None:
+        """Mutating a returned row must not corrupt the stored metadata."""
+        index = VectorIndex(mock_provider)
+        index.add(["text"], [_make_meta("a.md")])
+
+        grouped = index.chunks_by_path()
+        grouped["a.md"][0]["content"] = "mutated"
+
+        assert index.chunks_by_path()["a.md"][0]["content"] != "mutated"
+
+    def test_chunks_by_path_empty_index(
+        self, mock_provider: MockEmbeddingProvider
+    ) -> None:
+        """An empty index yields an empty mapping."""
+        index = VectorIndex(mock_provider)
+        assert index.chunks_by_path() == {}
+
+
 class TestVectorIndexAddVectors:
     """Tests for VectorIndex.add_vectors() — pre-computed vector ingestion."""
 

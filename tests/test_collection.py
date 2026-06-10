@@ -3162,13 +3162,13 @@ class TestEmbeddingsStatus:
 
 
 class TestBuildEmbeddings:
-    def test_build_embeddings_skip_when_already_built(
+    def test_build_embeddings_noop_when_converged(
         self,
         vault_path: Path,
         tmp_path: Path,
         mock_provider: MockEmbeddingProvider,
     ) -> None:
-        """build_embeddings(force=False) skips rebuild when index already has chunks.
+        """build_embeddings(force=False) does no work when vectors match FTS.
 
         The first call embeds 9 chunks and saves to disk.  The second call (no
         force) must return the same count without re-embedding.
@@ -3308,6 +3308,220 @@ class TestBuildEmbeddings:
         # The .npy file must exist (saved at the end).
         npy_path = tmp_path / "embeddings.npy"
         assert npy_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# build_embeddings() convergence (boot-time embedding drift, issue: vector
+# index frozen while FTS index grows via boot reindex)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildEmbeddingsConvergence:
+    """build_embeddings() must converge the vector index to the FTS index.
+
+    Simulates the MCP server boot sequence: a fresh ``Collection`` over a
+    persistent ``index_path``/``embeddings_path`` runs ``reindex()`` (while
+    no vector index is loaded — exactly the lifespan code path) followed by
+    ``build_embeddings()``.  Files changed externally while "down" must be
+    reflected in the vector index after boot.
+    """
+
+    @staticmethod
+    def _boot(
+        vault_path: Path,
+        tmp_path: Path,
+        provider: MockEmbeddingProvider,
+    ) -> Collection:
+        """Replicate the server lifespan boot sequence."""
+        col = Collection(
+            source_dir=vault_path,
+            index_path=tmp_path / "index.db",
+            embeddings_path=tmp_path / "embeddings",
+            embedding_provider=provider,
+        )
+        if col.has_indexed_documents():
+            col.reindex()
+        else:
+            col.build_index()
+        col.build_embeddings()
+        return col
+
+    @staticmethod
+    def _track_embeds(
+        provider: MockEmbeddingProvider,
+    ) -> list[list[str]]:
+        """Record every batch of texts passed to provider.embed()."""
+        original_embed = provider.embed
+        calls: list[list[str]] = []
+
+        def tracking_embed(texts: list[str]) -> list[list[float]]:
+            calls.append(list(texts))
+            return original_embed(texts)
+
+        provider.embed = tracking_embed  # type: ignore[method-assign]
+        return calls
+
+    def test_boot_with_no_drift_does_no_embedding_work(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """Second boot with vectors == FTS embeds nothing and drops nothing."""
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        count1 = col1._load_vectors().count
+        col1.close()
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        assert calls == []
+        vectors = col2._load_vectors()
+        assert vectors.count == count1
+        assert vectors.count == col2._fts.count_chunks()
+        col2.close()
+
+    def test_boot_embeds_documents_added_while_down(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """Files written externally while no server runs get embedded at boot."""
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        count1 = col1._load_vectors().count
+        col1.close()
+
+        # External process (e.g. a hook) writes new notes while "down".
+        (vault_path / "hook_summary.md").write_text(
+            "# Hook Summary\n\nSession summary written by a hook.\n"
+        )
+        (vault_path / "hook_followup.md").write_text(
+            "# Hook Followup\n\nFollow-up note written by a hook.\n"
+        )
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        # Exactly the new chunks were embedded — nothing re-embedded.
+        embedded_texts = [t for batch in calls for t in batch]
+        assert len(embedded_texts) == 2
+        assert any("Session summary" in t for t in embedded_texts)
+        assert any("Follow-up note" in t for t in embedded_texts)
+
+        vectors = col2._load_vectors()
+        assert vectors.count == count1 + 2
+        assert vectors.count == col2._fts.count_chunks()
+        by_path = vectors.chunks_by_path()
+        assert "hook_summary.md" in by_path
+        assert "hook_followup.md" in by_path
+
+        # The new document is reachable via semantic search.  The mock
+        # provider's vectors are hash-based (no real semantics), so use a
+        # limit that returns every chunk and assert reachability only.
+        results = col2.search(
+            "Session summary written by a hook", mode="semantic", limit=50
+        )
+        assert any(r.path == "hook_summary.md" for r in results)
+        col2.close()
+
+    def test_boot_removes_vectors_for_documents_deleted_while_down(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """Vectors for files deleted externally are dropped at boot."""
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        vectors1 = col1._load_vectors()
+        doomed_chunks = len(vectors1.chunks_by_path()["simple.md"])
+        assert doomed_chunks > 0
+        count1 = vectors1.count
+        col1.close()
+
+        (vault_path / "simple.md").unlink()
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        assert calls == []
+        vectors = col2._load_vectors()
+        assert "simple.md" not in vectors.chunks_by_path()
+        assert vectors.count == count1 - doomed_chunks
+        assert vectors.count == col2._fts.count_chunks()
+        col2.close()
+
+    def test_boot_refreshes_vectors_for_documents_modified_while_down(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """Modified documents get fresh vectors; stale chunk vectors are gone."""
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        col1.close()
+
+        (vault_path / "simple.md").write_text(
+            "# Simple Document\n\nCompletely rewritten body about gardening.\n"
+        )
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        # Only the modified document's chunks were embedded.
+        embedded_texts = [t for batch in calls for t in batch]
+        assert len(embedded_texts) > 0
+        assert all("gardening" in t for t in embedded_texts)
+
+        vectors = col2._load_vectors()
+        rows = vectors.chunks_by_path()["simple.md"]
+        assert all("gardening" in r["content"] for r in rows)
+        # No stale vectors for the old content remain anywhere.
+        all_rows = [r for rs in vectors.chunks_by_path().values() for r in rs]
+        assert not any("Section Two" in r["content"] for r in all_rows)
+        assert vectors.count == col2._fts.count_chunks()
+        col2.close()
+
+    def test_boot_converges_legacy_drifted_vector_index(
+        self,
+        vault_path: Path,
+        tmp_path: Path,
+        mock_provider: MockEmbeddingProvider,
+    ) -> None:
+        """A historic vectors-subset-of-FTS state heals in a single boot.
+
+        Reproduces the observed 307/1379 drift in miniature: the persisted
+        vector index is missing several documents that the FTS index knows
+        about.  One boot must embed exactly the missing chunks.
+        """
+        from markdown_vault_mcp.vector_index import VectorIndex
+
+        col1 = self._boot(vault_path, tmp_path, mock_provider)
+        fts_chunks = col1._fts.count_chunks()
+        col1.close()
+
+        # Corrupt the sidecar the way older code did: drop some documents'
+        # vectors while FTS keeps them.
+        embeddings_path = tmp_path / "embeddings"
+        vectors = VectorIndex.load(embeddings_path, mock_provider)
+        dropped = vectors.delete_by_path("simple.md")
+        dropped += vectors.delete_by_path("unicode.md")
+        assert dropped > 0
+        vectors.save(embeddings_path)
+
+        calls = self._track_embeds(mock_provider)
+        col2 = self._boot(vault_path, tmp_path, mock_provider)
+
+        # Exactly the missing chunks were re-embedded.
+        embedded_texts = [t for batch in calls for t in batch]
+        assert len(embedded_texts) == dropped
+
+        converged = col2._load_vectors()
+        assert converged.count == fts_chunks
+        by_path = converged.chunks_by_path()
+        assert "simple.md" in by_path
+        assert "unicode.md" in by_path
+        col2.close()
 
 
 # ---------------------------------------------------------------------------

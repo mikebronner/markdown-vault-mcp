@@ -760,6 +760,29 @@ class FTSIndex:
         )
         return [row[0] for row in cur.fetchall()]
 
+    def list_chunks(self) -> list[dict]:
+        """Return every indexed chunk joined with its document metadata.
+
+        Used to converge the vector index against the FTS index: the
+        returned rows have exactly the shape stored as vector-row
+        metadata, so callers can diff and embed without re-parsing
+        source files.
+
+        Returns:
+            List of dicts with keys ``path``, ``title``, ``folder``,
+            ``heading`` (may be ``None``), and ``content``, ordered by
+            document path then chunk position.
+        """
+        cur = self._conn.execute(
+            """
+            SELECT d.path, d.title, d.folder, s.heading, s.content
+            FROM sections AS s
+            JOIN documents AS d ON d.id = s.document_id
+            ORDER BY d.path, s.id
+            """
+        )
+        return [dict(row) for row in cur.fetchall()]
+
     def count_documents(self) -> int:
         """Return the total number of rows in the ``documents`` table.
 

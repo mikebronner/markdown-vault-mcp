@@ -761,17 +761,20 @@ def register_tools(mcp: FastMCP, *, transport: str = "stdio") -> None:
     ) -> dict[str, Any]:
         """Rebuild vector embeddings for semantic and hybrid search.
 
-        Embeddings are built automatically on startup, so this is normally
-        not needed. Use force=True to rebuild from scratch after changing
-        the embedding model. Without force, skips if embeddings already exist.
+        Embeddings are converged automatically on startup, so this is
+        normally not needed. Without force, the vector index is diffed
+        against the search index: missing or changed chunks are embedded
+        and stale vectors are removed. Use force=True to rebuild from
+        scratch after changing the embedding model.
 
         Args:
             force: When True, discards existing embeddings and rebuilds from
                 scratch. Use only if the embedding model has changed.
-                False (default) only embeds chunks not yet embedded.
+                False (default) embeds only missing or changed chunks.
 
         Returns:
-            Dict with chunks_embedded: number of chunks newly embedded.
+            Dict with chunks_embedded: total chunks in the vector index
+            after the call.
         """
         count = await asyncio.to_thread(collection.build_embeddings, force=force)
         return {"chunks_embedded": count}

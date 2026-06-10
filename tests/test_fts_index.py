@@ -624,6 +624,51 @@ class TestGetNote:
         assert idx.get_note("nonexistent.md") is None
 
 
+class TestListChunks:
+    def test_list_chunks_returns_all_chunks_with_document_metadata(self) -> None:
+        """list_chunks() joins sections with document path/title/folder."""
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "Journal/entry.md",
+                title="My Entry",
+                chunks=[
+                    Chunk(heading=None, heading_level=0, content="intro", start_line=0),
+                    Chunk(
+                        heading="Details",
+                        heading_level=2,
+                        content="the details",
+                        start_line=5,
+                    ),
+                ],
+            )
+        )
+        idx.upsert_note(make_note("alpha.md", title="Alpha"))
+
+        rows = idx.list_chunks()
+
+        assert len(rows) == 3
+        # Ordered by path, then chunk position.
+        assert [r["path"] for r in rows] == [
+            "Journal/entry.md",
+            "Journal/entry.md",
+            "alpha.md",
+        ]
+        first = rows[0]
+        assert set(first) == {"path", "title", "folder", "heading", "content"}
+        assert first["title"] == "My Entry"
+        assert first["folder"] == "Journal"
+        assert first["heading"] is None
+        assert first["content"] == "intro"
+        assert rows[1]["heading"] == "Details"
+        assert rows[1]["content"] == "the details"
+
+    def test_list_chunks_empty_index_returns_empty_list(self) -> None:
+        """list_chunks() on an empty index returns []."""
+        idx = FTSIndex(":memory:")
+        assert idx.list_chunks() == []
+
+
 class TestInMemoryMode:
     def test_in_memory_mode_works(self) -> None:
         """FTSIndex with ':memory:' is functional end-to-end."""
