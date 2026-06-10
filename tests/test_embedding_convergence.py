@@ -211,6 +211,35 @@ class TestBootEmbeddingConvergence:
         all_rows = [r for rows in by_path.values() for r in rows]
         assert not any("Original body 1" in r["content"] for r in all_rows)
 
+    def test_boot_refreshes_metadata_for_line_shift_only_edit(
+        self, tmp_path: Path
+    ) -> None:
+        """An edit that only shifts line numbers (identical chunk content)
+        still refreshes start_line in vector metadata (#668 review)."""
+        provider = MockEmbeddingProvider()
+        vault_dir = _make_vault_dir(tmp_path)
+        v1 = _boot(vault_dir, tmp_path, provider)
+        v1.close()
+
+        # Prepend blank lines: chunk content unchanged, start_line shifts.
+        original = (vault_dir / "note_1.md").read_text(encoding="utf-8")
+        (vault_dir / "note_1.md").write_text("\n\n" + original, encoding="utf-8")
+
+        v2 = _boot(vault_dir, tmp_path, provider)
+        fts_lines = {
+            (r["content"], r["start_line"])
+            for r in v2._fts.list_chunks()
+            if r["path"] == "note_1.md"
+        }
+        v2.close()
+
+        persisted = VectorIndex.load(tmp_path / "vectors", provider)
+        vec_lines = {
+            (r["content"], r["start_line"])
+            for r in persisted.chunks_by_path()["note_1.md"]
+        }
+        assert vec_lines == fts_lines
+
     def test_boot_converges_legacy_drifted_vector_index(self, tmp_path: Path) -> None:
         """A historic vectors-subset-of-FTS state heals in a single boot.
 

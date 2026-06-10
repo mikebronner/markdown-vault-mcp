@@ -709,9 +709,21 @@ class IndexManager:
                 "_require_vectors() must be called before _converge_embeddings()"
             )
 
-        def _signature(rows: list[dict[str, Any]]) -> Counter[tuple[Any, Any, Any]]:
+        def _signature(
+            rows: list[dict[str, Any]],
+        ) -> Counter[tuple[Any, Any, Any, Any]]:
+            # start_line participates so that line-shift-only edits (content
+            # identical, positions moved) still refresh vector metadata; the
+            # cost is re-embedding that one doc's chunks, and embeddings are
+            # deterministic for identical content.
             return Counter(
-                (r.get("title"), r.get("heading"), r.get("content")) for r in rows
+                (
+                    r.get("title"),
+                    r.get("heading"),
+                    r.get("content"),
+                    r.get("start_line"),
+                )
+                for r in rows
             )
 
         fts_by_path: dict[str, list[dict[str, Any]]] = {}
