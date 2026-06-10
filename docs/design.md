@@ -212,7 +212,13 @@ for built-in names, or pass a custom instance.
 **Hash-based**, not git-based. Works with any directory, no git dependency.
 
 - **State file** (the JSON persistence layer for hash-based change detection):
-  `{relative_path: sha256_hash}` as JSON.
+  `{"version": 2, "indexed": {relative_path: sha256_hash}, "skipped": {relative_path: sha256_hash}}`
+  as JSON. The `skipped` map records files seen on disk but deliberately not
+  indexed (missing required frontmatter, excluded, unparseable), so they are
+  not re-reported as added — and their skips not re-logged — on every scan; a
+  skipped file is re-evaluated only when its content hash changes. The legacy
+  flat format (`{relative_path: sha256_hash}`) still loads, with all entries
+  treated as indexed.
 - **Default path**: `{source_dir}/.markdown_vault_mcp/state.json` (when
   `state_path=None`).
 - On `reindex()`: scan all files, compare hashes to stored state, re-parse and
@@ -547,6 +553,7 @@ class ReindexResult:
     modified: int
     deleted: int
     unchanged: int
+    skipped: int = 0                  # files on disk deliberately not indexed
 
 @dataclass
 class CollectionStats:
@@ -570,6 +577,7 @@ class ChangeSet:
     modified: list[str]
     deleted: list[str]
     unchanged: int
+    skipped_unchanged: int = 0        # known-skipped files, content unchanged
 
 # --- Graph types ---
 
@@ -1001,12 +1009,16 @@ class ChangeTracker:
     def __init__(self, state_path: Path): ...
     def detect_changes(self, source_dir: Path,
                        glob_pattern: str = "**/*.md") -> ChangeSet: ...
-    def update_state(self, notes: list[ParsedNote]) -> None: ...
+    def update_state(self, notes: list[ParsedNote],
+                     skipped: dict[str, str] | None = None) -> None: ...
     def reset(self) -> None: ...
 ```
 
 `tracker.py` is entirely new code (no ifcraftcorpus equivalent). State file
-format: `{"Journal/note.md": "sha256hex", ...}` as JSON.
+format (version 2):
+`{"version": 2, "indexed": {"Journal/note.md": "sha256hex", ...}, "skipped": {"CLAUDE.md": "sha256hex", ...}}`
+as JSON. The legacy flat format (`{"Journal/note.md": "sha256hex", ...}`)
+still loads; all entries are treated as indexed.
 
 ### `mcp_server.py` -- Generic MCP Server
 

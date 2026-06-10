@@ -742,7 +742,7 @@ def register_tools(mcp: FastMCP, *, transport: str = "stdio") -> None:
         model), use 'build_embeddings' with force=True instead.
 
         Returns:
-            Dict with counts: added, modified, deleted, unchanged.
+            Dict with counts: added, modified, deleted, unchanged, skipped.
         """
         result = await asyncio.to_thread(collection.reindex)
         return asdict(result)

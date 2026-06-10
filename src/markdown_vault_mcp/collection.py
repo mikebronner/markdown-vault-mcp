@@ -1276,8 +1276,26 @@ class Collection:
         # Resolve vault-wide wikilinks now that all documents are indexed.
         self._fts.resolve_vault_wikilinks()
 
+        # Record skipped files (excluded, missing frontmatter, unparseable)
+        # in tracker state too, so the first reindex() does not re-report
+        # them as added and re-log every skip.
+        indexed_paths = {note.path for note in notes}
+        skipped_state: dict[str, str] = {}
+        for abs_path in all_files:
+            if not abs_path.is_file():
+                continue
+            rel_str = abs_path.relative_to(self._source_dir).as_posix()
+            if rel_str in indexed_paths:
+                continue
+            try:
+                skipped_state[rel_str] = compute_file_hash(abs_path)
+            except OSError as exc:
+                logger.debug(
+                    "build_index: cannot hash skipped file %s (%s)", rel_str, exc
+                )
+
         # Update tracker state so reindex() knows the baseline.
-        self._tracker.update_state(notes)
+        self._tracker.update_state(notes, skipped=skipped_state)
 
         self._initialized = True
         if errored:
@@ -1323,11 +1341,12 @@ class Collection:
         # Phase 1: scan (outside lock — read-only filesystem walk + hashing).
         changes = self._tracker.detect_changes(self._source_dir)
         logger.info(
-            "reindex: %d added, %d modified, %d deleted, %d unchanged",
+            "reindex: %d added, %d modified, %d deleted, %d unchanged, %d skipped",
             len(changes.added),
             len(changes.modified),
             len(changes.deleted),
             changes.unchanged,
+            changes.skipped_unchanged,
         )
 
         # Pre-parse notes outside the lock to minimise lock hold time.
@@ -1337,18 +1356,39 @@ class Collection:
         # written content is indexed rather than the version that triggered
         # the change.  This is acceptable — the next reindex() call will
         # reconcile the difference.
+        # Files seen this scan but deliberately not indexed.  Recording their
+        # content hash in tracker state means an unchanged skipped file is
+        # neither re-parsed nor re-reported (or re-logged) on the next scan;
+        # it is only re-evaluated when its content changes.  Transient I/O
+        # errors are NOT recorded, so those files are retried on every scan.
+        newly_skipped: dict[str, str] = {}
+
+        def _record_skip(rel_path: str, abs_file: Path) -> None:
+            """Record a deterministically skipped file's current hash."""
+            try:
+                newly_skipped[rel_path] = compute_file_hash(abs_file)
+            except OSError as exc:
+                logger.debug("reindex: cannot hash skipped file %s (%s)", rel_path, exc)
+
         parsed: list[tuple[str, ParsedNote]] = []
         for path in changes.added + changes.modified:
+            abs_path = self._source_dir / path
+
             # Apply exclude_patterns — mirrors scan_directory behaviour.
             if self._is_path_excluded(path):
                 logger.debug("reindex: excluding %s (matched exclude pattern)", path)
+                _record_skip(path, abs_path)
                 continue
 
-            abs_path = self._source_dir / path
             try:
                 note = parse_note(abs_path, self._source_dir, self._chunk_strategy)
-            except (UnicodeDecodeError, OSError) as exc:
+            except OSError as exc:
+                # Possibly transient — do not record; retry on the next scan.
                 logger.warning("reindex: skipping %s — %s", path, exc)
+                continue
+            except UnicodeDecodeError as exc:
+                logger.warning("reindex: skipping %s — %s", path, exc)
+                _record_skip(path, abs_path)
                 continue
             except Exception as exc:
                 logger.warning(
@@ -1357,6 +1397,7 @@ class Collection:
                     exc,
                     exc_info=True,
                 )
+                _record_skip(path, abs_path)
                 continue
 
             # Apply required_frontmatter filter.
@@ -1368,6 +1409,7 @@ class Collection:
                     logger.info(
                         "reindex: skipping %s — missing frontmatter: %s", path, missing
                     )
+                    newly_skipped[path] = note.content_hash
                     continue
 
             parsed.append((path, note))
@@ -1442,13 +1484,14 @@ class Collection:
                 )
                 for r in self._fts.list_notes()
             ]
-            self._tracker.update_state(state_notes)
+            self._tracker.update_state(state_notes, skipped=newly_skipped)
 
         return ReindexResult(
             added=indexed_added,
             modified=indexed_modified,
             deleted=len(changes.deleted),
             unchanged=changes.unchanged,
+            skipped=changes.skipped_unchanged + len(newly_skipped),
         )
 
     def build_embeddings(self, *, force: bool = False) -> int:

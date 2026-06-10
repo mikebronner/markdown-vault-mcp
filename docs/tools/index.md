@@ -181,7 +181,9 @@ Incrementally update the full-text search index to reflect file changes made out
 
 If semantic search is already active (vector index loaded), this also re-embeds changed documents automatically.
 
-**Returns:** `{"added": 3, "modified": 1, "deleted": 0, "unchanged": 38}`
+**Returns:** `{"added": 3, "modified": 1, "deleted": 0, "unchanged": 38, "skipped": 2}`
+
+`skipped` counts files present on disk that were deliberately not indexed (missing required frontmatter, matching an exclude pattern, or unparseable). Unchanged skipped files are remembered and not re-evaluated until their content changes.
 
 ### `build_embeddings`
 

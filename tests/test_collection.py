@@ -6,7 +6,7 @@ import concurrent.futures
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -615,6 +615,154 @@ class TestPersistentIndexAdoption:
         assert stats.documents_indexed == 3
         assert stats.chunks_indexed == 3
         assert len(upserts) == 3
+
+
+# ---------------------------------------------------------------------------
+# Skipped-file tracking (required_frontmatter) across reindex scans
+# ---------------------------------------------------------------------------
+
+
+class TestSkippedFileTracking:
+    """Files skipped for missing frontmatter must not be re-reported per scan.
+
+    Regression tests for the warm-boot loop where every ``reindex()`` saw
+    frontmatter-skipped files as "added", re-parsed them, and re-logged the
+    skip (O(skipped files) wasted parsing per boot).
+    """
+
+    REQUIRED: ClassVar[list[str]] = ["name", "type"]
+
+    @pytest.fixture
+    def fm_vault(self, tmp_path: Path) -> Path:
+        """Vault with one valid document and one missing required frontmatter."""
+        vault = tmp_path / "fm_vault"
+        vault.mkdir()
+        (vault / "valid.md").write_text(
+            "---\nname: Valid\ntype: note\n---\n# Valid\n\nIndexed note.\n"
+        )
+        (vault / "CLAUDE.md").write_text("# Claude\n\nNo frontmatter here.\n")
+        return vault
+
+    def _make(self, vault: Path, tmp_path: Path) -> Collection:
+        """Build a Collection enforcing required frontmatter with shared state."""
+        return Collection(
+            source_dir=vault,
+            index_path=tmp_path / "index.db",
+            state_path=tmp_path / "state.json",
+            required_frontmatter=self.REQUIRED,
+        )
+
+    def test_skipped_file_not_rereported_on_second_reindex(
+        self, tmp_path: Path, fm_vault: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unchanged skipped file is neither re-parsed nor re-logged."""
+        col1 = self._make(fm_vault, tmp_path)
+        col1.build_index()
+        col1.close()
+
+        # Warm boot: adopt the index, run the boot reindex.
+        col2 = self._make(fm_vault, tmp_path)
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.collection"):
+            result = col2.reindex()
+
+        assert result.added == 0
+        assert result.modified == 0
+        assert result.deleted == 0
+        assert result.unchanged == 1
+        assert result.skipped == 1
+        assert not any("missing frontmatter" in r.message for r in caplog.records)
+
+        # And again — still quiet, still not reported as added.
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.collection"):
+            result2 = col2.reindex()
+        col2.close()
+
+        assert result2.added == 0
+        assert result2.skipped == 1
+        assert not any("missing frontmatter" in r.message for r in caplog.records)
+
+    def test_skipped_file_gaining_frontmatter_gets_indexed(
+        self, tmp_path: Path, fm_vault: Path
+    ) -> None:
+        """A skipped file that gains the required frontmatter is indexed."""
+        col = self._make(fm_vault, tmp_path)
+        col.build_index()
+
+        (fm_vault / "CLAUDE.md").write_text(
+            "---\nname: Claude\ntype: agent\n---\n# Claude\n\nNow valid.\n"
+        )
+
+        result = col.reindex()
+        paths = [row["path"] for row in col._fts.list_notes()]
+        col.close()
+
+        assert result.added == 1
+        assert result.skipped == 0
+        assert "CLAUDE.md" in paths
+
+    def test_changed_but_still_skipped_file_logged_once(
+        self, tmp_path: Path, fm_vault: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A changed-and-still-skipped file is re-logged once, then quiet."""
+        col = self._make(fm_vault, tmp_path)
+        col.build_index()
+
+        (fm_vault / "CLAUDE.md").write_text("# Claude\n\nStill no frontmatter.\n")
+
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.collection"):
+            result1 = col.reindex()
+        assert result1.skipped == 1
+        assert any("missing frontmatter" in r.message for r in caplog.records)
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.collection"):
+            result2 = col.reindex()
+        col.close()
+
+        assert result2.skipped == 1
+        assert not any("missing frontmatter" in r.message for r in caplog.records)
+
+    def test_legacy_flat_state_file_migrates_cleanly(
+        self, tmp_path: Path, fm_vault: Path
+    ) -> None:
+        """An old flat-format state.json loads fine; skips settle after one scan."""
+        col1 = self._make(fm_vault, tmp_path)
+        col1.build_index()
+        col1.close()
+
+        # Rewrite state.json in the legacy flat format (indexed entries only).
+        state_path = tmp_path / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state_path.write_text(json.dumps(state["indexed"]), encoding="utf-8")
+
+        col2 = self._make(fm_vault, tmp_path)
+        # First scan re-evaluates the skipped file once (it is absent from
+        # legacy state), records it, and does not index it.
+        result1 = col2.reindex()
+        assert result1.added == 0
+        assert result1.unchanged == 1
+        assert result1.skipped == 1
+
+        # Second scan: the skip is remembered; nothing is re-evaluated.
+        result2 = col2.reindex()
+        col2.close()
+        assert result2.added == 0
+        assert result2.skipped == 1
+
+    def test_build_index_records_skipped_files_in_state(
+        self, tmp_path: Path, fm_vault: Path
+    ) -> None:
+        """build_index() persists skipped files so reindex() stays quiet."""
+        col = self._make(fm_vault, tmp_path)
+        col.build_index()
+        col.close()
+
+        state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+        assert state["version"] == 2
+        assert "valid.md" in state["indexed"]
+        assert "CLAUDE.md" in state["skipped"]
+        assert "CLAUDE.md" not in state["indexed"]
 
 
 # ---------------------------------------------------------------------------
