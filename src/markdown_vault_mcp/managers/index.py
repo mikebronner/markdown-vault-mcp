@@ -12,6 +12,7 @@ import json
 import logging
 import sqlite3
 import time
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -512,11 +513,25 @@ class IndexManager:
     # ------------------------------------------------------------------
 
     def build_embeddings(self, *, force: bool = False) -> int:
-        """Build the vector index from all chunks currently in the FTS index.
+        """Build or converge the vector index against the FTS index.
+
+        Without ``force``, a non-empty persisted vector index is diffed
+        against the chunks currently in the FTS ``sections`` table and
+        reconciled (#665): chunks present in the FTS index but missing
+        from the vector index are embedded and added, vectors for
+        documents no longer in the FTS index are removed, and documents
+        whose indexed content changed are re-embedded.  After every call
+        the vector index mirrors the FTS chunk set, so external changes
+        picked up by the boot reconciliation reindex (while no vector
+        index was loaded) cannot accumulate as permanent semantic-search
+        drift.  Work scales with the size of the diff, not the size of
+        the vault.  An empty vector index falls through to the full cold
+        build below.
 
         Args:
             force: If ``True``, rebuild from scratch even if a vector index
-                already exists on disk.
+                already exists on disk (e.g. after changing the embedding
+                model).
 
         Returns:
             Number of chunks successfully embedded. Any provider exception on
@@ -524,7 +539,8 @@ class IndexManager:
             also transient API/network errors) is logged and the batch
             skipped, so this may be less than the total number of chunks
             attempted; if every batch is skipped, ``0`` is returned and no
-            vectors are saved.
+            vectors are saved.  On the convergence path this counts only the
+            newly embedded chunks — a fully converged index returns ``0``.
 
         Raises:
             ValueError: If ``embedding_provider`` or ``embeddings_path`` is
@@ -549,11 +565,8 @@ class IndexManager:
             if vectors is None:
                 raise ValueError("Failed to load vector index after _load_vectors()")
             if vectors.count > 0:
-                logger.info(
-                    "build_embeddings: index already exists (%d chunks), skipping",
-                    vectors.count,
-                )
-                return vectors.count
+                return self._converge_embeddings(vectors)
+            # Empty index — fall through to the full cold build.
 
         rows = self._fts.list_notes()
         num_notes = len(rows)
@@ -659,6 +672,118 @@ class IndexManager:
         else:
             logger.info("build_embeddings: nothing to embed")
         return embedded
+
+    def _converge_embeddings(self, vectors: VectorIndex) -> int:
+        """Reconcile a non-empty vector index with the FTS chunk set (#665).
+
+        Chunk identity is the ``(title, heading, content)`` multiset per
+        document path — exactly the metadata stored alongside each vector
+        row, so the diff needs no file re-parsing.  Documents present only
+        in the vector index (deleted or newly excluded while no server
+        ran) lose their vectors; documents missing from it are embedded;
+        documents whose chunk multiset differs in any way (modified
+        content, changed title, re-chunked boundaries) are re-embedded in
+        full.  The sidecar is saved only when something actually changed.
+
+        A provider failure while embedding one document's chunks skips
+        that document — its existing vectors are left intact — and the
+        remaining documents still converge; the next call retries
+        (mirroring the cold build's per-batch resilience, #649).  This is
+        also what makes a failed boot ``BuildEmbeddings`` job self-heal:
+        the drift it left behind is just a larger diff for the next run.
+
+        Thread-safety: runs on the single-owner
+        :class:`~markdown_vault_mcp.indexing.IndexWriter` thread via
+        :meth:`build_embeddings`, so no internal lock is required.
+
+        Args:
+            vectors: The loaded, non-empty vector index to reconcile.
+
+        Returns:
+            Number of chunks newly embedded (``0`` on an already-converged
+            index).
+        """
+        # build_embeddings() ran _require_vectors() before dispatching here.
+        if self._embeddings_path is None or self._embedding_provider is None:
+            raise RuntimeError(
+                "_require_vectors() must be called before _converge_embeddings()"
+            )
+
+        def _signature(rows: list[dict[str, Any]]) -> Counter[tuple[Any, Any, Any]]:
+            return Counter(
+                (r.get("title"), r.get("heading"), r.get("content")) for r in rows
+            )
+
+        fts_by_path: dict[str, list[dict[str, Any]]] = {}
+        for row in self._fts.list_chunks():
+            fts_by_path.setdefault(row["path"], []).append(row)
+        vec_by_path = vectors.chunks_by_path()
+
+        stale_paths = [p for p in vec_by_path if p not in fts_by_path]
+        missing_paths: list[str] = []
+        refresh_paths: list[str] = []
+        up_to_date = 0
+        for path, rows in fts_by_path.items():
+            existing = vec_by_path.get(path)
+            if existing is None:
+                missing_paths.append(path)
+            elif _signature(rows) != _signature(existing):
+                refresh_paths.append(path)
+            else:
+                up_to_date += len(rows)
+
+        added = 0
+        removed = 0
+        failed = 0
+        # Embed per document, in bounded batches (#159), so a provider
+        # failure affects exactly one document: its old vectors stay
+        # untouched and every other document still converges.
+        for path in missing_paths + refresh_paths:
+            rows = fts_by_path[path]
+            texts = [r["content"] for r in rows]
+            raw: list[list[float]] = []
+            try:
+                for start in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
+                    raw.extend(
+                        self._embedding_provider.embed(
+                            texts[start : start + _EMBEDDING_BATCH_SIZE]
+                        )
+                    )
+            except Exception as exc:
+                # Broad by design: providers raise heterogeneous types for
+                # an oversized batch or transient outage (RuntimeError,
+                # httpx errors, ...). Keep the traceback diagnosable.
+                failed += len(texts)
+                logger.warning(
+                    "build_embeddings_converge_skip_doc path=%s chunks=%d err=%s",
+                    path,
+                    len(texts),
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            removed += vectors.delete_by_path(path)
+            added += vectors.add_vectors(raw, rows)
+
+        for path in stale_paths:
+            removed += vectors.delete_by_path(path)
+
+        if added or removed:
+            vectors.save(self._embeddings_path)
+
+        if failed:
+            logger.warning(
+                "build_embeddings_converge_failed_chunks total=%d "
+                "(existing vectors kept; retried on the next run)",
+                failed,
+            )
+        logger.info(
+            "build_embeddings_converged added=%d removed=%d up_to_date=%d",
+            added,
+            removed,
+            up_to_date,
+        )
+        return added
 
     def embeddings_status(self) -> dict[str, Any]:
         """Return status information about the vector index.

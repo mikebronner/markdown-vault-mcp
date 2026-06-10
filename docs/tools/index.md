@@ -248,6 +248,8 @@ If semantic search is configured, the queued reindex job re-embeds the changed d
 
 Build vector embeddings to enable semantic and hybrid search. This can be slow for large vaults.
 
+Without `force`, an existing vector index is **converged** to the FTS chunk set (#665): documents missing from it are embedded, documents whose indexed content changed are re-embedded, and vectors for deleted or excluded documents are dropped. Work scales with the size of the drift, not the size of the vault — an already-converged index does no embedding work.
+
 **Parameters:**
 
 | Parameter | Type | Default | Description |
@@ -257,7 +259,7 @@ Build vector embeddings to enable semantic and hybrid search. This can be slow f
 **Returns:** `{"status": "queued"}`. The build runs asynchronously on the single-owner :class:`IndexWriter` thread (#559); poll `get_server_info` or `get_index_status` for completion.
 
 !!! note "When to use"
-    Call `build_embeddings` once to enable semantic search for the first time. After that, `reindex` handles incremental re-embedding automatically.
+    Normally never: the server queues a `build_embeddings` job at every startup, which converges the vector index to whatever the boot reconciliation reindex found (#665). Call it manually only to embed a vault for the first time without restarting, to retry after a provider outage, or with `force=true` after changing the embedding model.
 
 ---
 

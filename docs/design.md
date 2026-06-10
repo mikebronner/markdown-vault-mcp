@@ -503,9 +503,52 @@ resolves to.
 
 To apply a configuration change (e.g. new `exclude_patterns`,
 `required_frontmatter`) to a pre-existing index, call
-`build_index(force=True)` — and, when embeddings are configured,
-`build_embeddings(force=True)` — because the short-circuit is keyed on
-FTS contents alone and does not detect config drift.
+`build_index(force=True)` — the short-circuit is keyed on FTS contents
+alone and does not detect config drift. When embeddings are configured, a
+follow-up plain `build_embeddings()` converges the vector index to the
+rebuilt chunk set (see Embedding Convergence below); `force=True` remains
+necessary only when the embedding model itself changed, because identical
+chunks embedded by a different model are invisible to the chunk-set diff
+(the persisted provider/model fingerprint check normally catches this case
+at load time and forces the rebuild automatically).
+
+### Embedding Convergence (#665)
+
+`build_embeddings(force=False)` over a **non-empty** vector index does not
+skip and does not rebuild — it diffs the FTS `sections` table (the
+canonical chunk set, via `FTSIndex.list_chunks()`) against the stored
+vector metadata grouped by path (`VectorIndex.chunks_by_path()`) and
+reconciles:
+
+- Documents missing from the vector index are embedded and added.
+- Documents whose per-path `(title, heading, content)` chunk multiset
+  differs in any way (modified content, changed title, re-chunked
+  boundaries) are re-embedded in full. The multiset is the chunk identity
+  — `VectorIndex` has no per-chunk keys, only a parallel metadata list
+  with path-level deletion.
+- Vectors for documents no longer in the FTS index (deleted, or newly
+  excluded) are removed.
+- Unchanged documents are untouched; the sidecar is saved only when
+  something actually changed, and the run is summarised in a single
+  `build_embeddings_converged added=N removed=M up_to_date=K` log line.
+
+This closes the FTS-vs-vector gap that the boot reconciliation reindex
+would otherwise widen: the boot `ReindexAll` job runs before the vector
+index is loaded, so offline document changes reach the FTS index but not
+the vectors — the boot `BuildEmbeddings` job that follows it (writer FIFO
+order) now converges the difference instead of skipping because vectors
+exist. Embedding work scales with the size of the drift, not the size of
+the vault, so a steady-state boot does zero embedding work.
+
+Convergence embeds per document, in the same bounded batches as the cold
+build (#159): a provider failure on one document's chunks (token-context
+rejection, transient outage) skips exactly that document — its existing
+vectors stay intact — and the rest still converge. This is also the
+self-healing property: a boot `BuildEmbeddings` job that failed outright
+(recorded in `last_build_embeddings_error`, never retried in-process)
+merely leaves a larger diff for the next successful run to converge. A
+cold build (empty vector index) and `force=True` behave exactly as
+before.
 
 ### Error Handling
 
@@ -534,8 +577,9 @@ pathological memory allocation from embedding providers (see issue #159).
 FastEmbed's ONNX inference uses a further inner batch size of 4 to keep
 per-call memory bounded — without this, the ONNX attention matrix for 64 long
 chunks can require >192 GB of allocation. The save happens once at the end so a
-mid-run crash does not leave a partial index that the skip-if-exists check
-treats as complete on the next startup.
+mid-run crash does not leave a partial index on disk; if one exists anyway,
+the next startup's convergence pass (see Embedding Convergence, #665) embeds
+exactly the missing chunks rather than treating the index as complete.
 
 ### Thread Safety
 

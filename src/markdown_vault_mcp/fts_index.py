@@ -1277,6 +1277,30 @@ class FTSIndex:
         return int(row[0])
 
     @_retry_on_locked
+    def list_chunks(self) -> list[dict[str, Any]]:
+        """Return every indexed chunk joined with its document metadata.
+
+        Used to converge the vector index against the FTS chunk set
+        (#665): the returned rows carry exactly the shape stored as
+        vector-row metadata, so callers can diff and embed without
+        re-parsing source files.
+
+        Returns:
+            List of dicts with keys ``path``, ``title``, ``folder``,
+            ``heading`` (may be ``None``), ``content``, and
+            ``start_line``, ordered by document path then chunk position.
+        """
+        cur = self._conn().execute(
+            """
+            SELECT d.path, d.title, d.folder, s.heading, s.content, s.start_line
+            FROM sections AS s
+            JOIN documents AS d ON d.id = s.document_id
+            ORDER BY d.path, s.id
+            """
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    @_retry_on_locked
     def get_toc(self, path: str) -> list[dict[str, str | int]]:
         """Return headings for a document, ordered by position.
 

@@ -926,7 +926,7 @@ class TestCmdReindex:
         self,
         mock_build: MagicMock,
     ) -> None:
-        """reindex command calls build_embeddings(force=True) when configured."""
+        """reindex command calls build_embeddings() (convergence) when configured."""
         mock_vault = MagicMock()
         mock_result = MagicMock()
         mock_result.added = 1
@@ -940,7 +940,7 @@ class TestCmdReindex:
         with patch("sys.argv", ["markdown-vault-mcp", "reindex"]):
             main()
 
-        mock_vault.index.build_embeddings.assert_called_once_with(force=True)
+        mock_vault.index.build_embeddings.assert_called_once_with()
 
     @patch("markdown_vault_mcp._cli_impl._build_vault")
     def test_reindex_skips_embeddings_when_not_configured(
@@ -964,32 +964,16 @@ class TestCmdReindex:
         mock_vault.index.build_embeddings.assert_called_once()
 
     @patch("markdown_vault_mcp._cli_impl._build_vault")
-    def test_reindex_uses_force_false_when_no_changes(
+    def test_reindex_never_forces_embedding_rebuild(
         self,
         mock_build: MagicMock,
     ) -> None:
-        """reindex skips force rebuild when FTS found no changes."""
-        mock_vault = MagicMock()
-        mock_result = MagicMock()
-        mock_result.added = 0
-        mock_result.modified = 0
-        mock_result.deleted = 0
-        mock_result.unchanged = 10
-        mock_vault.index.reindex.return_value = mock_result
-        mock_vault.index.build_embeddings.return_value = 0
-        mock_build.return_value = mock_vault
+        """reindex never force-rebuilds embeddings, even when changes exist.
 
-        with patch("sys.argv", ["markdown-vault-mcp", "reindex"]):
-            main()
-
-        mock_vault.index.build_embeddings.assert_called_once_with(force=False)
-
-    @patch("markdown_vault_mcp._cli_impl._build_vault")
-    def test_reindex_uses_force_true_when_changes_exist(
-        self,
-        mock_build: MagicMock,
-    ) -> None:
-        """reindex forces rebuild when FTS found added/modified/deleted files."""
+        build_embeddings() without force converges the vector index to the
+        FTS chunk set (#665), embedding exactly the delta — the old
+        force-on-any-change workaround re-embedded the entire corpus.
+        """
         mock_vault = MagicMock()
         mock_result = MagicMock()
         mock_result.added = 2
@@ -997,13 +981,13 @@ class TestCmdReindex:
         mock_result.deleted = 0
         mock_result.unchanged = 10
         mock_vault.index.reindex.return_value = mock_result
-        mock_vault.index.build_embeddings.return_value = 30
+        mock_vault.index.build_embeddings.return_value = 4
         mock_build.return_value = mock_vault
 
         with patch("sys.argv", ["markdown-vault-mcp", "reindex"]):
             main()
 
-        mock_vault.index.build_embeddings.assert_called_once_with(force=True)
+        mock_vault.index.build_embeddings.assert_called_once_with()
 
     def test_reindex_against_real_vault(
         self,

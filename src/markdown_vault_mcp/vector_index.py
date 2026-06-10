@@ -148,6 +148,21 @@ class VectorIndex:
         """
         return len(self._metadata)
 
+    def chunks_by_path(self) -> dict[str, list[dict[str, Any]]]:
+        """Group stored metadata rows by document path.
+
+        Used to diff the vector index against the FTS chunk set at boot
+        (#665).
+
+        Returns:
+            Mapping of document path to copies of the stored metadata
+            dicts for that document, in storage order.
+        """
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in self._metadata:
+            grouped.setdefault(row.get("path", ""), []).append(dict(row))
+        return grouped
+
     def add(self, texts: list[str], metadata: list[dict[str, Any]]) -> int:
         """Embed ``texts`` and append rows to the index.
 

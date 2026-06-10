@@ -1762,13 +1762,16 @@ def register_tools(mcp: FastMCP) -> None:
 
         Embeddings are built automatically on startup, so this is normally
         not needed. Use force=True to rebuild from scratch after changing
-        the embedding model. Without force, skips if embeddings already exist.
+        the embedding model. Without force, the vector index converges to
+        the FTS chunk set: missing or changed documents are embedded,
+        orphaned vectors are removed, unchanged chunks are untouched.
 
         Args:
             force: When True, discards existing embeddings and rebuilds from
                 scratch. Use only if the embedding model has changed.
-                When False (default), only embeds chunks not yet in the
-                vector index (incremental — does not skip if any exist).
+                When False (default), converges the vector index to the
+                FTS chunk set — work scales with the size of the drift,
+                not the size of the vault (#665).
 
         Returns:
             Dict with ``status: "queued"``. The build runs asynchronously on
