@@ -182,6 +182,10 @@ class ChangeTracker:
             if path not in new_indexed
         }
         self._save_state(new_indexed, new_skipped)
+        # The carry is consumed by exactly one update_state call; clearing it
+        # keeps a later call without a fresh detect_changes (e.g. a full
+        # build_index) from merging stale skipped entries into its snapshot.
+        self._skipped_carry = {}
         logger.debug(
             "update_state: wrote state for %d indexed, %d skipped document(s)",
             len(new_indexed),

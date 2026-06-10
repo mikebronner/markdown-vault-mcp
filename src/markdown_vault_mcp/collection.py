@@ -1285,7 +1285,12 @@ class Collection:
         for abs_path in all_files:
             if not abs_path.is_file():
                 continue
-            rel_str = abs_path.relative_to(self._source_dir).as_posix()
+            try:
+                rel_str = abs_path.relative_to(self._source_dir).as_posix()
+            except ValueError:
+                # Symlink target outside the vault — mirror detect_changes.
+                logger.warning("File outside source_dir, skipping: %s", abs_path)
+                continue
             if rel_str in indexed_paths:
                 continue
             try:

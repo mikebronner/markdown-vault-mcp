@@ -438,6 +438,26 @@ class TestSkippedFiles:
         raw = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
         assert raw["skipped"] == {"skip.md": self._hash_of(md)}
 
+    def test_carry_consumed_by_one_update_state(self, tmp_path: Path) -> None:
+        """A second update_state without a fresh detect_changes (a full
+        build_index) must not merge the previous scan's skipped carry."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        md = _write_md(vault, "skip.md", "no frontmatter\n")
+
+        tracker = ChangeTracker(tmp_path / "state.json")
+        tracker.update_state([], skipped={"skip.md": self._hash_of(md)})
+        tracker.detect_changes(vault)  # populates the carry with skip.md
+        tracker.update_state([])  # consumes the carry
+
+        md.unlink()
+        # Full-build-style call: no detect_changes beforehand, and the file
+        # is gone from disk — its stale entry must not reappear.
+        tracker.update_state([])
+
+        raw = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+        assert raw["skipped"] == {}
+
     def test_indexed_path_wins_over_skipped(self, tmp_path: Path) -> None:
         """A path present in notes is dropped from the skipped map."""
         vault = tmp_path / "vault"
