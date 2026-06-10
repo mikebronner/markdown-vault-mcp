@@ -17,6 +17,39 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Thresholds for running FTS5 'optimize' after a bulk purge.  Deleting rows
+# from an FTS5 table only marks their tokens as deleted inside the inverted
+# index — the dead entries stay in the on-disk segment b-trees until segments
+# are merged, which FTS5 does lazily and may never get around to.  A purge
+# pass that removes many documents (e.g. newly-configured exclude patterns
+# expelling previously indexed files at boot, issue #255) can therefore leave
+# hundreds of megabytes of dead segments that bloat the database file and
+# slow keyword queries.  'optimize' merges everything into one clean segment.
+# An optimize pass is cheap relative to the bloat it removes, so the
+# thresholds err toward running it: a purge of at least
+# ``OPTIMIZE_MIN_PURGED_DOCS`` documents, or at least
+# ``OPTIMIZE_MIN_PURGED_FRACTION`` of the pre-purge corpus, qualifies.
+OPTIMIZE_MIN_PURGED_DOCS = 25
+OPTIMIZE_MIN_PURGED_FRACTION = 0.10
+
+
+def should_optimize(purged: int, total_before: int) -> bool:
+    """Decide whether a bulk purge warrants an FTS5 'optimize' pass.
+
+    Args:
+        purged: Number of documents removed in a single purge pass.
+        total_before: Number of indexed documents before the purge.
+
+    Returns:
+        ``True`` when ``purged`` is at least :data:`OPTIMIZE_MIN_PURGED_DOCS`
+        or at least :data:`OPTIMIZE_MIN_PURGED_FRACTION` of ``total_before``.
+    """
+    if purged <= 0 or total_before <= 0:
+        return False
+    if purged >= OPTIMIZE_MIN_PURGED_DOCS:
+        return True
+    return purged / total_before >= OPTIMIZE_MIN_PURGED_FRACTION
+
 
 def _json_default(obj: Any) -> str:
     """Handle non-JSON-native types from YAML frontmatter.
@@ -1277,6 +1310,77 @@ class FTSIndex:
               AND NOT EXISTS (SELECT 1 FROM links WHERE target_path = d.path)
             """
         )
+
+    def optimize(self) -> bool:
+        """Merge FTS5 inverted-index segments, dropping deleted-document tokens.
+
+        Runs ``INSERT INTO notes_fts(notes_fts) VALUES('optimize')``, which
+        merges all FTS5 segments into one and discards entries for deleted
+        rows.  Call this after a bulk purge (see :func:`should_optimize`) so
+        dead segments do not accumulate in the database file.
+
+        The merge frees pages *inside* the database file; the file itself
+        only shrinks after a ``VACUUM`` (see :meth:`vacuum`).  The number of
+        reclaimable bytes is logged at INFO so operators can decide whether
+        a vacuum is worthwhile.
+
+        Transient lock contention (another process writing the shared index)
+        is tolerated: the optimize is skipped with a warning and the next
+        bulk purge retries.
+
+        Returns:
+            ``True`` when the optimize ran, ``False`` when it was skipped
+            because the database was busy or locked.
+        """
+        try:
+            with self._conn:
+                self._conn.execute(
+                    "INSERT INTO notes_fts(notes_fts) VALUES('optimize')"
+                )
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "busy" in msg or "locked" in msg:
+                logger.warning(
+                    "fts_optimize_skipped reason=%s (next bulk purge will retry)",
+                    exc,
+                )
+                return False
+            raise
+        freelist = self._conn.execute("PRAGMA freelist_count").fetchone()[0]
+        page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+        reclaimable = int(freelist) * int(page_size)
+        logger.info(
+            "fts_optimize_done reclaimable_bytes=%d "
+            "(run the 'reindex --vacuum' CLI command to reclaim disk space)",
+            reclaimable,
+        )
+        return True
+
+    def vacuum(self) -> bool:
+        """Rebuild the database file, returning freed pages to the filesystem.
+
+        ``VACUUM`` takes an exclusive lock on the database, so it is never
+        run automatically — multiple server processes may share one index
+        file.  It is exposed for explicit maintenance (the ``reindex
+        --vacuum`` CLI flag).
+
+        Returns:
+            ``True`` when the vacuum ran, ``False`` when it was skipped
+            because the database was busy or locked.
+        """
+        try:
+            # VACUUM cannot run inside a transaction; commit any implicit
+            # transaction the connection may have open first.
+            self._conn.commit()
+            self._conn.execute("VACUUM")
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "busy" in msg or "locked" in msg:
+                logger.warning("fts_vacuum_skipped reason=%s", exc)
+                return False
+            raise
+        logger.info("fts_vacuum_done db_path=%s", self._db_path)
+        return True
 
     def close(self) -> None:
         """Close the underlying database connection.

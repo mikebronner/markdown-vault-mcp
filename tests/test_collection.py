@@ -4468,3 +4468,132 @@ class TestLoggingAuditSilentPaths:
         assert any(
             "_get_frontmatter: invalid JSON" in rec.message for rec in caplog.records
         )
+
+
+# ---------------------------------------------------------------------------
+# Bulk-purge FTS optimize tests
+# ---------------------------------------------------------------------------
+
+
+def _write_docs(directory: Path, count: int, prefix: str = "doc") -> list[Path]:
+    """Write *count* small markdown files into *directory*.
+
+    Args:
+        directory: Target directory (created if missing).
+        count: Number of files to create.
+        prefix: Filename prefix.
+
+    Returns:
+        List of created file paths.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    files = []
+    for i in range(count):
+        f = directory / f"{prefix}{i}.md"
+        f.write_text(f"# {prefix} {i}\n\nUnique content {prefix}{i} body text.\n")
+        files.append(f)
+    return files
+
+
+class TestBulkPurgeOptimize:
+    def test_reindex_bulk_delete_triggers_optimize(self, tmp_path: Path) -> None:
+        """Deleting >= threshold docs in one reindex pass runs FTS optimize."""
+        vault = tmp_path / "vault"
+        files = _write_docs(vault, 30)
+        col = _make_collection(vault, state_path=tmp_path / "state.json")
+        col.build_index()
+
+        # Remove 26 files (>= OPTIMIZE_MIN_PURGED_DOCS) from disk.
+        for f in files[:26]:
+            f.unlink()
+
+        with patch.object(col._fts, "optimize", wraps=col._fts.optimize) as spy:
+            result = col.reindex()
+
+        assert result.deleted == 26
+        assert spy.call_count == 1
+
+    def test_reindex_small_delete_does_not_optimize(self, tmp_path: Path) -> None:
+        """A purge below both thresholds skips the FTS optimize."""
+        vault = tmp_path / "vault"
+        files = _write_docs(vault, 30)
+        col = _make_collection(vault, state_path=tmp_path / "state.json")
+        col.build_index()
+
+        # Remove 1 of 30 files: below 25 docs and below 10% of the corpus.
+        files[0].unlink()
+
+        with patch.object(col._fts, "optimize", wraps=col._fts.optimize) as spy:
+            result = col.reindex()
+
+        assert result.deleted == 1
+        assert spy.call_count == 0
+
+    def test_exclusion_upgrade_purge_triggers_optimize(self, tmp_path: Path) -> None:
+        """Newly-configured exclude patterns purging >= threshold docs at boot
+        (issue #255 upgrade path) trigger an FTS optimize."""
+        vault = tmp_path / "vault"
+        index_path = tmp_path / "index.db"
+        _write_docs(vault, 5)
+        _write_docs(vault / ".claude", 26, prefix="transcript")
+
+        # Phase 1: index WITHOUT exclude_patterns (old configuration).
+        col1 = _make_collection(
+            vault, index_path=index_path, state_path=tmp_path / "state.json"
+        )
+        col1.build_index()
+        assert col1._fts.count_documents() == 31
+        col1.close()
+
+        # Phase 2: new process adopts the index WITH exclude_patterns.
+        col2 = _make_collection(
+            vault,
+            index_path=index_path,
+            state_path=tmp_path / "state.json",
+            exclude_patterns=[".claude/**"],
+        )
+        with patch.object(col2._fts, "optimize", wraps=col2._fts.optimize) as spy:
+            col2.build_index()
+
+        assert col2._fts.count_documents() == 5
+        assert spy.call_count == 1
+
+    def test_exclusion_upgrade_small_purge_does_not_optimize(
+        self, tmp_path: Path
+    ) -> None:
+        """An adoption purge below both thresholds skips the FTS optimize."""
+        vault = tmp_path / "vault"
+        index_path = tmp_path / "index.db"
+        _write_docs(vault, 30)
+        _write_docs(vault / ".claude", 1, prefix="transcript")
+
+        col1 = _make_collection(
+            vault, index_path=index_path, state_path=tmp_path / "state.json"
+        )
+        col1.build_index()
+        col1.close()
+
+        col2 = _make_collection(
+            vault,
+            index_path=index_path,
+            state_path=tmp_path / "state.json",
+            exclude_patterns=[".claude/**"],
+        )
+        with patch.object(col2._fts, "optimize", wraps=col2._fts.optimize) as spy:
+            col2.build_index()
+
+        assert col2._fts.count_documents() == 30
+        assert spy.call_count == 0
+
+    def test_vacuum_compacts_index(self, tmp_path: Path) -> None:
+        """Collection.vacuum() delegates to the FTS index under the lock."""
+        vault = tmp_path / "vault"
+        _write_docs(vault, 3)
+        col = _make_collection(
+            vault,
+            index_path=tmp_path / "index.db",
+            state_path=tmp_path / "state.json",
+        )
+        col.build_index()
+
+        assert col.vacuum() is True

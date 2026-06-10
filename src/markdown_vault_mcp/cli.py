@@ -204,6 +204,11 @@ def _cmd_reindex(args: argparse.Namespace) -> None:
         print(f"Embeddings ready: {n} chunks")
     except ValueError:
         pass  # embeddings not configured
+    if args.vacuum:
+        if collection.vacuum():
+            print("Vacuum: index file compacted")
+        else:
+            print("Vacuum: skipped (database busy)")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -311,6 +316,14 @@ def _build_parser() -> argparse.ArgumentParser:
     reindex_parser.add_argument(
         "--index-path",
         help=f"path to SQLite index file (overrides {_ENV_PREFIX}_INDEX_PATH)",
+    )
+    reindex_parser.add_argument(
+        "--vacuum",
+        action="store_true",
+        help=(
+            "compact the index file after reindexing (takes an exclusive "
+            "lock; do not use while a server shares the index)"
+        ),
     )
 
     return parser
