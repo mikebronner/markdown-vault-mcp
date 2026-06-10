@@ -40,6 +40,16 @@ class TestLazyExports:
         assert "Collection" in listing
         assert "ReindexResult" in listing
 
+    def test_resolved_attribute_is_cached_in_module_dict(self) -> None:
+        """First resolution binds the name into the module __dict__ so later
+        lookups bypass __getattr__ entirely."""
+        name = "Collection"
+        vars(markdown_vault_mcp).pop(name, None)
+        assert name not in vars(markdown_vault_mcp)
+        first = getattr(markdown_vault_mcp, name)
+        assert name in vars(markdown_vault_mcp)
+        assert vars(markdown_vault_mcp)[name] is first
+
 
 class TestImportIsLight:
     """The package root must not import the heavy dependency tree.
