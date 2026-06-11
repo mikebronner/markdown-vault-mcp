@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from markdown_vault_mcp.fts_index import _derive_folder
+from markdown_vault_mcp.fts_index import _derive_folder, should_optimize
 from markdown_vault_mcp.scanner import parse_note, scan_directory
 from markdown_vault_mcp.types import IndexStats, ParsedNote, ReindexResult
 from markdown_vault_mcp.utils import is_path_excluded
@@ -244,8 +244,9 @@ class IndexManager:
                 self._load_vectors()
                 vectors = self._get_vectors()
 
+            rows = self._fts.list_notes()
             purged = 0
-            for row in self._fts.list_notes():
+            for row in rows:
                 if row["path"] not in indexed_paths and self._is_path_excluded(
                     row["path"]
                 ):
@@ -256,6 +257,12 @@ class IndexManager:
 
             if purged and vectors is not None and self._embeddings_path is not None:
                 vectors.save(self._embeddings_path)
+
+            # A bulk purge (e.g. exclude patterns newly configured on an
+            # existing index, issue #255) leaves dead FTS5 segments behind;
+            # merge them away when the purge crossed the optimize threshold.
+            if should_optimize(purged, len(rows)):
+                self._fts.optimize()
 
         # Count how many files were skipped due to required_frontmatter.
         all_files = list(self._source_dir.glob("**/*.md", **GLOB_SYMLINK_KWARGS))
@@ -369,8 +376,12 @@ class IndexManager:
         # Phase 2: apply mutations (writer is sole mutator; no lock needed).
         vectors = self._get_vectors()
 
+        # Corpus size before this purge pass, for the optimize threshold.
+        docs_before_purge = len(self._fts.list_notes())
+
+        deleted_purged = 0
         for path in changes.deleted:
-            self._fts.delete_by_path(path)
+            deleted_purged += self._fts.delete_by_path(path)
             if vectors is not None:
                 vectors.delete_by_path(path)
 
@@ -396,6 +407,13 @@ class IndexManager:
                     "reindex: purged %d stale excluded document(s)",
                     stale_excluded,
                 )
+
+        # A bulk purge leaves dead FTS5 segments behind; merge them away
+        # when this pass crossed the optimize threshold (issue #255
+        # follow-up: the exclusion upgrade path can purge most of the
+        # corpus at boot and bloat the index file with dead segments).
+        if should_optimize(deleted_purged + stale_excluded, docs_before_purge):
+            self._fts.optimize()
 
         indexed_added = 0
         indexed_modified = 0

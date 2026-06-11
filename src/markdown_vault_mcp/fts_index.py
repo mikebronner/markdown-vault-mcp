@@ -102,6 +102,40 @@ def _retry_on_locked(method: Callable[..., _T]) -> Callable[..., _T]:
     return wrapper
 
 
+# Thresholds for running FTS5 'optimize' after a bulk purge.  Deleting rows
+# from an FTS5 table only marks their tokens as deleted inside the inverted
+# index — the dead entries stay in the on-disk segment b-trees until segments
+# are merged, which FTS5 does lazily and may never get around to.  A purge
+# pass that removes many documents (e.g. newly-configured exclude patterns
+# expelling previously indexed files at boot, issue #255) can therefore leave
+# hundreds of megabytes of dead segments that bloat the database file and
+# slow keyword queries.  'optimize' merges everything into one clean segment.
+# An optimize pass is cheap relative to the bloat it removes, so the
+# thresholds err toward running it: a purge of at least
+# ``OPTIMIZE_MIN_PURGED_DOCS`` documents, or at least
+# ``OPTIMIZE_MIN_PURGED_FRACTION`` of the pre-purge corpus, qualifies.
+OPTIMIZE_MIN_PURGED_DOCS = 25
+OPTIMIZE_MIN_PURGED_FRACTION = 0.10
+
+
+def should_optimize(purged: int, total_before: int) -> bool:
+    """Decide whether a bulk purge warrants an FTS5 'optimize' pass.
+
+    Args:
+        purged: Number of documents removed in a single purge pass.
+        total_before: Number of indexed documents before the purge.
+
+    Returns:
+        ``True`` when ``purged`` is at least :data:`OPTIMIZE_MIN_PURGED_DOCS`
+        or at least :data:`OPTIMIZE_MIN_PURGED_FRACTION` of ``total_before``.
+    """
+    if purged <= 0 or total_before <= 0:
+        return False
+    if purged >= OPTIMIZE_MIN_PURGED_DOCS:
+        return True
+    return purged / total_before >= OPTIMIZE_MIN_PURGED_FRACTION
+
+
 def _json_default(obj: Any) -> str:
     """Handle non-JSON-native types from YAML frontmatter.
 
@@ -904,6 +938,56 @@ class FTSIndex:
         if deleted:
             logger.debug("delete_by_path: removed %s", path)
         return deleted
+
+    def optimize(self) -> bool:
+        """Merge FTS5 inverted-index segments, dropping deleted-document tokens.
+
+        Runs ``INSERT INTO notes_fts(notes_fts) VALUES('optimize')``, which
+        merges all FTS5 segments into one and discards entries for deleted
+        rows.  Call this after a bulk purge (see :func:`should_optimize`) so
+        dead segments do not accumulate in the database file.
+
+        The merge frees pages *inside* the database file; the file itself
+        only shrinks after a ``VACUUM``.  ``VACUUM`` is never run
+        automatically because it takes an exclusive lock and multiple server
+        processes may share one index file — instead the reclaimable size
+        (freelist pages times page size) is logged at INFO so operators can
+        decide whether a manual vacuum is worthwhile.
+
+        Lock contention beyond the retry budget is tolerated: the optimize
+        is skipped with a warning and the next bulk purge retries.
+
+        Returns:
+            ``True`` when the optimize ran, ``False`` when it was skipped
+            because the database stayed busy or locked.
+        """
+        conn = self._conn()
+
+        def _do() -> None:
+            with conn:
+                conn.execute("INSERT INTO notes_fts(notes_fts) VALUES('optimize')")
+
+        try:
+            _retry_on_sqlite_locked(_do)
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "busy" in msg or "locked" in msg:
+                logger.warning(
+                    "optimize: skipped — database contended (%s); "
+                    "next bulk purge will retry",
+                    exc,
+                )
+                return False
+            raise
+        freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        reclaimable = int(freelist) * int(page_size)
+        logger.info(
+            "optimize: merged FTS5 segments — %d bytes reclaimable "
+            "(run VACUUM on the index file to reclaim disk space)",
+            reclaimable,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Build completeness sentinel (issue #525)
