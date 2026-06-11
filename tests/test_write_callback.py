@@ -1,9 +1,11 @@
-"""Unit tests for WriteCallbackDispatcher (issue #599).
+"""Unit tests for WriteCallbackDispatcher (issues #599, #601).
 
-Pins the six behavioural invariants the dispatcher inherits from the former
-Vault callback worker (#175): on_write=None no-op, lazy+idempotent single
-worker, FIFO order, callback-exception isolation, bounded draining close, and
-the daemon worker identity.
+Pins the behavioural invariants the dispatcher inherits from the former Vault
+callback worker (#175) — on_write=None no-op, lazy+idempotent single worker,
+FIFO order, callback-exception isolation, bounded draining close, daemon worker
+identity — plus the #601 close/fire lifecycle contract: fire-after-close is a
+dropped, logged no-op that does not resurrect the worker; double-close is an
+explicit no-op; and the join-timeout warning quantifies the pending count.
 """
 
 from __future__ import annotations
@@ -113,3 +115,123 @@ class TestClose:
             dispatcher.close(timeout=0.05)  # join times out -> warn
         assert any("did not finish" in r.getMessage() for r in caplog.records)
         release.set()  # let the daemon worker exit
+
+    def test_close_timeout_warning_quantifies_pending(self, caplog) -> None:
+        """The hang warning must report how many commits are at risk (#601)."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def cb(_abs_path: Path, _content: str, _operation: str) -> None:
+            started.set()
+            release.wait(5)  # block the worker on the first item
+
+        dispatcher = WriteCallbackDispatcher(cb)
+        dispatcher.fire(Path("a.md"), "first", "write")
+        assert started.wait(2)
+        dispatcher.fire(Path("b.md"), "second", "write")  # queued behind the block
+        with caplog.at_level(logging.WARNING):
+            dispatcher.close(timeout=0.05)
+        warning = next(
+            r.getMessage() for r in caplog.records if "did not finish" in r.getMessage()
+        )
+        # Worker is blocked on "first" (in-flight); "second" is queued; close()
+        # adds the sentinel. qsize() = [second, sentinel] = 2, which equals the
+        # commits genuinely at risk: the in-flight "first" + the queued "second".
+        assert "2 pending" in warning, warning
+        release.set()
+
+
+class TestThreadContract:
+    """#601: enforce the close/fire lifecycle contract by the type, not by
+    caller convention."""
+
+    def test_fire_after_close_is_dropped(self, caplog) -> None:
+        calls, cb = _recorder()
+        dispatcher = WriteCallbackDispatcher(cb)
+        dispatcher.fire(Path("a.md"), "before", "write")
+        dispatcher.close()
+        assert calls == [(Path("a.md"), "before", "write")]
+        worker_after_close = dispatcher._worker
+
+        with caplog.at_level(logging.WARNING):
+            dispatcher.fire(Path("b.md"), "after", "write")
+        dispatcher.close()  # idempotent; nothing new to drain
+
+        # The post-close fire must NOT run the callback...
+        assert calls == [(Path("a.md"), "before", "write")]
+        # ...nor resurrect a fresh worker thread.
+        assert dispatcher._worker is worker_after_close
+        assert any("after close" in r.getMessage().lower() for r in caplog.records), [
+            r.getMessage() for r in caplog.records
+        ]
+
+    def test_double_close_is_idempotent_noop(self) -> None:
+        calls, cb = _recorder()
+        dispatcher = WriteCallbackDispatcher(cb)
+        dispatcher.fire(Path("a.md"), "x", "write")
+        dispatcher.close()
+        worker = dispatcher._worker
+        dispatcher.close()  # second close: explicit no-op via the closed flag
+        assert dispatcher._worker is worker  # unchanged
+        assert calls == [(Path("a.md"), "x", "write")]
+
+
+class TestDrain:
+    def test_drain_waits_for_all_queued_items(self) -> None:
+        calls, cb = _recorder()
+        dispatcher = WriteCallbackDispatcher(cb)
+        for i in range(5):
+            dispatcher.fire(Path(f"{i}.md"), str(i), "write")
+        dispatcher.drain()  # must block until all 5 have run
+        assert [content for _, content, _ in calls] == ["0", "1", "2", "3", "4"]
+        dispatcher.close()
+
+    def test_drain_keeps_worker_alive(self) -> None:
+        calls, cb = _recorder()
+        dispatcher = WriteCallbackDispatcher(cb)
+        dispatcher.fire(Path("a.md"), "a", "write")
+        dispatcher.drain()
+        worker_after_drain = dispatcher._worker
+        dispatcher.fire(Path("b.md"), "b", "write")
+        dispatcher.drain()
+        assert dispatcher._worker is worker_after_drain
+        assert [content for _, content, _ in calls] == ["a", "b"]
+        dispatcher.close()
+
+    def test_drain_noop_when_worker_never_started(self) -> None:
+        _calls, cb = _recorder()
+        dispatcher = WriteCallbackDispatcher(cb)
+        dispatcher.drain()  # no fire -> no worker; must return immediately, not hang
+        assert dispatcher._worker is None
+        dispatcher.close()
+
+    def test_drain_noop_when_closed(self) -> None:
+        calls, cb = _recorder()
+        dispatcher = WriteCallbackDispatcher(cb)
+        dispatcher.fire(Path("a.md"), "a", "write")
+        dispatcher.close()
+        dispatcher.drain()  # after close: immediate no-op, no hang
+        assert calls == [(Path("a.md"), "a", "write")]
+
+    def test_drain_noop_when_on_write_none(self) -> None:
+        dispatcher = WriteCallbackDispatcher(None)
+        dispatcher.drain()  # no callback configured -> immediate no-op
+        assert dispatcher._worker is None
+
+    def test_drain_timeout_warns(self, caplog) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def cb(_abs_path: Path, _content: str, _operation: str) -> None:
+            started.set()
+            release.wait(5)  # block the worker
+
+        dispatcher = WriteCallbackDispatcher(cb)
+        dispatcher.fire(Path("a.md"), "first", "write")
+        assert started.wait(2)  # worker blocked on the in-flight item
+        dispatcher.fire(Path("b.md"), "second", "write")  # queued behind the block
+        with caplog.at_level(logging.WARNING):
+            dispatcher.drain(timeout=0.05)  # cannot drain -> warn, return
+        assert any("drain did not finish" in r.getMessage() for r in caplog.records)
+        release.set()
+        dispatcher.close()
