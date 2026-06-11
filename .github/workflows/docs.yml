@@ -41,7 +41,9 @@ jobs:
           path: site/
 
   deploy:
-    if: github.ref == 'refs/heads/main'
+    # Deploy only on upstream — forks have no Pages site; the build job
+    # still runs everywhere as docs validation.
+    if: github.ref == 'refs/heads/main' && github.repository == 'pvliesdonk/markdown-vault-mcp'
     permissions:
       pages: write
       id-token: write
