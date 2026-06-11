@@ -2851,16 +2851,17 @@ class TestEmbeddingsStatus:
 
 
 class TestBuildEmbeddings:
-    def test_build_embeddings_skip_when_already_built(
+    def test_build_embeddings_noop_when_already_converged(
         self,
         vault_path: Path,
         tmp_path: Path,
         mock_provider: MockEmbeddingProvider,
     ) -> None:
-        """build_embeddings(force=False) skips rebuild when index already has chunks.
+        """build_embeddings(force=False) converges, not rebuilds, when chunks exist.
 
         The first call embeds 9 chunks and saves to disk.  The second call (no
-        force) must return the same count without re-embedding.
+        force) diffs the vector index against the FTS chunk set (#665), finds
+        no drift, embeds nothing, and reports zero newly embedded chunks.
         """
         embeddings_path = tmp_path / "embeddings"
         col = Vault(
@@ -2884,9 +2885,10 @@ class TestBuildEmbeddings:
 
         count2 = col.index.build_embeddings(force=False)
 
-        # No new embedding calls; same count returned.
+        # No new embedding calls; nothing newly embedded; index unchanged.
         assert embed_calls == []
-        assert count2 == count1
+        assert count2 == 0
+        assert col.index.embeddings_status()["chunk_count"] == count1
 
     def test_build_embeddings_force_rebuilds(
         self,

@@ -14,20 +14,29 @@ from markdown_vault_mcp.utils.fs import GLOB_SYMLINK_KWARGS
 
 logger = logging.getLogger(__name__)
 
+# Current on-disk state file format version. Version 2 splits the flat
+# path → digest map into separate "indexed" and "skipped" maps (#665).
+_STATE_VERSION = 2
+
 
 class ChangeTracker:
     """Detects file additions, modifications, and deletions using SHA256 hashes.
 
-    State is persisted as a JSON file mapping relative document paths to their
-    last-seen SHA256 hex digest. On the first run (no state file), every file
-    on disk is treated as newly added.
+    State is persisted as a JSON file with two maps of relative document path
+    to last-seen SHA256 hex digest: ``indexed`` (files that made it into the
+    index) and ``skipped`` (files seen on disk but deliberately not indexed,
+    e.g. missing required frontmatter). A skipped file is only re-reported as
+    added when its content changes, so it can be re-evaluated. Legacy state
+    files (a flat path-to-hash object) load fine; all entries are treated as
+    indexed. On the first run (no state file), every file on disk is treated
+    as newly added.
 
     Example::
 
         tracker = ChangeTracker(Path("/data/vault/.markdown_vault_mcp/state.json"))
         changes = tracker.detect_changes(Path("/data/vault"))
         # process changes ...
-        tracker.update_state(notes)
+        tracker.update_state(notes, skipped=newly_skipped)
     """
 
     def __init__(self, state_path: Path) -> None:
@@ -38,6 +47,9 @@ class ChangeTracker:
                 yet; the parent directory is created on first write.
         """
         self._state_path = state_path
+        # Skipped entries from the last detect_changes() that are still on
+        # disk with unchanged content; carried forward by update_state().
+        self._skipped_carry: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -52,15 +64,21 @@ class ChangeTracker:
 
         Algorithm:
 
-        1. Load existing state (empty dict if state file does not exist).
+        1. Load existing state (empty maps if state file does not exist).
         2. Scan *source_dir* for all files matching *glob_pattern*.
         3. Compute SHA256 of each file's raw bytes.
         4. Categorise each path:
 
            - present on disk but absent from state → **added**
-           - present in both and hash differs → **modified**
-           - present in state but absent from disk → **deleted**
-           - present in both and hash matches → **unchanged** (counted only)
+           - in indexed state and hash differs → **modified**
+           - in indexed state and hash matches → **unchanged** (counted only)
+           - in skipped state and hash matches → **skipped_unchanged**
+             (counted only; not re-reported)
+           - in skipped state and hash differs → **added** (re-evaluated;
+             it may now qualify for indexing)
+           - in indexed state but absent from disk → **deleted**
+           - in skipped state but absent from disk → dropped silently (it
+             was never indexed, so nothing needs deleting)
 
         5. Return a :class:`~markdown_vault_mcp.types.ChangeSet`.
 
@@ -72,7 +90,7 @@ class ChangeTracker:
         Returns:
             A :class:`~markdown_vault_mcp.types.ChangeSet` describing the delta.
         """
-        stored_state = self._load_state()
+        indexed_state, skipped_state = self._load_state()
 
         # Build a mapping of relative path → sha256 for current disk contents.
         disk_state: dict[str, str] = {}
@@ -94,25 +112,37 @@ class ChangeTracker:
         added: list[str] = []
         modified: list[str] = []
         unchanged: int = 0
+        skipped_unchanged: int = 0
+        self._skipped_carry = {}
 
         for rel_path, current_hash in disk_state.items():
-            if rel_path not in stored_state:
-                added.append(rel_path)
-            elif stored_state[rel_path] != current_hash:
-                modified.append(rel_path)
+            if rel_path in indexed_state:
+                if indexed_state[rel_path] != current_hash:
+                    modified.append(rel_path)
+                else:
+                    unchanged += 1
+            elif rel_path in skipped_state:
+                if skipped_state[rel_path] != current_hash:
+                    # Content changed since the skip — re-evaluate it.
+                    added.append(rel_path)
+                else:
+                    skipped_unchanged += 1
+                    self._skipped_carry[rel_path] = current_hash
             else:
-                unchanged += 1
+                added.append(rel_path)
 
         deleted: list[str] = [
-            rel_path for rel_path in stored_state if rel_path not in disk_state
+            rel_path for rel_path in indexed_state if rel_path not in disk_state
         ]
 
         logger.debug(
-            "detect_changes: %d added, %d modified, %d deleted, %d unchanged",
+            "detect_changes: %d added, %d modified, %d deleted, %d unchanged, "
+            "%d skipped-unchanged",
             len(added),
             len(modified),
             len(deleted),
             unchanged,
+            skipped_unchanged,
         )
 
         return ChangeSet(
@@ -120,29 +150,58 @@ class ChangeTracker:
             modified=modified,
             deleted=deleted,
             unchanged=unchanged,
+            skipped_unchanged=skipped_unchanged,
         )
 
-    def update_state(self, notes: list[ParsedNote]) -> None:
+    def update_state(
+        self,
+        notes: list[ParsedNote],
+        skipped: dict[str, str] | None = None,
+    ) -> None:
         """Persist the current hash state derived from *notes*.
 
-        Overwrites the entire state file with the hashes from *notes*. Call
-        this after successfully (re)indexing a set of documents to record their
-        current content hashes.
+        Overwrites the entire state file. The indexed map comes from *notes*;
+        the skipped map merges the unchanged skipped entries observed by the
+        preceding :meth:`detect_changes` call with *skipped*. Call this after
+        successfully (re)indexing a set of documents to record their current
+        content hashes.
 
         Args:
             notes: Parsed notes whose ``path`` and ``content_hash`` attributes
-                form the new state. Any paths not in this list are dropped from
-                state (treated as deleted on the next scan).
+                form the new indexed state. Any indexed paths not in this list
+                are dropped from state (treated as deleted on the next scan).
+            skipped: Mapping of relative path to SHA256 hex digest for files
+                seen during this scan but deliberately not indexed (missing
+                required frontmatter, excluded, unparseable). Indexed paths
+                always win: any path also present in *notes* is dropped from
+                the skipped map.
         """
-        new_state = {note.path: note.content_hash for note in notes}
-        self._save_state(new_state)
-        logger.debug("update_state: wrote state for %d document(s)", len(notes))
+        new_indexed = {note.path: note.content_hash for note in notes}
+        new_skipped = {
+            path: content_hash
+            for path, content_hash in {
+                **self._skipped_carry,
+                **(skipped or {}),
+            }.items()
+            if path not in new_indexed
+        }
+        self._save_state(new_indexed, new_skipped)
+        # The carry is consumed by exactly one update_state call; clearing it
+        # keeps a later call without a fresh detect_changes (e.g. a full
+        # build_index) from merging stale skipped entries into its snapshot.
+        self._skipped_carry = {}
+        logger.debug(
+            "update_state: wrote state for %d indexed, %d skipped document(s)",
+            len(new_indexed),
+            len(new_skipped),
+        )
 
     def reset(self) -> None:
         """Delete the state file so the next scan treats all files as added.
 
         If the state file does not exist, this is a no-op.
         """
+        self._skipped_carry = {}
         if self._state_path.exists():
             self._state_path.unlink()
             logger.debug("reset: deleted state file %s", self._state_path)
@@ -153,18 +212,24 @@ class ChangeTracker:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _load_state(self) -> dict[str, str]:
+    def _load_state(self) -> tuple[dict[str, str], dict[str, str]]:
         """Load the persisted state from disk.
 
+        Supports two formats: the current versioned object
+        (``{"version": 2, "indexed": {...}, "skipped": {...}}``) and the
+        legacy flat mapping of path to digest, which is loaded with every
+        entry treated as indexed.
+
         Returns:
-            Mapping of relative document path to SHA256 hex digest.
-            Returns an empty dict when the state file does not exist.
+            Tuple of ``(indexed, skipped)`` maps of relative document path to
+            SHA256 hex digest. Both are empty when the state file does not
+            exist or is malformed.
         """
         if not self._state_path.exists():
             logger.debug(
                 "No state file at %s; treating all files as added", self._state_path
             )
-            return {}
+            return {}, {}
         try:
             with self._state_path.open(encoding="utf-8") as fh:
                 state = json.load(fh)
@@ -173,24 +238,39 @@ class ChangeTracker:
                     "State file %s is malformed (expected object); resetting",
                     self._state_path,
                 )
-                return {}
-            return state
+                return {}, {}
+            if state.get("version") == _STATE_VERSION:
+                indexed = state.get("indexed", {})
+                skipped = state.get("skipped", {})
+                if not isinstance(indexed, dict) or not isinstance(skipped, dict):
+                    logger.warning(
+                        "State file %s is malformed (expected object maps); resetting",
+                        self._state_path,
+                    )
+                    return {}, {}
+                return indexed, skipped
+            # Legacy flat format: every entry is an indexed path → digest.
+            return state, {}
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning(
                 "Cannot read state file %s (%s); treating all files as added",
                 self._state_path,
                 exc,
             )
-            return {}
+            return {}, {}
 
-    def _save_state(self, state: dict[str, str]) -> None:
-        """Write *state* to the state file as JSON.
+    def _save_state(self, indexed: dict[str, str], skipped: dict[str, str]) -> None:
+        """Write the indexed and skipped maps to the state file as JSON.
 
         Creates parent directories if they do not exist.
 
         Args:
-            state: Mapping of relative document path to SHA256 hex digest.
+            indexed: Mapping of relative document path to SHA256 hex digest
+                for documents present in the index.
+            skipped: Mapping of relative document path to SHA256 hex digest
+                for files seen on disk but deliberately not indexed.
         """
+        state = {"version": _STATE_VERSION, "indexed": indexed, "skipped": skipped}
         self._state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_fd, tmp_path = tempfile.mkstemp(dir=self._state_path.parent, suffix=".tmp")
         try:
@@ -200,7 +280,12 @@ class ChangeTracker:
         except:
             Path(tmp_path).unlink(missing_ok=True)
             raise
-        logger.debug("Saved state for %d path(s) to %s", len(state), self._state_path)
+        logger.debug(
+            "Saved state for %d indexed, %d skipped path(s) to %s",
+            len(indexed),
+            len(skipped),
+            self._state_path,
+        )
 
     def _compute_hash(self, path: Path) -> str:
         """Compute the SHA256 hex digest of *path* using chunked reads.

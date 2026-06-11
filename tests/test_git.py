@@ -406,45 +406,62 @@ class TestGitWriteStrategyClass:
         strategy.close()
 
     def test_multiple_writes_single_push(
-        self, git_repo_with_remote: tuple[Path, Path]
+        self,
+        git_repo_with_remote: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Multiple rapid writes result in a single deferred push."""
+        """Multiple rapid writes coalesce into a single deferred push (#430).
+
+        Verified deterministically rather than by racing the debounce timer: a
+        long ``push_delay_s`` guarantees the timer never fires during the
+        synchronous body, the pending state is asserted directly, and the push
+        is then forced via ``flush()`` while counting the underlying ``_push``
+        calls. (The earlier "assert not-yet-in-the-bare-log right after the
+        writes" approach raced the 0.3 s timer and was flaky on Python 3.14.)
+        """
+        import markdown_vault_mcp.git.strategy as git_strategy
 
         work, bare = git_repo_with_remote
 
-        strategy = GitWriteStrategy(token=None, push_delay_s=0.3)
+        push_calls: list[tuple[object, ...]] = []
+        real_push = git_strategy._push
 
-        for i in range(5):
-            md_file = work / f"note_{i}.md"
-            md_file.write_text(f"# Note {i}\n")
-            strategy(md_file, f"# Note {i}\n", "write")
+        def counting_push(*args: object, **kwargs: object) -> None:
+            push_calls.append(args)
+            real_push(*args, **kwargs)  # type: ignore[arg-type]
 
-        # Not pushed yet.
-        result = subprocess.run(
-            ["git", "-C", str(bare), "log", "--oneline"],
-            capture_output=True,
-            text=True,
-        )
-        assert "note_4.md" not in result.stdout
+        monkeypatch.setattr(git_strategy, "_push", counting_push)
 
-        # Poll until push lands (max 3s).
-        for _ in range(30):
-            time.sleep(0.1)
+        # 30 s delay: the idle timer cannot fire during the writes below, so
+        # there is no timer race to lose.
+        strategy = GitWriteStrategy(token=None, push_delay_s=30.0)
+        try:
+            for i in range(5):
+                md_file = work / f"note_{i}.md"
+                md_file.write_text(f"# Note {i}\n")
+                strategy(md_file, f"# Note {i}\n", "write")
+
+            # The 5 rapid writes coalesced into exactly one pending push (each
+            # write cancelled + rescheduled the single idle timer), and nothing
+            # has been pushed yet — deterministic, not timer-dependent.
+            assert strategy._push_pending is True
+            assert strategy._timer is not None
+            assert push_calls == []
+
+            # Force the single deferred push.
+            strategy.flush()
+
+            # One push call delivered all 5 commits — coalesced, not 5 pushes.
+            assert len(push_calls) == 1
             result = subprocess.run(
                 ["git", "-C", str(bare), "log", "--oneline"],
                 capture_output=True,
                 text=True,
             )
-            if "note_4.md" in result.stdout:
-                break
-        else:
-            pytest.fail("Deferred push did not fire within 3 seconds")
-
-        # All 5 commits pushed in a single push.
-        for i in range(5):
-            assert f"write: note_{i}.md" in result.stdout
-
-        strategy.close()
+            for i in range(5):
+                assert f"write: note_{i}.md" in result.stdout
+        finally:
+            strategy.close()
 
     def test_push_with_token_to_bare_remote(
         self, git_repo_with_remote: tuple[Path, Path]
@@ -2112,6 +2129,106 @@ class TestGitSyncOnce:
         # Both frontmatter-parse warnings were logged.
         warnings = [r for r in caplog.records if "frontmatter" in r.message]
         assert len(warnings) >= 1
+
+    def test_write_conflict_files_reads_original_once(
+        self,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The original file is read exactly once when updating its frontmatter,
+        even if the parse fails — no double read_text (#662)."""
+        from pathlib import Path
+
+        strategy = GitWriteStrategy(token=None, push_delay_s=0)
+        (git_repo / "note.md").write_text("# original body\n")
+        saved = [("note.md", "# mcp body\n")]
+
+        reads = {"n": 0}
+        real_read_text = Path.read_text
+
+        def counting_read_text(self_path: Path, *a: object, **k: object) -> str:
+            if self_path.name == "note.md":
+                reads["n"] += 1
+            return real_read_text(self_path, *a, **k)  # type: ignore[arg-type]
+
+        def _raise(*_a: object, **_k: object) -> object:
+            raise ValueError("parse error")
+
+        monkeypatch.setattr(Path, "read_text", counting_read_text)
+        # Force the original-file frontmatter parse to fail so the fallback runs;
+        # the old code re-read the file in that branch.
+        monkeypatch.setattr("markdown_vault_mcp.git.conflict.frontmatter.loads", _raise)
+
+        written = strategy._write_conflict_files(git_repo, saved, env=None)
+
+        assert len(written) == 1
+        assert reads["n"] == 1, f"original file read {reads['n']} times, expected 1"
+
+    def test_write_conflict_files_skips_original_on_read_error(
+        self,
+        git_repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """If the original file becomes unreadable (TOCTOU delete / permission)
+        after the exists() check, the update is skipped with a WARNING rather
+        than crashing, and the conflict sibling is still written (#662)."""
+        from pathlib import Path
+
+        strategy = GitWriteStrategy(token=None, push_delay_s=0)
+        (git_repo / "note.md").write_text("# original body\n")
+        saved = [("note.md", "# mcp body\n")]
+
+        # A narrow read_text substitution (gated on the original's name, falling
+        # through otherwise) to exercise the observable skip-on-read-error
+        # behaviour — not an attempt to reproduce the TOCTOU race itself.
+        real_read_text = Path.read_text
+
+        def failing_read_text(self_path: Path, *a: object, **k: object) -> str:
+            if self_path.name == "note.md":
+                raise OSError("simulated read failure")
+            return real_read_text(self_path, *a, **k)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "read_text", failing_read_text)
+
+        with caplog.at_level(logging.WARNING, logger="markdown_vault_mcp.git"):
+            written = strategy._write_conflict_files(git_repo, saved, env=None)
+
+        # No crash; the conflict sibling was still written.
+        assert len(written) == 1
+        assert (git_repo / written[0]).exists()
+        # The original-file update was skipped with a warning naming the file.
+        assert any(
+            "note.md" in r.message and "skip" in r.message.lower()
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+    def test_write_conflict_files_skips_non_utf8_original(
+        self,
+        git_repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A non-UTF-8 original is skipped, not crashed on (#662).
+
+        The original is read as UTF-8; non-UTF-8 bytes raise ``UnicodeDecodeError``
+        (a ``ValueError``, NOT an ``OSError``), so the guard must catch it too —
+        otherwise it bypasses the handler and crashes the whole pull. Uses a real
+        non-UTF-8 file (no mocking), exercising the actual decode path.
+        """
+        strategy = GitWriteStrategy(token=None, push_delay_s=0)
+        (git_repo / "note.md").write_bytes(b"\xff\xfe not valid utf-8 \x80\n")
+        saved = [("note.md", "# mcp body\n")]
+
+        with caplog.at_level(logging.WARNING, logger="markdown_vault_mcp.git"):
+            written = strategy._write_conflict_files(git_repo, saved, env=None)
+
+        # No crash; the conflict sibling was still written.
+        assert len(written) == 1
+        assert (git_repo / written[0]).exists()
+        assert any(
+            "note.md" in r.message and "skip" in r.message.lower()
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
 
 
 class TestRebaseInProgress:

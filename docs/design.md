@@ -342,7 +342,10 @@ for built-in names, or pass a custom instance.
 **Hash-based**, not git-based. Works with any directory, no git dependency.
 
 - **State file** (the JSON persistence layer for hash-based change detection):
-  `{relative_path: sha256_hash}` as JSON.
+  versioned format `{"version": 2, "indexed": {relative_path: sha256_hash},
+  "skipped": {relative_path: sha256_hash}}` as JSON (#665). The legacy flat
+  `{relative_path: sha256_hash}` format still loads — every entry is treated
+  as indexed — so upgrades need no migration step.
 - **Default path**: `{source_dir}/.markdown_vault_mcp/state.json` (when
   `state_path=None`).
 - On `reindex()`: scan all files, compare hashes to stored state, re-parse and
@@ -350,10 +353,22 @@ for built-in names, or pass a custom instance.
   `exclude_patterns` are skipped during re-parsing (mirroring `scan_directory`
   behaviour). Any previously indexed documents that now match `exclude_patterns`
   are purged from the FTS and vector indexes.
+- **Skipped-file memory (#665)**: deterministic skips — missing required
+  frontmatter, exclude-pattern matches, decode/parse errors — are recorded in
+  the `skipped` map with the file's content hash, during both full builds and
+  incremental reindexes. An unchanged skipped file is neither re-parsed nor
+  re-logged on later scans and is reported in the `skipped` count of
+  `ReindexResult` instead of `added`; it is re-evaluated (and indexed, if it
+  gained valid frontmatter) only when its content hash changes. Transient
+  `OSError` skips are deliberately *not* recorded, so those files retry on
+  every scan. A skipped file deleted from disk is dropped silently — it was
+  never indexed, so it is not counted as `deleted`.
 
-**Trigger model**: startup scan + explicit `reindex` tool call. No background
-polling in Phase 1. Architecture supports adding `watch_interval` or watchdog
-integration later without refactoring.
+**Trigger model**: boot reconciliation reindex (submitted by the server
+lifespan behind the initial build job, #665) + explicit `reindex` tool call
++ file watcher / git pull / webhook events. No background polling in Phase 1.
+Architecture supports adding `watch_interval` or watchdog integration later
+without refactoring.
 
 ### Incremental Reindex
 
@@ -508,9 +523,52 @@ resolves to.
 
 To apply a configuration change (e.g. new `exclude_patterns`,
 `required_frontmatter`) to a pre-existing index, call
-`build_index(force=True)` — and, when embeddings are configured,
-`build_embeddings(force=True)` — because the short-circuit is keyed on
-FTS contents alone and does not detect config drift.
+`build_index(force=True)` — the short-circuit is keyed on FTS contents
+alone and does not detect config drift. When embeddings are configured, a
+follow-up plain `build_embeddings()` converges the vector index to the
+rebuilt chunk set (see Embedding Convergence below); `force=True` remains
+necessary only when the embedding model itself changed, because identical
+chunks embedded by a different model are invisible to the chunk-set diff
+(the persisted provider/model fingerprint check normally catches this case
+at load time and forces the rebuild automatically).
+
+### Embedding Convergence (#665)
+
+`build_embeddings(force=False)` over a **non-empty** vector index does not
+skip and does not rebuild — it diffs the FTS `sections` table (the
+canonical chunk set, via `FTSIndex.list_chunks()`) against the stored
+vector metadata grouped by path (`VectorIndex.chunks_by_path()`) and
+reconciles:
+
+- Documents missing from the vector index are embedded and added.
+- Documents whose per-path `(title, heading, content)` chunk multiset
+  differs in any way (modified content, changed title, re-chunked
+  boundaries) are re-embedded in full. The multiset is the chunk identity
+  — `VectorIndex` has no per-chunk keys, only a parallel metadata list
+  with path-level deletion.
+- Vectors for documents no longer in the FTS index (deleted, or newly
+  excluded) are removed.
+- Unchanged documents are untouched; the sidecar is saved only when
+  something actually changed, and the run is summarised in a single
+  `build_embeddings_converged added=N removed=M up_to_date=K` log line.
+
+This closes the FTS-vs-vector gap that the boot reconciliation reindex
+would otherwise widen: the boot `ReindexAll` job runs before the vector
+index is loaded, so offline document changes reach the FTS index but not
+the vectors — the boot `BuildEmbeddings` job that follows it (writer FIFO
+order) now converges the difference instead of skipping because vectors
+exist. Embedding work scales with the size of the drift, not the size of
+the vault, so a steady-state boot does zero embedding work.
+
+Convergence embeds per document, in the same bounded batches as the cold
+build (#159): a provider failure on one document's chunks (token-context
+rejection, transient outage) skips exactly that document — its existing
+vectors stay intact — and the rest still converge. This is also the
+self-healing property: a boot `BuildEmbeddings` job that failed outright
+(recorded in `last_build_embeddings_error`, never retried in-process)
+merely leaves a larger diff for the next successful run to converge. A
+cold build (empty vector index) and `force=True` behave exactly as
+before.
 
 ### Error Handling
 
@@ -539,8 +597,9 @@ pathological memory allocation from embedding providers (see issue #159).
 FastEmbed's ONNX inference uses a further inner batch size of 4 to keep
 per-call memory bounded — without this, the ONNX attention matrix for 64 long
 chunks can require >192 GB of allocation. The save happens once at the end so a
-mid-run crash does not leave a partial index that the skip-if-exists check
-treats as complete on the next startup.
+mid-run crash does not leave a partial index on disk; if one exists anyway,
+the next startup's convergence pass (see Embedding Convergence, #665) embeds
+exactly the missing chunks rather than treating the index as complete.
 
 ### Thread Safety
 
@@ -570,7 +629,20 @@ Submission returns a `concurrent.futures.Future`; callers wait via
 `reindex()`, `build_embeddings()`) or fire-and-forget via the `*_async`
 counterparts (e.g. MCP-tool-level `reindex` and `build_embeddings`, both of
 which return `{"status": "queued"}` immediately and let the writer thread
-do the work). Follow-up submissions issued from inside the writer thread
+do the work).
+
+**Boot reconciliation (#665).** The server lifespan submits
+`reindex_async()` immediately after `build_index_async()`. On a warm
+restart the build short-circuits in O(1) via the FTS sentinel and scans
+nothing, so the queued `ReindexAll` job is what picks up files added,
+modified, or deleted while no server was running (the file watcher only
+sees future events). FIFO ordering guarantees build-before-reindex; on a
+cold boot the full build has just recorded tracker state — including
+skipped files — so the reindex degenerates to a hash scan with zero
+re-parses and zero re-upserts. While the boot reindex is pending or in
+flight the writer is non-drained, so the `_meta.index_stale` signal
+(#646) honestly reports `true` to early readers until offline changes are
+reconciled — no extra staleness bookkeeping is needed. Follow-up submissions issued from inside the writer thread
 itself succeed even during shutdown drain, so `ProcessDirtyPaths` can
 chain into `FlushDirtyEmbeddings` and both flush before the sentinel
 terminates the worker loop.
@@ -1106,6 +1178,7 @@ class ReindexResult:
     modified: int
     deleted: int
     unchanged: int
+    skipped: int = 0                  # deliberately not indexed (#665)
 
 @dataclass
 class VaultStats:
@@ -1129,6 +1202,7 @@ class ChangeSet:
     modified: list[str]
     deleted: list[str]
     unchanged: int
+    skipped_unchanged: int = 0        # recorded skips, content unchanged (#665)
 
 # --- Graph types ---
 
@@ -1329,6 +1403,26 @@ The MCP tool `get_connection_path` returns
 `{"found": bool, "path": list[str], "hops": int}`.
 
 ## Module Design
+
+### `__init__.py` -- Lazy Package Root (PEP 562, #665)
+
+The package root resolves its public attributes lazily via module-level
+``__getattr__``/``__dir__`` (PEP 562) from an explicit name -> submodule map
+(`_EXPORTS`), instead of eagerly importing every exporting submodule. The
+public API is unchanged: ``from markdown_vault_mcp import Vault`` still works,
+``__all__`` lists the same names, and a test pins ``_EXPORTS`` == ``__all__``.
+
+Rationale: an eager root pulled the full dependency tree (``config`` ->
+``fastmcp_pvl_core`` -> ``beartype``; ``frontmatter`` -> PyYAML) into *any*
+import of the package. coverage.py resolves dotted ``--cov=`` source packages
+with ``importlib.util.find_spec`` inside a sys.modules-restoring context, so
+those dependencies were imported and then purged while their process-global
+side effects (beartype's claw entry in ``sys.path_hooks``, PyYAML's cached
+single-phase-init C extension) survived, breaking every subsequent import in
+the process. The package root must therefore stay import-light: it may not
+import (directly or transitively) ``fastmcp_pvl_core``, ``beartype``,
+``frontmatter``, or ``yaml``. Regression tests live in
+``tests/test_package_imports.py``.
 
 ### `vault.py` -- Thin Facade
 
@@ -1604,12 +1698,16 @@ class ChangeTracker:
     def __init__(self, state_path: Path): ...
     def detect_changes(self, source_dir: Path,
                        glob_pattern: str = "**/*.md") -> ChangeSet: ...
-    def update_state(self, notes: list[ParsedNote]) -> None: ...
+    def update_state(self, notes: list[ParsedNote],
+                     skipped: dict[str, str] | None = None) -> None: ...
     def reset(self) -> None: ...
 ```
 
 `tracker.py` is entirely new code (no ifcraftcorpus equivalent). State file
-format: `{"Journal/note.md": "sha256hex", ...}` as JSON.
+format (version 2, #665): `{"version": 2, "indexed": {"Journal/note.md":
+"sha256hex", ...}, "skipped": {"CLAUDE.md": "sha256hex", ...}}` as JSON.
+The legacy flat `{"Journal/note.md": "sha256hex", ...}` format loads with
+every entry treated as indexed.
 
 ### `server.py` -- Generic MCP Server
 

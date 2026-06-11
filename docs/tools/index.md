@@ -235,15 +235,20 @@ build attempt.
 
 ### `reindex`
 
-Incrementally update the full-text search index to reflect file changes made outside this server. Only processes changed files — unchanged documents are skipped.
+Incrementally update the full-text search index to reflect file changes made outside this server. Only processes changed files — unchanged documents are skipped, and files deliberately excluded from the index (missing required frontmatter, exclude-pattern matches, unparseable content) are remembered across scans so they are not re-parsed or re-reported until their content changes (#665).
 
 If semantic search is configured, the queued reindex job re-embeds the changed documents on the writer thread. Poll `get_index_status` and watch the `dirty_embeddings` counter to observe completion.
+
+!!! note "Boot reconciliation"
+    The server lifespan automatically queues one incremental reindex at every startup (#665), so files added, modified, or deleted while no server was running are reconciled without a manual `reindex` call. Reads served before that job completes report `index_stale: true` in `_meta`.
 
 **Returns:** `{"status": "queued"}`. The reindex runs asynchronously on the single-owner :class:`IndexWriter` thread (#559); poll `get_server_info` or `get_index_status` for completion. `get_index_status` exposes `queue_depth`, `in_flight`, `dirty_paths`, and `dirty_embeddings` so you can observe progress without blocking.
 
 ### `build_embeddings`
 
 Build vector embeddings to enable semantic and hybrid search. This can be slow for large vaults.
+
+Without `force`, an existing vector index is **converged** to the FTS chunk set (#665): documents missing from it are embedded, documents whose indexed content changed are re-embedded, and vectors for deleted or excluded documents are dropped. Work scales with the size of the drift, not the size of the vault — an already-converged index does no embedding work.
 
 **Parameters:**
 
@@ -254,7 +259,7 @@ Build vector embeddings to enable semantic and hybrid search. This can be slow f
 **Returns:** `{"status": "queued"}`. The build runs asynchronously on the single-owner :class:`IndexWriter` thread (#559); poll `get_server_info` or `get_index_status` for completion.
 
 !!! note "When to use"
-    Call `build_embeddings` once to enable semantic search for the first time. After that, `reindex` handles incremental re-embedding automatically.
+    Normally never: the server queues a `build_embeddings` job at every startup, which converges the vector index to whatever the boot reconciliation reindex found (#665). Call it manually only to embed a vault for the first time without restarting, to retry after a provider outage, or with `force=true` after changing the embedding model.
 
 ---
 

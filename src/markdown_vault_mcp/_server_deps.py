@@ -111,6 +111,20 @@ def make_vault_lifespan(config: VaultConfig) -> Any:
         vault.index.build_index_async()
         logger.info("Submitted BuildIndex job to writer")
 
+        # Reconcile offline changes (#665): files added, modified, or
+        # deleted while no server was running are invisible to both the
+        # warm-restart short-circuit above (O(1), no filesystem scan) and
+        # the file watcher below (future events only).  Enqueue an
+        # incremental reindex behind the build: the writer's FIFO ordering
+        # guarantees build-before-reindex, and on a cold boot the full
+        # build has just recorded tracker state (including skipped files),
+        # so the reindex degenerates to a cheap hash scan instead of a
+        # second full parse.  While this job is pending, the writer is
+        # non-drained, so #646's out-of-band `index_stale` meta signal
+        # honestly reports True until the boot reconciliation completes.
+        vault.index.reindex_async()
+        logger.info("Submitted boot Reindex job to writer")
+
         if kwargs.get("embedding_provider") is not None:
             vault.index.build_embeddings_async()
             logger.info("Submitted BuildEmbeddings job to writer")

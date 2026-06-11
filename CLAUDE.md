@@ -11,6 +11,7 @@ The authoritative design specification lives at [`docs/design.md`](docs/design.m
 <!-- DOMAIN-START -->
 ```
 src/markdown_vault_mcp/
+  __init__.py        -- lazy (PEP 562) public API root; must stay import-light (#665)
   utils/
     text.py            -- text normalization, position mapping, fuzzy matching
     links.py           -- link target computation and replacement

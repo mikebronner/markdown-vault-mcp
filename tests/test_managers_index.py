@@ -234,6 +234,252 @@ class TestReindex:
 
 
 # ---------------------------------------------------------------------------
+# Skip-state memory (#665): skipped files are remembered in tracker state
+# ---------------------------------------------------------------------------
+
+
+class TestSkipStateMemory:
+    """reindex() must not re-report/re-parse deterministically skipped files."""
+
+    def _vault_with_skip(self, tmp_path: Path) -> Path:
+        """Vault with one indexable note and one missing required frontmatter."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "good.md").write_text(
+            "---\ntitle: Good\n---\n# Good\n\nbody\n", encoding="utf-8"
+        )
+        (vault / "skip.md").write_text("# No frontmatter\n\nbody\n", encoding="utf-8")
+        return vault
+
+    def test_build_index_records_skips_so_first_reindex_is_quiet(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reindex right after a full build re-parses nothing (boot path)."""
+        vault = self._vault_with_skip(tmp_path)
+        mgr, _fts, _ = _make_index_mgr(vault, tmp_path, required_frontmatter=["title"])
+        mgr.build_index()
+
+        import markdown_vault_mcp.managers.index as index_module
+
+        parse_calls: list[str] = []
+        original_parse = index_module.parse_note
+
+        def counting_parse(abs_path, source_dir, chunk_strategy):
+            parse_calls.append(str(abs_path))
+            return original_parse(abs_path, source_dir, chunk_strategy)
+
+        monkeypatch.setattr(index_module, "parse_note", counting_parse)
+
+        result = mgr.reindex()
+        assert result.added == 0
+        assert result.modified == 0
+        assert result.deleted == 0
+        assert result.unchanged == 1
+        assert result.skipped == 1
+        assert parse_calls == [], f"reindex re-parsed {parse_calls}"
+
+    def test_unchanged_skipped_file_not_relogged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The missing-frontmatter skip is logged once, not on every scan."""
+        vault = self._vault_with_skip(tmp_path)
+        mgr, _fts, _ = _make_index_mgr(vault, tmp_path, required_frontmatter=["title"])
+        # Cold tracker state: build via reindex so the skip is logged once.
+        mgr.build_index()
+        mgr._tracker.reset()
+
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.managers.index"):
+            mgr.reindex()
+        first_run_skips = [
+            r for r in caplog.records if "missing frontmatter" in r.getMessage()
+        ]
+        assert len(first_run_skips) == 1
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="markdown_vault_mcp.managers.index"):
+            result = mgr.reindex()
+        second_run_skips = [
+            r for r in caplog.records if "missing frontmatter" in r.getMessage()
+        ]
+        assert second_run_skips == []
+        assert result.skipped == 1
+
+    def test_skipped_file_gaining_frontmatter_is_indexed(self, tmp_path: Path) -> None:
+        """A skipped file whose content gains valid frontmatter is indexed."""
+        vault = self._vault_with_skip(tmp_path)
+        mgr, fts, _ = _make_index_mgr(vault, tmp_path, required_frontmatter=["title"])
+        mgr.build_index()
+        assert mgr.reindex().skipped == 1
+
+        (vault / "skip.md").write_text(
+            "---\ntitle: Now Valid\n---\n# Valid\n\nbody\n", encoding="utf-8"
+        )
+
+        result = mgr.reindex()
+        assert result.added == 1
+        assert result.skipped == 0
+        paths = {n["path"] for n in fts.list_notes()}
+        assert "skip.md" in paths
+
+    def test_excluded_file_recorded_as_skip(self, tmp_path: Path) -> None:
+        """A file matching exclude_patterns is skipped once, then remembered."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "good.md").write_text("# Good\n\nbody\n", encoding="utf-8")
+        mgr, _fts, _ = _make_index_mgr(vault, tmp_path, exclude_patterns=["drafts/**"])
+        mgr.build_index()
+
+        drafts = vault / "drafts"
+        drafts.mkdir()
+        (drafts / "wip.md").write_text("# WIP\n", encoding="utf-8")
+
+        first = mgr.reindex()
+        assert first.added == 0
+        assert first.skipped == 1
+
+        second = mgr.reindex()
+        assert second.added == 0
+        assert second.skipped == 1
+
+    def test_transient_oserror_skip_is_retried(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError during parse is NOT recorded; the file retries next scan."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "flaky.md").write_text("# Flaky\n\nbody\n", encoding="utf-8")
+        mgr, fts, _ = _make_index_mgr(vault, tmp_path)
+
+        import markdown_vault_mcp.managers.index as index_module
+
+        original_parse = index_module.parse_note
+
+        def failing_parse(abs_path, source_dir, chunk_strategy):  # noqa: ARG001
+            raise OSError("transient I/O error")
+
+        monkeypatch.setattr(index_module, "parse_note", failing_parse)
+        first = mgr.reindex()
+        assert first.added == 0
+        assert first.skipped == 0  # not recorded — must retry
+
+        monkeypatch.setattr(index_module, "parse_note", original_parse)
+        second = mgr.reindex()
+        assert second.added == 1
+        paths = {n["path"] for n in fts.list_notes()}
+        assert "flaky.md" in paths
+
+    def test_parse_error_skip_is_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A deterministic parse error is recorded; no re-parse next scan."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "broken.md").write_text("# Broken\n\nbody\n", encoding="utf-8")
+        mgr, _fts, _ = _make_index_mgr(vault, tmp_path)
+
+        import markdown_vault_mcp.managers.index as index_module
+
+        parse_calls: list[str] = []
+
+        def broken_parse(abs_path, source_dir, chunk_strategy):  # noqa: ARG001
+            parse_calls.append(str(abs_path))
+            raise ValueError("malformed note")
+
+        monkeypatch.setattr(index_module, "parse_note", broken_parse)
+        first = mgr.reindex()
+        assert first.added == 0
+        assert first.skipped == 1
+        assert len(parse_calls) == 1
+
+        second = mgr.reindex()
+        assert second.skipped == 1
+        assert len(parse_calls) == 1, "unchanged broken file must not re-parse"
+
+    def test_undecodable_file_skip_is_recorded(self, tmp_path: Path) -> None:
+        """A UnicodeDecodeError is deterministic: recorded, not re-parsed."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "binary.md").write_bytes(b"\xff\xfe\x00\x00 not utf-8")
+        mgr, fts, _ = _make_index_mgr(vault, tmp_path)
+
+        first = mgr.reindex()
+        assert first.added == 0
+        assert first.skipped == 1
+
+        second = mgr.reindex()
+        assert second.added == 0
+        assert second.skipped == 1
+        assert fts.list_notes() == []
+
+    def test_record_skip_hash_oserror_is_swallowed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An OSError while hashing a skip leaves it unrecorded (retry later)."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        drafts = vault / "drafts"
+        drafts.mkdir()
+        (drafts / "wip.md").write_text("# WIP\n", encoding="utf-8")
+        mgr, _fts, _ = _make_index_mgr(vault, tmp_path, exclude_patterns=["drafts/**"])
+
+        import markdown_vault_mcp.managers.index as index_module
+
+        def failing_hash(path):  # noqa: ARG001
+            raise OSError("unreadable")
+
+        monkeypatch.setattr(index_module, "compute_file_hash", failing_hash)
+        first = mgr.reindex()
+        assert first.added == 0
+        assert first.skipped == 0  # hash failed → skip not recorded
+
+        monkeypatch.undo()
+        second = mgr.reindex()
+        assert second.skipped == 1  # retried and recorded this time
+
+    def test_build_index_skip_hash_oserror_is_swallowed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """build_index tolerates a hash failure while recording skips."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "good.md").write_text(
+            "---\ntitle: Good\n---\n# Good\n\nbody\n", encoding="utf-8"
+        )
+        (vault / "skip.md").write_text("# No frontmatter\n", encoding="utf-8")
+        mgr, _fts, _ = _make_index_mgr(vault, tmp_path, required_frontmatter=["title"])
+
+        import markdown_vault_mcp.managers.index as index_module
+
+        def failing_hash(path):  # noqa: ARG001
+            raise OSError("unreadable")
+
+        monkeypatch.setattr(index_module, "compute_file_hash", failing_hash)
+        stats = mgr.build_index()
+        assert stats.documents_indexed == 1
+        monkeypatch.undo()
+
+        # The skip was not recorded, so the next scan re-evaluates it.
+        result = mgr.reindex()
+        assert result.added == 0  # still lacks frontmatter → skipped again
+        assert result.skipped == 1
+
+    def test_build_index_ignores_directory_matching_glob(self, tmp_path: Path) -> None:
+        """A directory whose name matches *.md is not recorded as a skip."""
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "good.md").write_text(
+            "---\ntitle: Good\n---\n# Good\n\nbody\n", encoding="utf-8"
+        )
+        (vault / "folder.md").mkdir()
+        mgr, _fts, _ = _make_index_mgr(vault, tmp_path, required_frontmatter=["title"])
+        mgr.build_index()
+
+        result = mgr.reindex()
+        assert result.added == 0
+        assert result.skipped == 0
+
+
+# ---------------------------------------------------------------------------
 # build_embeddings
 # ---------------------------------------------------------------------------
 

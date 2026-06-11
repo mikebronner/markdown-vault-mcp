@@ -170,19 +170,24 @@ def _cmd_reindex(args: argparse.Namespace) -> None:
     vault.index.build_index()
     result = vault.index.reindex()
     logger.info(
-        "Reindex complete: %d added, %d modified, %d deleted, %d unchanged",
+        "Reindex complete: %d added, %d modified, %d deleted, %d unchanged, %d skipped",
         result.added,
         result.modified,
         result.deleted,
         result.unchanged,
+        result.skipped,
     )
     print(
         f"Reindex: {result.added} added, {result.modified} modified, "
-        f"{result.deleted} deleted, {result.unchanged} unchanged"
+        f"{result.deleted} deleted, {result.unchanged} unchanged, "
+        f"{result.skipped} skipped"
     )
     try:
-        should_force = result.added > 0 or result.modified > 0 or result.deleted > 0
-        n = vault.index.build_embeddings(force=should_force)
+        # build_embeddings() without force converges the vector index to
+        # the FTS chunk set (#665): exactly the changed documents are
+        # embedded and orphaned vectors dropped, so no force-rebuild of
+        # the whole corpus is needed when the reindex found changes.
+        n = vault.index.build_embeddings()
         logger.info("Embedded %d chunks", n)
         print(f"Embedded {n} chunks")
     except ValueError:

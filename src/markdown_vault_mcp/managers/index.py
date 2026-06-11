@@ -12,12 +12,14 @@ import json
 import logging
 import sqlite3
 import time
+from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from markdown_vault_mcp.fts_index import _derive_folder, should_optimize
+from markdown_vault_mcp.hashing import compute_file_hash
 from markdown_vault_mcp.scanner import parse_note, scan_directory
 from markdown_vault_mcp.types import IndexStats, ParsedNote, ReindexResult
 from markdown_vault_mcp.utils import is_path_excluded
@@ -271,8 +273,33 @@ class IndexManager:
         # Resolve vault-wide wikilinks now that all documents are indexed.
         self._fts.resolve_vault_wikilinks()
 
+        # Record skipped files (excluded, missing frontmatter, unparseable)
+        # in tracker state too, so the first reindex() — including the boot
+        # reconciliation pass after a cold build (#665) — does not re-report
+        # them as added and re-log every skip.
+        skipped_state: dict[str, str] = {}
+        for abs_path in all_files:
+            if not abs_path.is_file():
+                continue
+            try:
+                rel_str = abs_path.relative_to(self._source_dir).as_posix()
+            except ValueError:
+                # Symlink target outside the vault — mirror detect_changes.
+                logger.warning("File outside source_dir, skipping: %s", abs_path)
+                continue
+            if rel_str in indexed_paths:
+                continue
+            try:
+                skipped_state[rel_str] = compute_file_hash(abs_path)
+            except OSError as exc:
+                # Possibly transient — leave unrecorded so the next scan
+                # retries the file.
+                logger.debug(
+                    "build_index_skip_hash_failed path=%s err=%s", rel_str, exc
+                )
+
         # Update tracker state so reindex() knows the baseline.
-        self._tracker.update_state(notes)
+        self._tracker.update_state(notes, skipped=skipped_state)
 
         if errored:
             logger.warning(
@@ -330,25 +357,47 @@ class IndexManager:
         # Phase 1: scan filesystem (read-only walk + hashing).
         changes = self._tracker.detect_changes(self._source_dir)
         logger.info(
-            "reindex: %d added, %d modified, %d deleted, %d unchanged",
+            "reindex: %d added, %d modified, %d deleted, %d unchanged, %d skipped",
             len(changes.added),
             len(changes.modified),
             len(changes.deleted),
             changes.unchanged,
+            changes.skipped_unchanged,
         )
+
+        # Files seen this scan but deliberately not indexed (#665).  Recording
+        # their content hash in tracker state means an unchanged skipped file
+        # is neither re-parsed nor re-reported (or re-logged) on the next
+        # scan; it is only re-evaluated when its content changes.  Transient
+        # I/O errors are NOT recorded, so those files retry on every scan.
+        newly_skipped: dict[str, str] = {}
+
+        def _record_skip(rel_path: str, abs_file: Path) -> None:
+            """Record a deterministically skipped file's current hash."""
+            try:
+                newly_skipped[rel_path] = compute_file_hash(abs_file)
+            except OSError as exc:
+                logger.debug("reindex_skip_hash_failed path=%s err=%s", rel_path, exc)
 
         # Pre-parse notes outside the lock to minimise lock hold time.
         parsed: list[tuple[str, ParsedNote]] = []
         for path in changes.added + changes.modified:
+            abs_path = self._source_dir / path
+
             if self._is_path_excluded(path):
                 logger.debug("reindex: excluding %s (matched exclude pattern)", path)
+                _record_skip(path, abs_path)
                 continue
 
-            abs_path = self._source_dir / path
             try:
                 note = parse_note(abs_path, self._source_dir, self._chunk_strategy)
-            except (UnicodeDecodeError, OSError) as exc:
+            except OSError as exc:
+                # Possibly transient — do not record; retry on the next scan.
                 logger.warning("reindex: skipping %s — %s", path, exc)
+                continue
+            except UnicodeDecodeError as exc:
+                logger.warning("reindex: skipping %s — %s", path, exc)
+                _record_skip(path, abs_path)
                 continue
             except Exception as exc:
                 logger.warning(
@@ -357,6 +406,7 @@ class IndexManager:
                     exc,
                     exc_info=True,
                 )
+                _record_skip(path, abs_path)
                 continue
 
             if self._required_frontmatter:
@@ -369,6 +419,7 @@ class IndexManager:
                         path,
                         missing,
                     )
+                    newly_skipped[path] = note.content_hash
                     continue
 
             parsed.append((path, note))
@@ -377,7 +428,7 @@ class IndexManager:
         vectors = self._get_vectors()
 
         # Corpus size before this purge pass, for the optimize threshold.
-        docs_before_purge = len(self._fts.list_notes())
+        docs_before_purge = self._fts.count_documents()
 
         deleted_purged = 0
         for path in changes.deleted:
@@ -465,13 +516,14 @@ class IndexManager:
             )
             for r in self._fts.list_notes()
         ]
-        self._tracker.update_state(state_notes)
+        self._tracker.update_state(state_notes, skipped=newly_skipped)
 
         return ReindexResult(
             added=indexed_added,
             modified=indexed_modified,
             deleted=len(changes.deleted),
             unchanged=changes.unchanged,
+            skipped=changes.skipped_unchanged + len(newly_skipped),
         )
 
     # ------------------------------------------------------------------
@@ -479,11 +531,25 @@ class IndexManager:
     # ------------------------------------------------------------------
 
     def build_embeddings(self, *, force: bool = False) -> int:
-        """Build the vector index from all chunks currently in the FTS index.
+        """Build or converge the vector index against the FTS index.
+
+        Without ``force``, a non-empty persisted vector index is diffed
+        against the chunks currently in the FTS ``sections`` table and
+        reconciled (#665): chunks present in the FTS index but missing
+        from the vector index are embedded and added, vectors for
+        documents no longer in the FTS index are removed, and documents
+        whose indexed content changed are re-embedded.  After every call
+        the vector index mirrors the FTS chunk set, so external changes
+        picked up by the boot reconciliation reindex (while no vector
+        index was loaded) cannot accumulate as permanent semantic-search
+        drift.  Work scales with the size of the diff, not the size of
+        the vault.  An empty vector index falls through to the full cold
+        build below.
 
         Args:
             force: If ``True``, rebuild from scratch even if a vector index
-                already exists on disk.
+                already exists on disk (e.g. after changing the embedding
+                model).
 
         Returns:
             Number of chunks successfully embedded. Any provider exception on
@@ -491,7 +557,8 @@ class IndexManager:
             also transient API/network errors) is logged and the batch
             skipped, so this may be less than the total number of chunks
             attempted; if every batch is skipped, ``0`` is returned and no
-            vectors are saved.
+            vectors are saved.  On the convergence path this counts only the
+            newly embedded chunks — a fully converged index returns ``0``.
 
         Raises:
             ValueError: If ``embedding_provider`` or ``embeddings_path`` is
@@ -516,11 +583,8 @@ class IndexManager:
             if vectors is None:
                 raise ValueError("Failed to load vector index after _load_vectors()")
             if vectors.count > 0:
-                logger.info(
-                    "build_embeddings: index already exists (%d chunks), skipping",
-                    vectors.count,
-                )
-                return vectors.count
+                return self._converge_embeddings(vectors)
+            # Empty index — fall through to the full cold build.
 
         rows = self._fts.list_notes()
         num_notes = len(rows)
@@ -626,6 +690,130 @@ class IndexManager:
         else:
             logger.info("build_embeddings: nothing to embed")
         return embedded
+
+    def _converge_embeddings(self, vectors: VectorIndex) -> int:
+        """Reconcile a non-empty vector index with the FTS chunk set (#665).
+
+        Chunk identity is the ``(title, heading, content)`` multiset per
+        document path — exactly the metadata stored alongside each vector
+        row, so the diff needs no file re-parsing.  Documents present only
+        in the vector index (deleted or newly excluded while no server
+        ran) lose their vectors; documents missing from it are embedded;
+        documents whose chunk multiset differs in any way (modified
+        content, changed title, re-chunked boundaries) are re-embedded in
+        full.  The sidecar is saved only when something actually changed.
+
+        A provider failure while embedding one document's chunks skips
+        that document — its existing vectors are left intact — and the
+        remaining documents still converge; the next call retries
+        (mirroring the cold build's per-batch resilience, #649).  This is
+        also what makes a failed boot ``BuildEmbeddings`` job self-heal:
+        the drift it left behind is just a larger diff for the next run.
+
+        Thread-safety: runs on the single-owner
+        :class:`~markdown_vault_mcp.indexing.IndexWriter` thread via
+        :meth:`build_embeddings`, so no internal lock is required.
+
+        Args:
+            vectors: The loaded, non-empty vector index to reconcile.
+
+        Returns:
+            Number of chunks newly embedded (``0`` on an already-converged
+            index).
+        """
+        # build_embeddings() ran _require_vectors() before dispatching here.
+        if self._embeddings_path is None or self._embedding_provider is None:
+            raise RuntimeError(
+                "_require_vectors() must be called before _converge_embeddings()"
+            )
+
+        def _signature(
+            rows: list[dict[str, Any]],
+        ) -> Counter[tuple[Any, Any, Any, Any]]:
+            # start_line participates so that line-shift-only edits (content
+            # identical, positions moved) still refresh vector metadata; the
+            # cost is re-embedding that one doc's chunks, and embeddings are
+            # deterministic for identical content.
+            return Counter(
+                (
+                    r.get("title"),
+                    r.get("heading"),
+                    r.get("content"),
+                    r.get("start_line"),
+                )
+                for r in rows
+            )
+
+        fts_by_path: dict[str, list[dict[str, Any]]] = {}
+        for row in self._fts.list_chunks():
+            fts_by_path.setdefault(row["path"], []).append(row)
+        vec_by_path = vectors.chunks_by_path()
+
+        stale_paths = [p for p in vec_by_path if p not in fts_by_path]
+        missing_paths: list[str] = []
+        refresh_paths: list[str] = []
+        up_to_date = 0
+        for path, rows in fts_by_path.items():
+            existing = vec_by_path.get(path)
+            if existing is None:
+                missing_paths.append(path)
+            elif _signature(rows) != _signature(existing):
+                refresh_paths.append(path)
+            else:
+                up_to_date += len(rows)
+
+        added = 0
+        removed = 0
+        failed = 0
+        # Embed per document, in bounded batches (#159), so a provider
+        # failure affects exactly one document: its old vectors stay
+        # untouched and every other document still converges.
+        for path in missing_paths + refresh_paths:
+            rows = fts_by_path[path]
+            texts = [r["content"] for r in rows]
+            raw: list[list[float]] = []
+            try:
+                for start in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
+                    raw.extend(
+                        self._embedding_provider.embed(
+                            texts[start : start + _EMBEDDING_BATCH_SIZE]
+                        )
+                    )
+            except Exception as exc:
+                # Broad by design: providers raise heterogeneous types for
+                # an oversized batch or transient outage (RuntimeError,
+                # httpx errors, ...). Keep the traceback diagnosable.
+                failed += len(texts)
+                logger.warning(
+                    "build_embeddings_converge_skip_doc path=%s chunks=%d err=%s",
+                    path,
+                    len(texts),
+                    exc,
+                    exc_info=True,
+                )
+                continue
+            removed += vectors.delete_by_path(path)
+            added += vectors.add_vectors(raw, rows)
+
+        for path in stale_paths:
+            removed += vectors.delete_by_path(path)
+
+        if added or removed:
+            vectors.save(self._embeddings_path)
+
+        if failed:
+            logger.warning(
+                "build_embeddings_converge_failed_chunks total=%d "
+                "(existing vectors kept; retried on the next run)",
+                failed,
+            )
+        logger.info(
+            "build_embeddings_converged added=%d removed=%d up_to_date=%d",
+            added,
+            removed,
+            up_to_date,
+        )
+        return added
 
     def embeddings_status(self) -> dict[str, Any]:
         """Return status information about the vector index.
