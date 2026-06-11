@@ -267,6 +267,24 @@ Two methods manage the index:
   vector index (cold boot) builds everything; `force=True` discards and
   rebuilds from scratch (e.g. after an embedding-model change).
 
+**FTS5 segment hygiene after bulk purges**: deleting rows from an FTS5 table
+only marks their tokens as deleted — the dead entries remain in the on-disk
+inverted-index segments until FTS5's lazy merge gets around to them, which it
+may never do. A bulk purge (e.g. newly-configured `exclude_patterns` expelling
+previously indexed documents at boot, issue #255) can therefore leave large
+dead segments that bloat the index file and slow keyword queries. When a
+single purge pass removes ≥ 25 documents or ≥ 10% of the pre-purge corpus
+(`should_optimize()` in `fts_index.py`), the purge call sites in
+`build_index()` adoption and `reindex()` run `FTSIndex.optimize()` — `INSERT
+INTO notes_fts(notes_fts) VALUES('optimize')` — which merges all segments and
+drops the dead entries. The merge frees pages inside the file; the file itself
+only shrinks after a `VACUUM`. `optimize()` logs the reclaimable size
+(freelist × page size) at INFO, and the `reindex --vacuum` CLI flag exposes an
+explicit `VACUUM` for maintenance. `VACUUM` is never run automatically because
+it takes an exclusive lock and multiple server processes may share one index
+file. Lock contention during `optimize()` is tolerated: it is skipped with a
+warning and the next bulk purge retries.
+
 **Server startup**: the MCP server lifespan checks
 `Collection.has_indexed_documents()`. When the persistent index is already
 populated it runs `reindex()` (adopt + incremental delta for files changed

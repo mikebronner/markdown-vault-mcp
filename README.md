@@ -286,8 +286,14 @@ markdown-vault-mcp search <query> [-n LIMIT] [-m {keyword|semantic|hybrid}] [--f
 Incrementally reindex the vault (only processes changed files).
 
 ```bash
-markdown-vault-mcp reindex [--source-dir PATH] [--index-path PATH]
+markdown-vault-mcp reindex [--source-dir PATH] [--index-path PATH] [--vacuum]
 ```
+
+`--vacuum` compacts the SQLite index file after reindexing, returning pages
+freed by deleted documents to the filesystem. It takes an exclusive lock on
+the index file — do not use it while a server process shares the same
+`--index-path`. (Bulk purges already run an FTS5 `optimize` automatically;
+`--vacuum` only reclaims the resulting free pages.)
 
 ## MCP Tools
 

@@ -34,7 +34,7 @@ from markdown_vault_mcp.exceptions import (
     EditConflictError,
     ReadOnlyError,
 )
-from markdown_vault_mcp.fts_index import FTSIndex, _derive_folder
+from markdown_vault_mcp.fts_index import FTSIndex, _derive_folder, should_optimize
 from markdown_vault_mcp.hashing import compute_etag, compute_file_hash
 from markdown_vault_mcp.scanner import (
     ChunkStrategy,
@@ -1222,7 +1222,14 @@ class Collection:
             existing_count = self._fts.count_documents()
             if existing_count:
                 if not self._initialized:
-                    existing_count -= self._purge_stale_excluded()
+                    purged = self._purge_stale_excluded()
+                    existing_count -= purged
+                    if should_optimize(purged, existing_count + purged):
+                        # Bulk purge crossed the optimize threshold — merge
+                        # FTS5 segments so the purged documents' tokens do
+                        # not linger as dead weight (issue #255 follow-up).
+                        with self._write_lock:
+                            self._fts.optimize()
                     self._initialized = True
                     logger.info(
                         "build_index: adopted populated index docs=%d",
@@ -1422,9 +1429,13 @@ class Collection:
 
         # Phase 2: apply mutations (inside lock — prevents races with writes).
         with self._write_lock:
+            # Corpus size before this purge pass, for the optimize threshold.
+            docs_before_purge = self._fts.count_documents()
+
             # Delete removed documents.
+            deleted_purged = 0
             for path in changes.deleted:
-                self._fts.delete_by_path(path)
+                deleted_purged += self._fts.delete_by_path(path)
                 if self._vectors is not None:
                     self._vectors.delete_by_path(path)
 
@@ -1436,6 +1447,12 @@ class Collection:
                     "reindex: purged %d stale excluded document(s)",
                     stale_excluded,
                 )
+
+            # Bulk purge crossed the optimize threshold — merge FTS5
+            # segments so the purged documents' tokens do not linger as
+            # dead weight in the index file (issue #255 follow-up).
+            if should_optimize(deleted_purged + stale_excluded, docs_before_purge):
+                self._fts.optimize()
 
             # Upsert parsed notes.
             indexed_added = 0
@@ -1499,6 +1516,22 @@ class Collection:
             unchanged=changes.unchanged,
             skipped=changes.skipped_unchanged + len(newly_skipped),
         )
+
+    def vacuum(self) -> bool:
+        """Rebuild the index database file to reclaim freed pages.
+
+        Explicit maintenance operation (exposed via the ``reindex --vacuum``
+        CLI flag).  ``VACUUM`` takes an exclusive lock on the SQLite file,
+        which may be shared by multiple server processes, so it is never run
+        automatically; :meth:`FTSIndex.optimize` logs the reclaimable size
+        after bulk purges so operators know when a vacuum is worthwhile.
+
+        Returns:
+            ``True`` when the vacuum ran, ``False`` when it was skipped
+            because the database was busy or locked.
+        """
+        with self._write_lock:
+            return self._fts.vacuum()
 
     def build_embeddings(self, *, force: bool = False) -> int:
         """Build or converge the vector index against the FTS index.

@@ -860,3 +860,66 @@ class TestCmdReindex:
             main()
 
         mock_collection.build_embeddings.assert_called_once_with()
+
+
+class TestCmdReindexVacuum:
+    """Test the reindex --vacuum flag."""
+
+    def test_parser_accepts_vacuum_flag(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(["reindex", "--vacuum"])
+        assert args.vacuum is True
+
+    def test_parser_vacuum_defaults_to_false(self) -> None:
+        parser = _build_parser()
+        args = parser.parse_args(["reindex"])
+        assert args.vacuum is False
+
+    @patch("markdown_vault_mcp.cli._build_collection")
+    def test_reindex_vacuum_calls_collection_vacuum(
+        self,
+        mock_build: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--vacuum runs Collection.vacuum() after the reindex."""
+        mock_collection = MagicMock()
+        mock_collection.vacuum.return_value = True
+        mock_build.return_value = mock_collection
+
+        with patch("sys.argv", ["markdown-vault-mcp", "reindex", "--vacuum"]):
+            main()
+
+        mock_collection.vacuum.assert_called_once_with()
+        captured = capsys.readouterr()
+        assert "compacted" in captured.out
+
+    @patch("markdown_vault_mcp.cli._build_collection")
+    def test_reindex_vacuum_reports_busy_skip(
+        self,
+        mock_build: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """--vacuum reports when the vacuum was skipped (database busy)."""
+        mock_collection = MagicMock()
+        mock_collection.vacuum.return_value = False
+        mock_build.return_value = mock_collection
+
+        with patch("sys.argv", ["markdown-vault-mcp", "reindex", "--vacuum"]):
+            main()
+
+        captured = capsys.readouterr()
+        assert "skipped" in captured.out
+
+    @patch("markdown_vault_mcp.cli._build_collection")
+    def test_reindex_without_vacuum_does_not_vacuum(
+        self,
+        mock_build: MagicMock,
+    ) -> None:
+        """Plain reindex never vacuums."""
+        mock_collection = MagicMock()
+        mock_build.return_value = mock_collection
+
+        with patch("sys.argv", ["markdown-vault-mcp", "reindex"]):
+            main()
+
+        mock_collection.vacuum.assert_not_called()

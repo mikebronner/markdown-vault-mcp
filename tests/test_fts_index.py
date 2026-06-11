@@ -13,7 +13,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from markdown_vault_mcp.fts_index import FTSIndex, _json_default
+from markdown_vault_mcp.fts_index import FTSIndex, _json_default, should_optimize
 from markdown_vault_mcp.types import Chunk, FTSResult, ParsedNote
 
 # ---------------------------------------------------------------------------
@@ -894,3 +894,188 @@ class TestGetRecent:
         """get_recent on empty index returns []."""
         idx = FTSIndex(":memory:")
         assert idx.get_recent() == []
+
+
+class TestShouldOptimize:
+    def test_purge_at_absolute_threshold_triggers(self) -> None:
+        """Purging OPTIMIZE_MIN_PURGED_DOCS documents qualifies."""
+        assert should_optimize(25, 1000) is True
+
+    def test_purge_below_both_thresholds_does_not_trigger(self) -> None:
+        """A small purge of a large corpus does not qualify."""
+        assert should_optimize(24, 1000) is False
+
+    def test_purge_at_fractional_threshold_triggers(self) -> None:
+        """Purging >= 10% of a small corpus qualifies."""
+        assert should_optimize(3, 20) is True  # 15% of corpus.
+
+    def test_purge_below_fractional_threshold_does_not_trigger(self) -> None:
+        """Purging < 10% of a small corpus does not qualify."""
+        assert should_optimize(1, 20) is False  # 5% of corpus.
+
+    def test_zero_purged_never_triggers(self) -> None:
+        """No purge, no optimize."""
+        assert should_optimize(0, 100) is False
+
+    def test_empty_corpus_never_triggers(self) -> None:
+        """Guard against division by zero on an empty corpus."""
+        assert should_optimize(5, 0) is False
+
+
+def _dbstat_fts_data_size(db_path: Path) -> int | None:
+    """Return SUM(pgsize) of the notes_fts_data shadow table via dbstat.
+
+    Returns ``None`` when this SQLite build lacks the dbstat virtual table,
+    so callers can skip size assertions in environments without it.
+    """
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT SUM(pgsize) FROM dbstat WHERE name = 'notes_fts_data'"
+        ).fetchone()
+        return int(row[0] or 0)
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+
+class _FailingConnection:
+    """Stand-in connection whose every execute raises OperationalError.
+
+    ``sqlite3.Connection.execute`` cannot be patched on an instance (the
+    attribute is read-only), so lock-contention tests swap the whole
+    connection for this stub instead.
+    """
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    def __enter__(self) -> _FailingConnection:
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def execute(self, *_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError(self._message)
+
+    def commit(self) -> None:
+        """No-op; vacuum() commits before executing."""
+
+
+class TestOptimize:
+    def test_optimize_runs_and_returns_true(self) -> None:
+        """optimize() executes the FTS5 optimize command and reports success."""
+        idx = FTSIndex(":memory:")
+        idx.build_from_notes([make_note("a.md"), make_note("b.md")])
+        idx.delete_by_path("a.md")
+
+        assert idx.optimize() is True
+
+    def test_optimize_preserves_search_results(self) -> None:
+        """Surviving documents remain searchable after optimize()."""
+        idx = FTSIndex(":memory:")
+        idx.build_from_notes(
+            [
+                make_note(
+                    "keep.md",
+                    chunks=[
+                        Chunk(
+                            heading="K",
+                            heading_level=1,
+                            content="zanzibar survives",
+                            start_line=0,
+                        )
+                    ],
+                ),
+                make_note("drop.md"),
+            ]
+        )
+        idx.delete_by_path("drop.md")
+        idx.optimize()
+
+        results = idx.search("zanzibar")
+        assert [r.path for r in results] == ["keep.md"]
+
+    def test_optimize_shrinks_dead_segments(self, tmp_path: Path) -> None:
+        """After a bulk delete, optimize() shrinks the FTS5 segment b-trees.
+
+        Measured via the dbstat virtual table; the size assertion is skipped
+        when this SQLite build does not provide dbstat.
+        """
+        db_path = tmp_path / "index.db"
+        idx = FTSIndex(db_path)
+        # Index enough distinct-token content for measurable segments.
+        notes = [
+            make_note(
+                f"doc{i}.md",
+                chunks=[
+                    Chunk(
+                        heading=f"Heading {i}",
+                        heading_level=1,
+                        content=" ".join(f"token{i}word{j}" for j in range(200)),
+                        start_line=0,
+                    )
+                ],
+                content_hash=f"hash{i}",
+            )
+            for i in range(40)
+        ]
+        idx.build_from_notes(notes)
+        idx._conn.commit()
+
+        for i in range(40):
+            idx.delete_by_path(f"doc{i}.md")
+        idx._conn.commit()
+        size_before = _dbstat_fts_data_size(db_path)
+
+        assert idx.optimize() is True
+        idx._conn.commit()
+        size_after = _dbstat_fts_data_size(db_path)
+        idx.close()
+
+        if size_before is None or size_after is None:
+            pytest.skip("dbstat virtual table not available in this SQLite build")
+        assert size_after < size_before
+
+    def test_optimize_tolerates_locked_database(self) -> None:
+        """A busy/locked database skips the optimize instead of raising."""
+        idx = FTSIndex(":memory:")
+        idx.build_from_notes([make_note("a.md")])
+
+        idx._conn = _FailingConnection("database is locked")  # type: ignore[assignment]
+        assert idx.optimize() is False
+
+    def test_optimize_propagates_other_operational_errors(self) -> None:
+        """Non-lock OperationalErrors are not swallowed."""
+        idx = FTSIndex(":memory:")
+
+        idx._conn = _FailingConnection("disk I/O error")  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            idx.optimize()
+
+
+class TestVacuum:
+    def test_vacuum_runs_and_returns_true(self, tmp_path: Path) -> None:
+        """vacuum() compacts a file-backed index and reports success."""
+        idx = FTSIndex(tmp_path / "index.db")
+        idx.build_from_notes([make_note("a.md")])
+        idx.delete_by_path("a.md")
+
+        assert idx.vacuum() is True
+
+    def test_vacuum_tolerates_locked_database(self) -> None:
+        """A busy/locked database skips the vacuum instead of raising."""
+        idx = FTSIndex(":memory:")
+
+        idx._conn = _FailingConnection("database is busy")  # type: ignore[assignment]
+        assert idx.vacuum() is False
+
+    def test_vacuum_propagates_other_operational_errors(self) -> None:
+        """Non-lock OperationalErrors are not swallowed."""
+        idx = FTSIndex(":memory:")
+
+        idx._conn = _FailingConnection("disk I/O error")  # type: ignore[assignment]
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            idx.vacuum()
