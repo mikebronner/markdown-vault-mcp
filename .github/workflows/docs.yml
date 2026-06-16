@@ -55,6 +55,17 @@ jobs:
       - name: Build documentation
         run: uv run mkdocs build --strict
 
+      - name: Install browser test deps
+        # --all-extras so the shared tests/conftest.py imports (numpy, etc.)
+        # resolve; the smoke test loads the package conftest like any pytest run.
+        run: uv sync --no-default-groups --all-extras --group docs --group browser --frozen
+
+      - name: Install Chromium
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run config-wizard smoke test
+        run: uv run pytest tests/test_config_wizard_smoke.py -v -m browser
+
       - name: Upload artifact
         if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
         uses: actions/upload-pages-artifact@v5
