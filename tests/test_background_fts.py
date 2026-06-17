@@ -49,10 +49,9 @@ def test_is_queryable_true_after_synchronous_build(tmp_path: Path) -> None:
 
 def test_is_queryable_false_after_captured_background_error(tmp_path: Path) -> None:
     """Direct state poke: simulate a finished-but-failed background by setting
-    the error and the event, leaving _index_built False."""
+    the error and the event, leaving built False."""
     col = Vault(source_dir=_vault(tmp_path))
-    col._coordinator._readiness._error = RuntimeError("simulated")
-    col._coordinator._readiness._done.set()
+    col._coordinator._readiness.fail_build(RuntimeError("simulated"))
     assert col.index.is_queryable() is False
     col.close()
 
@@ -65,7 +64,7 @@ def test_is_queryable_true_with_captured_error_when_built(tmp_path: Path) -> Non
     _seed(vault)
     col = Vault(source_dir=vault)
     col.index.build_index()
-    col._coordinator._readiness._error = RuntimeError("subsequent rebuild blew up")
+    col._coordinator._readiness.record_error(RuntimeError("subsequent rebuild blew up"))
     assert col.index.is_queryable() is True
     col.close()
 
@@ -81,13 +80,11 @@ def test_wait_until_queryable_returns_when_already_built(tmp_path: Path) -> None
 
 def test_wait_until_queryable_blocks_until_event_set(tmp_path: Path) -> None:
     col = Vault(source_dir=_vault(tmp_path))
-    col._coordinator._readiness._done.clear()
-    col._coordinator._readiness._index_built = False
+    col._coordinator._readiness.begin_async_build()
 
     def setter() -> None:
         time.sleep(0.05)
-        col._coordinator._readiness._index_built = True
-        col._coordinator._readiness._done.set()
+        col._coordinator._readiness.mark_built()
 
     threading.Thread(target=setter).start()
     col.index.wait_until_queryable(timeout=1.0)  # returns when event fires
@@ -96,8 +93,7 @@ def test_wait_until_queryable_blocks_until_event_set(tmp_path: Path) -> None:
 
 def test_wait_until_queryable_raises_on_timeout(tmp_path: Path) -> None:
     col = Vault(source_dir=_vault(tmp_path))
-    col._coordinator._readiness._done.clear()
-    col._coordinator._readiness._index_built = False
+    col._coordinator._readiness.begin_async_build()
     with pytest.raises(IndexUnavailableError) as excinfo:
         col.index.wait_until_queryable(timeout=0.05)
     assert excinfo.value.reason == "timeout"
@@ -107,12 +103,12 @@ def test_wait_until_queryable_raises_on_timeout(tmp_path: Path) -> None:
 def test_wait_until_queryable_raises_unavailable_when_error_set_and_not_built(
     tmp_path: Path,
 ) -> None:
-    """Captured error + event set + _index_built=False (default) → raises
+    """Captured error + event set + built=False (default) → raises
     IndexUnavailableError(reason="build_failed") — a build ran and failed,
     distinct from a never-scheduled build (#586). The captured error is not a
     separate exception class; callers read get_index_status() for the diagnostic."""
     col = Vault(source_dir=_vault(tmp_path))
-    col._coordinator._readiness._error = RuntimeError("scan exploded")
+    col._coordinator._readiness.fail_build(RuntimeError("scan exploded"))
     with pytest.raises(IndexUnavailableError) as excinfo:
         col.index.wait_until_queryable(timeout=0.1)
     assert excinfo.value.reason == "build_failed"
@@ -120,11 +116,11 @@ def test_wait_until_queryable_raises_unavailable_when_error_set_and_not_built(
 
 
 def test_wait_until_queryable_raises_when_never_scheduled(tmp_path: Path) -> None:
-    """Pre-set event + no error + _index_built=False + _background_started=False.
+    """Pre-set event + no error + built=False + _background_started=False.
     This is the case the spec calls 'never scheduled' — the pre-set event would
     let wait() return success without the explicit guard."""
     col = Vault(source_dir=_vault(tmp_path))
-    # All defaults: event pre-set, no error, _index_built=False, no spawn.
+    # All defaults: event pre-set, no error, built=False, no spawn.
     with pytest.raises(IndexUnavailableError) as excinfo:
         col.index.wait_until_queryable(timeout=0.1)
     assert excinfo.value.reason == "never_built"
@@ -140,7 +136,7 @@ def test_wait_until_queryable_returns_when_built_with_captured_error(
     _seed(vault)
     col = Vault(source_dir=vault)
     col.index.build_index()
-    col._coordinator._readiness._error = RuntimeError("subsequent rebuild blew up")
+    col._coordinator._readiness.record_error(RuntimeError("subsequent rebuild blew up"))
     col.index.wait_until_queryable(timeout=0.1)  # must not raise
     col.close()
 
@@ -206,10 +202,10 @@ def test_start_background_build_index_one_shot_after_thread_start_failure(
 
     # Event must be set; error recorded.
     assert col._coordinator._readiness._done.is_set()
-    assert isinstance(col._coordinator._readiness._error, RuntimeError)
+    assert isinstance(col._coordinator._readiness.error, RuntimeError)
 
     # wait_until_queryable surfaces this as build_failed (a build was scheduled
-    # and failed): event set + _index_built=False + error captured (#586).
+    # and failed): event set + built=False + error captured (#586).
     # The captured error is diagnostic only, readable via get_index_status().
     with pytest.raises(IndexUnavailableError) as excinfo:
         col.index.wait_until_queryable(timeout=0.1)
@@ -276,8 +272,8 @@ def test_get_index_status_queryable_when_built_with_captured_error(
     vault = _vault(tmp_path)
     _seed(vault)
     col = Vault(source_dir=vault)
-    col.index.build_index()  # _index_built True, error cleared
-    col._coordinator._readiness._error = RuntimeError("subsequent rebuild blew up")
+    col.index.build_index()  # built True, error cleared
+    col._coordinator._readiness.record_error(RuntimeError("subsequent rebuild blew up"))
     status = col.index.get_index_status()
     assert status["status"] == "queryable"
     assert status["documents_indexed"] == 1
@@ -298,7 +294,7 @@ def test_get_index_status_building_in_flight(tmp_path: Path) -> None:
 
 
 def test_get_index_status_building_never_started(tmp_path: Path) -> None:
-    """Fresh Vault: event pre-set, no error, _index_built=False.
+    """Fresh Vault: event pre-set, no error, built=False.
     Reports 'building' (not 'ready' — the attempt-6 lie is fixed)."""
     col = Vault(source_dir=_vault(tmp_path))
     status = col.index.get_index_status()
@@ -311,7 +307,7 @@ def test_get_index_status_failed_when_not_queryable_with_captured_error(
     tmp_path: Path,
 ) -> None:
     col = Vault(source_dir=_vault(tmp_path))
-    col._coordinator._readiness._error = RuntimeError("scan failed for X")
+    col._coordinator._readiness.fail_build(RuntimeError("scan failed for X"))
     status = col.index.get_index_status()
     assert status["status"] == "failed"
     assert status["error"] is not None
@@ -914,8 +910,8 @@ def test_synchronous_build_index_clears_prior_background_error(
     tmp_path: Path,
 ) -> None:
     """Recovery path: after a failed background build, calling build_index()
-    synchronously sets _index_built=True so is_queryable() returns True and
-    bucket-3/4 calls succeed. Also clears _background_build_error so the
+    synchronously sets built=True so is_queryable() returns True and
+    bucket-3/4 calls succeed. Also clears the captured error so the
     diagnostic field in get_index_status reflects the new successful
     attempt."""
     vault = _vault(tmp_path)
@@ -923,19 +919,18 @@ def test_synchronous_build_index_clears_prior_background_error(
     col = Vault(source_dir=vault, index_path=tmp_path / "fts.db")
 
     # Simulate a prior failed background: error captured, event set,
-    # _index_built still False.
-    col._coordinator._readiness._error = RuntimeError(
-        "simulated prior background failure"
+    # built still False.
+    col._coordinator._readiness.fail_build(
+        RuntimeError("simulated prior background failure")
     )
-    col._coordinator._readiness._done.set()
     col._coordinator._background_started = True
     assert col.index.is_queryable() is False
 
     # Synchronous recovery build.
     col.index.build_index()
 
-    # Now ready: error cleared, _index_built True, event still set.
-    assert col._coordinator._readiness._error is None
+    # Now ready: error cleared, built True, event still set.
+    assert col._coordinator._readiness.error is None
     assert col.index.is_queryable() is True
     # Bucket-3 call no longer surfaces the prior error.
     col.graph.get_backlinks("n.md")  # must not raise
@@ -997,10 +992,10 @@ def test_build_index_async_submit_failure_unblocks_waiters(tmp_path: Path) -> No
         # quickly with IndexUnavailableError rather than blocking.
         with pytest.raises(IndexUnavailableError) as excinfo:
             col.index.wait_until_queryable(timeout=2.0)
-        # build_failed is the expected reason: event set, _index_built
+        # build_failed is the expected reason: event set, built
         # False, and the submit error captured (#586).
         assert excinfo.value.reason == "build_failed"
-        assert isinstance(col._coordinator._readiness._error, RuntimeError)
+        assert isinstance(col._coordinator._readiness.error, RuntimeError)
     finally:
         col.close()
 
@@ -1009,7 +1004,7 @@ def test_synchronous_build_index_warm_path_clears_prior_background_error(
     tmp_path: Path,
 ) -> None:
     """Recovery path via the warm-restart short-circuit: a prior background
-    failure left _background_build_error populated; the sentinel from a
+    failure left the captured error populated; the sentinel from a
     prior successful build is still present; calling build_index()
     synchronously must clear the captured error and is_queryable() must
     return True."""
@@ -1025,17 +1020,16 @@ def test_synchronous_build_index_warm_path_clears_prior_background_error(
     # Phase 2: fresh Vault sees the warm sentinel; simulate a prior
     # background failure.
     col = Vault(source_dir=vault, index_path=index_path)
-    col._coordinator._readiness._error = RuntimeError(
-        "simulated prior background failure"
+    col._coordinator._readiness.fail_build(
+        RuntimeError("simulated prior background failure")
     )
-    col._coordinator._readiness._done.set()
     col._coordinator._background_started = True
     assert col.index.is_queryable() is False
 
     # Warm-restart short-circuit recovery.
     col.index.build_index()
 
-    assert col._coordinator._readiness._error is None
+    assert col._coordinator._readiness.error is None
     assert col.index.is_queryable() is True
     col.close()
 
