@@ -6,10 +6,14 @@ verifying end-to-end behaviour through the full Vault stack.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import socket
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import patch
 
 import pytest
 from fastmcp import Client
@@ -1071,6 +1075,57 @@ class TestFetchTool:
         mock_client.__aexit__ = AsyncMock(return_value=False)
         return mock_client
 
+    # getaddrinfo sockaddr is a 2-tuple (host, port) for AF_INET and a 4-tuple
+    # (host, port, flowinfo, scope_id) for AF_INET6; the resolver only reads
+    # ``info[4][0]`` but the fake emits the real shapes so the annotation holds.
+    _Sockaddr = tuple[str, int] | tuple[str, int, int, int]
+
+    @staticmethod
+    def _getaddrinfo_returning(
+        *ips: str,
+    ) -> Callable[..., list[tuple[int, int, int, str, TestFetchTool._Sockaddr]]]:
+        """Build a fake ``getaddrinfo`` that resolves to *ips*."""
+
+        def fake(
+            _host: str, port: int, *_args: object, **_kwargs: object
+        ) -> list[tuple[int, int, int, str, TestFetchTool._Sockaddr]]:
+            out: list[tuple[int, int, int, str, TestFetchTool._Sockaddr]] = []
+            for ip in ips:
+                sockaddr: TestFetchTool._Sockaddr
+                if ":" in ip:
+                    family = socket.AF_INET6
+                    sockaddr = (ip, port or 0, 0, 0)
+                else:
+                    family = socket.AF_INET
+                    sockaddr = (ip, port or 0)
+                out.append((family, socket.SOCK_STREAM, 6, "", sockaddr))
+            return out
+
+        return fake
+
+    def _patch_resolves_to(self, monkeypatch: pytest.MonkeyPatch, *ips: str) -> None:
+        """Patch the running loop's ``getaddrinfo`` to resolve to *ips*.
+
+        Targets ``loop.getaddrinfo`` — what the resolver actually calls — rather
+        than ``socket.getaddrinfo``, so the stub holds under any event-loop
+        implementation (e.g. uvloop), not only CPython's selector loop where
+        ``loop.getaddrinfo`` happens to delegate to ``socket.getaddrinfo``.
+        """
+        fake = self._getaddrinfo_returning(*ips)
+
+        async def _aio_getaddrinfo(
+            host: str, port: int, *_args: object, **_kwargs: object
+        ) -> list[tuple[int, int, int, str, TestFetchTool._Sockaddr]]:
+            return fake(host, port)
+
+        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _aio_getaddrinfo)
+
+    @pytest.fixture(autouse=True)
+    async def _stub_public_dns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Resolve any hostname to a fixed public IP so success-path fetch tests
+        never hit real DNS. SSRF tests override this with a private resolution."""
+        self._patch_resolves_to(monkeypatch, "93.184.216.34")
+
     async def test_fetch_markdown_note(
         self, _mcp_env_writable_with_attachments: Path
     ) -> None:
@@ -1348,6 +1403,144 @@ class TestFetchTool:
                     "fetch",
                     {"url": "http://0.0.0.0/admin", "path": "stolen.md"},
                 )
+
+    async def test_fetch_rejects_resolve_to_private(
+        self,
+        _mcp_env_writable_with_attachments: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A public hostname resolving to a private IP is blocked (DNS rebinding)."""
+        import httpx
+
+        self._patch_resolves_to(monkeypatch, "10.0.0.5")
+        mock_client = self._mock_httpx_stream(b"x", {})
+        with patch.object(httpx, "AsyncClient", return_value=mock_client):
+            server = make_server()
+            async with Client(server) as client:
+                with pytest.raises(ToolError, match="non-public"):
+                    await client.call_tool(
+                        "fetch",
+                        {"url": "https://evil.example.com/x", "path": "x.md"},
+                    )
+        mock_client.stream.assert_not_called()
+
+    async def test_fetch_rejects_mixed_public_and_private(
+        self,
+        _mcp_env_writable_with_attachments: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If ANY resolved address is private, the fetch is blocked."""
+        import httpx
+
+        self._patch_resolves_to(monkeypatch, "93.184.216.34", "192.168.1.10")
+        mock_client = self._mock_httpx_stream(b"x", {})
+        with patch.object(httpx, "AsyncClient", return_value=mock_client):
+            server = make_server()
+            async with Client(server) as client:
+                with pytest.raises(ToolError, match="non-public"):
+                    await client.call_tool(
+                        "fetch",
+                        {"url": "https://evil.example.com/x", "path": "x.md"},
+                    )
+        mock_client.stream.assert_not_called()
+
+    async def test_fetch_rejects_resolve_to_ipv6_loopback(
+        self,
+        _mcp_env_writable_with_attachments: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An IPv6 loopback resolution is blocked."""
+        self._patch_resolves_to(monkeypatch, "::1")
+        server = make_server()
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="non-public"):
+                await client.call_tool(
+                    "fetch",
+                    {"url": "https://evil.example.com/x", "path": "x.md"},
+                )
+
+    async def test_fetch_fails_closed_on_resolution_error(
+        self,
+        _mcp_env_writable_with_attachments: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A DNS resolution error blocks the fetch (fail-closed, not fail-open)."""
+
+        async def boom(
+            _host: str, _port: int, *_args: object, **_kwargs: object
+        ) -> object:
+            raise socket.gaierror("name resolution failed")
+
+        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", boom)
+        server = make_server()
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="resolve"):
+                await client.call_tool(
+                    "fetch",
+                    {"url": "https://unresolvable.example/x", "path": "x.md"},
+                )
+
+    async def test_fetch_fails_closed_on_empty_resolution(
+        self,
+        _mcp_env_writable_with_attachments: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A host that resolves to zero addresses blocks the fetch (fail-closed)."""
+        self._patch_resolves_to(monkeypatch)  # resolves to nothing
+        server = make_server()
+        async with Client(server) as client:
+            with pytest.raises(ToolError, match="did not resolve"):
+                await client.call_tool(
+                    "fetch",
+                    {"url": "https://empty.example/x", "path": "x.md"},
+                )
+
+    async def test_fetch_pins_validated_ip_with_host_and_sni(
+        self,
+        _mcp_env_writable_with_attachments: Path,
+    ) -> None:
+        """A public host is dialled by IP, with the original Host header + SNI."""
+        import httpx
+
+        # _stub_public_dns resolves any host to 93.184.216.34.
+        mock_client = self._mock_httpx_stream(
+            b"# Ok\n", {"content-type": "text/markdown"}
+        )
+        with patch.object(httpx, "AsyncClient", return_value=mock_client):
+            server = make_server()
+            async with Client(server) as client:
+                await client.call_tool(
+                    "fetch",
+                    {"url": "https://example.com/note.md", "path": "pinned.md"},
+                )
+        mock_client.stream.assert_called_once()
+        call = mock_client.stream.call_args
+        assert call.args[0] == "GET"
+        assert call.args[1] == "https://93.184.216.34/note.md"
+        assert call.kwargs["headers"]["Host"] == "example.com"
+        assert call.kwargs["extensions"]["sni_hostname"] == "example.com"
+
+    async def test_fetch_host_header_port_handling(
+        self, _mcp_env_writable_with_attachments: Path
+    ) -> None:
+        """The Host header omits an explicit default port (RFC 7230 §5.4) but
+        keeps a non-default one."""
+        import httpx
+
+        for url, expected_host in (
+            ("https://example.com:443/n.md", "example.com"),  # default → omitted
+            ("https://example.com:8443/n.md", "example.com:8443"),  # kept
+        ):
+            mock_client = self._mock_httpx_stream(
+                b"# Ok\n", {"content-type": "text/markdown"}
+            )
+            with patch.object(httpx, "AsyncClient", return_value=mock_client):
+                server = make_server()
+                async with Client(server) as client:
+                    await client.call_tool("fetch", {"url": url, "path": "p.md"})
+            assert (
+                mock_client.stream.call_args.kwargs["headers"]["Host"] == expected_host
+            )
 
     async def test_fetch_unicode_decode_error(
         self, _mcp_env_writable_with_attachments: Path
