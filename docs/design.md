@@ -1025,6 +1025,10 @@ Key methods:
   embeddings have been computed outside a lock section (see Thread Safety).
 - `delete_by_path(path)` — removes all rows for a document.
 - `save(path)` / `load(path, provider)` — persist/restore sidecar files.
+  `save()` writes each sidecar (`.npy`, `.json`) to a temp file in the same
+  directory and atomically `replace()`s the final path (mirrors
+  `tracker._save_state`), so an interrupted write can never corrupt a
+  previously persisted index.
 
 ### `providers.py` -- Embedding Providers
 
