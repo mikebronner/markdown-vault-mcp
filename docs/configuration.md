@@ -1,14 +1,21 @@
 # Configuration
 
+Markdown Vault MCP is configured via environment variables with the
+`MARKDOWN_VAULT_MCP_` prefix.
+
+See `fastmcp-pvl-core`'s README for the full list of universal
+variables (`MARKDOWN_VAULT_MCP_TRANSPORT`, `MARKDOWN_VAULT_MCP_HOST`,
+`MARKDOWN_VAULT_MCP_PORT`, `MARKDOWN_VAULT_MCP_HTTP_PATH`,
+`MARKDOWN_VAULT_MCP_BASE_URL`, auth vars, etc.).
+
 !!! tip "Prefer a guided setup?"
     Use the [Configuration Generator](configuration-generator.md) to answer a few
     questions and copy a ready-made `.env`, Docker, or Claude config.
 
-All configuration is via environment variables. Most use the `MARKDOWN_VAULT_MCP_` prefix. `OLLAMA_HOST` and `OPENAI_API_KEY` are bare ecosystem-standard names; all other variables use the `MARKDOWN_VAULT_MCP_` prefix.
-
 !!! note "Configuration is validated at startup"
     Numeric variables are validated against the **Type** column below (such as `int ≥ 1`). A non-numeric or out-of-range value makes the server **fail fast** at startup with a `ConfigurationError` naming the offending setting, rather than silently falling back to a default. A typo in an env var surfaces immediately instead of producing surprising behavior later.
 
+<!-- DOMAIN-CONFIG-VARS-START -->
 ## Core
 
 | Variable | Type | Default | Required | Description |
@@ -52,7 +59,6 @@ timeout the tool answers from the current index rather than raising
 jobs take longer; decrease for faster client feedback when the index has
 chronic backlog.
 
-<!-- DOMAIN-CONFIG-VARS-START -->
 ## Server Identity
 
 | Variable | Type | Default | Description |

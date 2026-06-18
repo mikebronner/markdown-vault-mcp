@@ -42,6 +42,11 @@ exclude_docs: |
 hooks:
   - docs/hooks.py
 
+extra:
+  version:
+    provider: mike
+    default: latest
+
 plugins:
   - search
   # Generates llms.txt + llms-full.txt for the README badge.
@@ -127,11 +132,6 @@ markdown_extensions:
       permalink: true
   - attr_list
   - md_in_html
-
-extra:
-  version:
-    provider: mike
-    default: latest
 
 extra_javascript:
   - path: javascripts/config-wizard/wizard.js
