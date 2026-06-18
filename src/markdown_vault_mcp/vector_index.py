@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from markdown_vault_mcp.providers import EmbeddingProvider
 
 try:
@@ -415,12 +416,11 @@ class VectorIndex:
         npy_path = path.with_suffix(".npy")
         json_path = path.with_suffix(".json")
 
-        if self._embeddings.size == 0:
-            # Save a zero-shape array so load() can always read it back.
-            empty = np.empty((0, 0), dtype=np.float32)
-            np.save(str(npy_path), empty)
-        else:
-            np.save(str(npy_path), self._embeddings)
+        array_to_save = (
+            np.empty((0, 0), dtype=np.float32)
+            if self._embeddings.size == 0
+            else self._embeddings
+        )
 
         payload = {
             "rows": self._metadata,
@@ -433,8 +433,29 @@ class VectorIndex:
             },
         }
 
-        with json_path.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
+        # Write each sidecar to a temp file in the same directory, then
+        # atomically replace the final file. A mid-write interruption can
+        # then never corrupt a previously persisted index (mirrors
+        # tracker._save_state). np.save appends ".npy" unless the path
+        # already ends in it, so the temp file uses a ".npy" suffix and we
+        # write through the open fd to avoid any suffix ambiguity.
+        npy_fd, npy_tmp = tempfile.mkstemp(dir=npy_path.parent, suffix=".npy")
+        try:
+            with os.fdopen(npy_fd, "wb") as fh:
+                np.save(fh, array_to_save)
+            Path(npy_tmp).replace(npy_path)
+        except BaseException:
+            Path(npy_tmp).unlink(missing_ok=True)
+            raise
+
+        json_fd, json_tmp = tempfile.mkstemp(dir=json_path.parent, suffix=".tmp")
+        try:
+            with os.fdopen(json_fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            Path(json_tmp).replace(json_path)
+        except BaseException:
+            Path(json_tmp).unlink(missing_ok=True)
+            raise
 
         logger.info(
             "VectorIndex.save: saved %d vectors to %s",

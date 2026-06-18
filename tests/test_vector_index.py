@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 
 from markdown_vault_mcp.vector_index import VectorIndex, VectorIndexCompatibilityError
@@ -482,6 +483,103 @@ class TestVectorIndexPersistence:
 
         with pytest.raises(VectorIndexCompatibilityError, match="mismatch"):
             VectorIndex.load(base, mock_provider)
+
+    def test_failed_save_preserves_prior_files_json(
+        self,
+        mock_provider: MockEmbeddingProvider,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A json.dump failure during save leaves the prior sidecars intact and loadable."""
+        index = VectorIndex(mock_provider)
+        index.add(["north star"], [_make_meta("stars.md", heading="North")])
+        base = tmp_path / "embeddings"
+        index.save(base)
+
+        npy_path = tmp_path / "embeddings.npy"
+        json_path = tmp_path / "embeddings.json"
+        original_npy = npy_path.read_bytes()
+        original_json = json_path.read_bytes()
+
+        # Re-saving the same index, but json.dump raises before the .json temp
+        # is committed. The .json sidecar's atomic replace must never fire, and
+        # the .npy replace (which writes byte-identical content for an unchanged
+        # array) must leave the prior file intact.
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(json, "dump", boom)
+        with pytest.raises(OSError, match="disk full"):
+            index.save(base)
+        monkeypatch.undo()
+
+        # Prior sidecars are byte-for-byte intact.
+        assert npy_path.read_bytes() == original_npy
+        assert json_path.read_bytes() == original_json
+
+        # And the preserved index still loads cleanly.
+        loaded = VectorIndex.load(base, mock_provider)
+        assert loaded.count == 1
+
+    def test_failed_save_preserves_prior_files_npy(
+        self,
+        mock_provider: MockEmbeddingProvider,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An np.save failure during save leaves the prior sidecars intact and loadable."""
+        index = VectorIndex(mock_provider)
+        index.add(["north star"], [_make_meta("stars.md", heading="North")])
+        base = tmp_path / "embeddings"
+        index.save(base)
+
+        npy_path = tmp_path / "embeddings.npy"
+        json_path = tmp_path / "embeddings.json"
+        original_npy = npy_path.read_bytes()
+        original_json = json_path.read_bytes()
+
+        # np.save is the first write in save(); it raises before either atomic
+        # replace can fire, so both prior sidecars must be untouched.
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(np, "save", boom)
+        with pytest.raises(OSError, match="disk full"):
+            index.save(base)
+        monkeypatch.undo()
+
+        # Prior sidecars are byte-for-byte intact.
+        assert npy_path.read_bytes() == original_npy
+        assert json_path.read_bytes() == original_json
+
+        # And the preserved index still loads cleanly.
+        loaded = VectorIndex.load(base, mock_provider)
+        assert loaded.count == 1
+
+    def test_failed_save_leaves_no_temp_files(
+        self,
+        mock_provider: MockEmbeddingProvider,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed save cleans up its temp files, leaving only the originals."""
+        index = VectorIndex(mock_provider)
+        index.add(["north star"], [_make_meta("stars.md", heading="North")])
+        base = tmp_path / "embeddings"
+        index.save(base)
+
+        def boom(*_args: object, **_kwargs: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(json, "dump", boom)
+        with pytest.raises(OSError, match="disk full"):
+            index.save(base)
+        monkeypatch.undo()
+
+        # Only the two original sidecars remain — no .tmp scratch and no stray
+        # temp .npy left behind by the aborted write.
+        remaining = sorted(p.name for p in tmp_path.iterdir())
+        assert remaining == ["embeddings.json", "embeddings.npy"]
 
 
 class TestSearchByPath:
