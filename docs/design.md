@@ -434,14 +434,26 @@ purge pass removes ≥ 25 documents or ≥ 10% of the pre-purge corpus
 `IndexManager.build_index()` and `IndexManager.reindex()` run
 `FTSIndex.optimize()` (`INSERT INTO notes_fts(notes_fts)
 VALUES('optimize')`), which merges all segments and drops the dead entries.
-The merge frees pages inside the file; the file itself only shrinks after a
-`VACUUM`, which is never run automatically because it takes an exclusive lock
-and multiple server processes may share one index file. `optimize()` logs
-the reclaimable size (freelist × page size) at INFO so operators can decide
-whether a manual `VACUUM` is worthwhile. Both call sites run on the
-single-owner IndexWriter thread, like all other index mutations; lock
-contention beyond the retry budget is tolerated (skip with a warning; the
-next bulk purge retries).
+The merge frees pages inside the file; `optimize()` then returns those pages to
+the filesystem with `PRAGMA incremental_vacuum`, logging the reclaimable size
+(freelist × page size) at INFO before and the freed size after.
+
+Incremental vacuum works because indexes are created with `auto_vacuum =
+INCREMENTAL` — the pragma is applied in `_init_schema()` *before* the schema DDL
+and before `PRAGMA journal_mode = WAL` (the pragma only takes effect on an empty
+database, and enabling WAL writes the first page). Crucially, the pragma is
+issued via `executescript` rather than `execute`: Python's `sqlite3` steps a
+`PRAGMA incremental_vacuum` statement only once via `execute` (freeing a single
+page per call), whereas `executescript` drives it to completion and reclaims the
+whole freelist in one pass. Incremental vacuum needs only a normal write lock,
+so unlike a full `VACUUM` it does not stall the other server processes that may
+share one index file. Indexes created before this shipped (`auto_vacuum = NONE`)
+are converted in place on the next open via a one-time `VACUUM`; that conversion
+needs an exclusive lock, so under contention it is skipped and retried on a later
+boot. Both `optimize()` call sites run on the single-owner IndexWriter thread,
+like all other index mutations; lock contention during the optimize, the
+incremental vacuum, and the migration is tolerated throughout (skip with a
+warning; the next bulk purge or boot retries).
 
 **Readiness contract (issue #525)**: `Vault.__init__` does not
 populate the index. Callers must invoke `build_index()` explicitly
