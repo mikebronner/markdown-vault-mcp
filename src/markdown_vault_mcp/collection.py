@@ -1523,8 +1523,10 @@ class Collection:
         Explicit maintenance operation (exposed via the ``reindex --vacuum``
         CLI flag).  ``VACUUM`` takes an exclusive lock on the SQLite file,
         which may be shared by multiple server processes, so it is never run
-        automatically; :meth:`FTSIndex.optimize` logs the reclaimable size
-        after bulk purges so operators know when a vacuum is worthwhile.
+        automatically.  Routine reclamation is handled by
+        :meth:`FTSIndex.optimize`, which runs an incremental vacuum after each
+        bulk purge to return freed pages to the filesystem under a normal write
+        lock; a full ``VACUUM`` is only needed for deeper compaction.
 
         Returns:
             ``True`` when the vacuum ran, ``False`` when it was skipped

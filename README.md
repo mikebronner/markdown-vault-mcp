@@ -289,11 +289,17 @@ Incrementally reindex the vault (only processes changed files).
 markdown-vault-mcp reindex [--source-dir PATH] [--index-path PATH] [--vacuum]
 ```
 
-`--vacuum` compacts the SQLite index file after reindexing, returning pages
-freed by deleted documents to the filesystem. It takes an exclusive lock on
-the index file — do not use it while a server process shares the same
-`--index-path`. (Bulk purges already run an FTS5 `optimize` automatically;
-`--vacuum` only reclaims the resulting free pages.)
+`--vacuum` runs a full `VACUUM` on the SQLite index file after reindexing,
+rebuilding it for maximum compaction. It takes an exclusive lock on the index
+file — do not use it while a server process shares the same `--index-path`.
+
+In normal operation you should not need `--vacuum`: indexes use
+`auto_vacuum = INCREMENTAL`, and the FTS5 `optimize` that runs after a bulk
+purge follows up with an incremental vacuum that returns freed pages to the
+filesystem under a normal write lock (no exclusive-lock stall). Indexes created
+before this behaviour shipped are converted to incremental auto-vacuum
+automatically on the next server start. `--vacuum` remains available for deeper
+defragmentation beyond what incremental vacuum reclaims.
 
 ## MCP Tools
 

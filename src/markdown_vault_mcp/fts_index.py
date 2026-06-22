@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 # pass that removes many documents (e.g. newly-configured exclude patterns
 # expelling previously indexed files at boot, issue #255) can therefore leave
 # hundreds of megabytes of dead segments that bloat the database file and
-# slow keyword queries.  'optimize' merges everything into one clean segment.
+# slow keyword queries.  'optimize' merges everything into one clean segment;
+# the freed pages are then returned to the filesystem by the incremental vacuum
+# that 'optimize' runs afterwards (see FTSIndex.optimize).
 # An optimize pass is cheap relative to the bloat it removes, so the
 # thresholds err toward running it: a purge of at least
 # ``OPTIMIZE_MIN_PURGED_DOCS`` documents, or at least
@@ -173,6 +175,65 @@ def _derive_folder(path: str) -> str:
     return "" if folder == "." else folder
 
 
+def _apply_auto_vacuum(conn: sqlite3.Connection, db_path: Path | str) -> None:
+    """Ensure the database uses ``auto_vacuum = INCREMENTAL``.
+
+    Incremental auto-vacuum lets :meth:`FTSIndex.optimize` return freed pages to
+    the filesystem with only a normal write lock (via ``PRAGMA
+    incremental_vacuum``), avoiding the exclusive-lock stall of a full
+    ``VACUUM`` — important because several server processes may share one index
+    file.
+
+    The pragma behaves in two distinct ways depending on the database state, and
+    this helper handles both:
+
+    * **Fresh database** (no schema yet): ``PRAGMA auto_vacuum`` takes effect
+      only when set *before the first table is created*, so this must run before
+      the schema DDL and before ``PRAGMA journal_mode = WAL`` (enabling WAL
+      writes the first page, after which the mode can no longer change).
+    * **Existing database** already created with ``auto_vacuum = NONE``: the mode
+      cannot be changed by the pragma alone — it requires a one-time ``VACUUM``
+      to rewrite the file in the new layout. That ``VACUUM`` needs an exclusive
+      lock, so under contention from another process it is skipped and simply
+      retried on a later boot.
+
+    In-memory databases do not support ``auto_vacuum``; the caller skips them.
+
+    Args:
+        conn: Open connection with no schema applied yet (fresh path) or a
+            populated schema (migration path).
+        db_path: Database path, used only for logging.
+    """
+    current = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+    if current == 1:  # 1 == FULL, 2 == INCREMENTAL, 0 == NONE.
+        # FULL auto-vacuum already reclaims pages on every commit; leave it.
+        return
+    if current == 2:
+        return  # Already INCREMENTAL — nothing to do.
+
+    # auto_vacuum is NONE.  Set the target mode; this alone suffices on a fresh
+    # database but is a no-op on a populated one until a VACUUM rewrites it.
+    conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    conn.commit()
+    if conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2:
+        return  # Fresh database — mode applied without a rewrite.
+
+    # Populated legacy database: convert in place with a one-time VACUUM.  This
+    # needs an exclusive lock, so tolerate contention and retry on a later boot.
+    try:
+        conn.execute("VACUUM")
+    except sqlite3.OperationalError as exc:
+        msg = str(exc).lower()
+        if "busy" in msg or "locked" in msg:
+            logger.warning(
+                "fts_auto_vacuum_migration_skipped reason=%s (will retry on next open)",
+                exc,
+            )
+            return
+        raise
+    logger.info("fts_auto_vacuum_migrated db_path=%s mode=INCREMENTAL", db_path)
+
+
 def _open_connection(db_path: Path | str) -> sqlite3.Connection:
     """Open an SQLite connection with required pragmas and schema applied.
 
@@ -185,6 +246,14 @@ def _open_connection(db_path: Path | str) -> sqlite3.Connection:
     """
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Set auto_vacuum = INCREMENTAL *before* any table is created and before WAL
+    # is enabled — the pragma only takes effect on an empty database, and
+    # enabling WAL writes the first page.  In-memory databases do not support
+    # auto_vacuum, so skip them.  For an existing database created with
+    # auto_vacuum = NONE this is a no-op here; it is migrated below after the
+    # schema is present (a VACUUM is required to convert a populated file).
+    if str(db_path) != ":memory:":
+        _apply_auto_vacuum(conn, db_path)
     # Apply schema; executescript commits implicitly.
     conn.executescript(_SCHEMA_SQL)
     # Migrate existing databases: add columns introduced after initial schema.
@@ -1319,10 +1388,13 @@ class FTSIndex:
         rows.  Call this after a bulk purge (see :func:`should_optimize`) so
         dead segments do not accumulate in the database file.
 
-        The merge frees pages *inside* the database file; the file itself
-        only shrinks after a ``VACUUM`` (see :meth:`vacuum`).  The number of
-        reclaimable bytes is logged at INFO so operators can decide whether
-        a vacuum is worthwhile.
+        The merge frees pages *inside* the database file.  When the database
+        uses ``auto_vacuum = INCREMENTAL`` (the default for indexes created or
+        migrated by :func:`_open_connection`), this method follows the merge
+        with :meth:`_incremental_vacuum`, returning those freed pages to the
+        filesystem under a normal write lock — no exclusive ``VACUUM`` stall.
+        The reclaimable size is logged at INFO before and the actually-freed
+        size after, so the vacuum's effect is observable.
 
         Transient lock contention (another process writing the shared index)
         is tolerated: the optimize is skipped with a warning and the next
@@ -1346,13 +1418,51 @@ class FTSIndex:
                 )
                 return False
             raise
-        freelist = self._conn.execute("PRAGMA freelist_count").fetchone()[0]
-        page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
-        reclaimable = int(freelist) * int(page_size)
+        page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
+        freelist = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+        reclaimable = freelist * page_size
+        logger.info("fts_optimize_done reclaimable_bytes=%d", reclaimable)
+        self._incremental_vacuum(page_size)
+        return True
+
+    def _incremental_vacuum(self, page_size: int) -> bool:
+        """Return freed freelist pages to the filesystem (incremental vacuum).
+
+        Runs ``PRAGMA incremental_vacuum``, which truncates the freelist back to
+        the operating system using only a normal write lock — unlike a full
+        ``VACUUM``, which needs an exclusive lock.  This is a no-op when the
+        database uses ``auto_vacuum = NONE`` (the pragma silently frees nothing),
+        so it is safe to call unconditionally.
+
+        The pragma is issued via ``executescript`` deliberately: ``execute``
+        steps a ``PRAGMA incremental_vacuum`` statement only once and so frees a
+        single page per call, whereas ``executescript`` drives the statement to
+        completion and reclaims the entire freelist in one pass.
+
+        Lock contention is tolerated the same way :meth:`optimize` and
+        :meth:`vacuum` tolerate it: the vacuum is skipped with a warning.
+
+        Args:
+            page_size: Database page size in bytes, used to report the freed
+                byte count.
+
+        Returns:
+            ``True`` when the incremental vacuum ran, ``False`` when it was
+            skipped because the database was busy or locked.
+        """
+        try:
+            before = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+            self._conn.executescript("PRAGMA incremental_vacuum;")
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "busy" in msg or "locked" in msg:
+                logger.warning("fts_incremental_vacuum_skipped reason=%s", exc)
+                return False
+            raise
+        after = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
         logger.info(
-            "fts_optimize_done reclaimable_bytes=%d "
-            "(run the 'reindex --vacuum' CLI command to reclaim disk space)",
-            reclaimable,
+            "fts_incremental_vacuum_done freed_bytes=%d",
+            (before - after) * page_size,
         )
         return True
 
@@ -1363,6 +1473,12 @@ class FTSIndex:
         run automatically — multiple server processes may share one index
         file.  It is exposed for explicit maintenance (the ``reindex
         --vacuum`` CLI flag).
+
+        Routine page reclamation no longer requires this: indexes use
+        ``auto_vacuum = INCREMENTAL`` and :meth:`optimize` returns freed pages
+        to the filesystem after every bulk purge under a normal write lock.  A
+        full ``VACUUM`` is now only needed to defragment or compact beyond what
+        incremental vacuum reclaims.
 
         Returns:
             ``True`` when the vacuum ran, ``False`` when it was skipped

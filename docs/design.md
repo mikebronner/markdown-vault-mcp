@@ -277,13 +277,28 @@ single purge pass removes ≥ 25 documents or ≥ 10% of the pre-purge corpus
 (`should_optimize()` in `fts_index.py`), the purge call sites in
 `build_index()` adoption and `reindex()` run `FTSIndex.optimize()` — `INSERT
 INTO notes_fts(notes_fts) VALUES('optimize')` — which merges all segments and
-drops the dead entries. The merge frees pages inside the file; the file itself
-only shrinks after a `VACUUM`. `optimize()` logs the reclaimable size
-(freelist × page size) at INFO, and the `reindex --vacuum` CLI flag exposes an
-explicit `VACUUM` for maintenance. `VACUUM` is never run automatically because
-it takes an exclusive lock and multiple server processes may share one index
-file. Lock contention during `optimize()` is tolerated: it is skipped with a
-warning and the next bulk purge retries.
+drops the dead entries. The merge frees pages inside the file; `optimize()`
+then returns those pages to the filesystem with `PRAGMA incremental_vacuum`,
+logging the reclaimable size (freelist × page size) at INFO before and the
+freed size after.
+
+Incremental vacuum works because indexes are created with `auto_vacuum =
+INCREMENTAL` — the pragma is applied in `_open_connection()` *before* the schema
+DDL and before `PRAGMA journal_mode = WAL` (the pragma only takes effect on an
+empty database, and enabling WAL writes the first page). Crucially, the pragma
+is issued via `executescript` rather than `execute`: Python's `sqlite3` steps a
+`PRAGMA incremental_vacuum` statement only once via `execute` (freeing a single
+page per call), whereas `executescript` drives it to completion and reclaims the
+whole freelist in one pass. Incremental vacuum needs only a normal write lock,
+so unlike a full `VACUUM` it does not stall the other server processes that may
+share one index file. Indexes created before this shipped (`auto_vacuum = NONE`)
+are converted in place on the next open via a one-time `VACUUM`; that conversion
+needs an exclusive lock, so under contention it is skipped and retried on a
+later boot. The `reindex --vacuum` CLI flag still exposes an explicit full
+`VACUUM` for deeper compaction, but it is no longer required for routine page
+reclamation. Lock contention during `optimize()`, the incremental vacuum, and
+the migration is tolerated throughout: each is skipped with a warning and
+retried later.
 
 **Server startup**: the MCP server lifespan checks
 `Collection.has_indexed_documents()`. When the persistent index is already
