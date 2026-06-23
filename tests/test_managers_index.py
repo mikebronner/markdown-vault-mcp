@@ -747,6 +747,212 @@ class TestBuildEmbeddings:
 
 
 # ---------------------------------------------------------------------------
+# _load_vectors self-heal of a corrupt/incomplete sidecar
+# ---------------------------------------------------------------------------
+
+
+class TestLoadVectorsSelfHeal:
+    """A corrupt/incomplete vector sidecar must rebuild instead of wedging boot.
+
+    An interrupted save can leave a truncated or zero-byte sidecar; before the
+    self-heal the corrupt file propagated out of ``_load_vectors`` and kept
+    semantic search down until a manual rebuild. These tests pin the broadened
+    catch — ``(json.JSONDecodeError, ValueError, EOFError, FileNotFoundError)``
+    route to the same ``force=True`` rebuild — while confirming environmental
+    errors (``PermissionError`` / generic ``OSError``) still propagate.
+    """
+
+    def _build_persisted_index(
+        self, vault: Path, state_dir: Path
+    ) -> tuple[IndexManager, dict, Path, Path]:
+        """Build an index + embeddings and return (mgr, holder, npy, json).
+
+        After this helper the sidecars exist on disk and the in-memory cache
+        is cleared, so a subsequent ``_load_vectors()`` re-reads from disk.
+        """
+        from tests.conftest import MockEmbeddingProvider
+
+        embeddings_path = state_dir / "embeddings"
+        holder: dict = {"vectors": None}
+        mgr, _fts, _ = _make_index_mgr(
+            vault,
+            state_dir,
+            embeddings_path=embeddings_path,
+            embedding_provider=MockEmbeddingProvider(),
+            get_vectors=lambda: holder["vectors"],
+            set_vectors=lambda v: holder.__setitem__("vectors", v),
+        )
+        mgr.build_index()
+        mgr.build_embeddings()
+        assert holder["vectors"] is not None
+        # Drop the cache so _load_vectors() re-reads the sidecars from disk.
+        holder["vectors"] = None
+
+        npy_path = embeddings_path.with_suffix(".npy")
+        json_path = embeddings_path.with_suffix(".json")
+        assert npy_path.exists() and json_path.exists()
+        return mgr, holder, npy_path, json_path
+
+    def test_corrupt_json_triggers_rebuild(
+        self, index_vault: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A truncated .json with a valid .npy rebuilds rather than propagating."""
+        mgr, holder, _npy, json_path = self._build_persisted_index(
+            index_vault, tmp_path
+        )
+        json_path.write_text('{"rows": [{"path"', encoding="utf-8")
+
+        with caplog.at_level(
+            logging.WARNING, logger="markdown_vault_mcp.managers.index"
+        ):
+            result = mgr._load_vectors()
+
+        assert result is holder["vectors"]
+        assert result.count >= 4  # a usable, repopulated index
+        assert any(
+            "vector_index_corrupt_rebuilding" in r.getMessage() for r in caplog.records
+        )
+
+    def test_zero_byte_npy_triggers_rebuild(
+        self, index_vault: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A zero-byte .npy raises EOFError from numpy — must rebuild, not propagate.
+
+        EOFError is neither a ValueError nor an OSError, so it has to be named
+        explicitly in the catch; this is the canonical interrupted-save residue.
+        """
+        mgr, holder, npy_path, _json = self._build_persisted_index(
+            index_vault, tmp_path
+        )
+        npy_path.write_bytes(b"")  # truncate to zero bytes
+
+        with caplog.at_level(
+            logging.WARNING, logger="markdown_vault_mcp.managers.index"
+        ):
+            result = mgr._load_vectors()
+
+        assert result is holder["vectors"]
+        assert result.count >= 4
+        assert any(
+            "vector_index_corrupt_rebuilding" in r.getMessage() for r in caplog.records
+        )
+
+    def test_garbage_npy_triggers_rebuild(
+        self, index_vault: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A garbage (non-numpy) .npy raises ValueError — must rebuild."""
+        mgr, holder, npy_path, _json = self._build_persisted_index(
+            index_vault, tmp_path
+        )
+        npy_path.write_bytes(b"this is not a numpy array at all")
+
+        with caplog.at_level(
+            logging.WARNING, logger="markdown_vault_mcp.managers.index"
+        ):
+            result = mgr._load_vectors()
+
+        assert result is holder["vectors"]
+        assert result.count >= 4
+        assert any(
+            "vector_index_corrupt_rebuilding" in r.getMessage() for r in caplog.records
+        )
+
+    def test_missing_json_with_present_npy_triggers_rebuild(
+        self, index_vault: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A missing .json while the .npy exists (incomplete pair) rebuilds.
+
+        With the .npy-exists guard satisfied, the FileNotFoundError raised when
+        VectorIndex.load opens the absent .json can only mean an incomplete pair
+        — so a rebuild is the correct response.
+        """
+        mgr, holder, _npy, json_path = self._build_persisted_index(
+            index_vault, tmp_path
+        )
+        json_path.unlink()
+
+        with caplog.at_level(
+            logging.WARNING, logger="markdown_vault_mcp.managers.index"
+        ):
+            result = mgr._load_vectors()
+
+        assert result is holder["vectors"]
+        assert result.count >= 4
+        assert any(
+            "vector_index_corrupt_rebuilding" in r.getMessage() for r in caplog.records
+        )
+
+    def test_permission_error_propagates_without_rebuild(
+        self, index_vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An environmental OSError on load must propagate, not trigger a rebuild.
+
+        PermissionError is an OSError but not one of the corruption types, so it
+        is deliberately left out of the catch: a destructive rebuild would be
+        futile against a disk/permission fault and would mask the real problem.
+        """
+        from markdown_vault_mcp.vector_index import VectorIndex
+
+        mgr, _holder, _npy, _json = self._build_persisted_index(index_vault, tmp_path)
+
+        def boom(*_args: object, **_kwargs: object) -> VectorIndex:
+            raise PermissionError("read denied")
+
+        monkeypatch.setattr(VectorIndex, "load", boom)
+        rebuild_calls: list[bool] = []
+        original_build = mgr.build_embeddings
+
+        def tracking_build(*args: object, **kwargs: object) -> int:
+            rebuild_calls.append(True)
+            return original_build(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(mgr, "build_embeddings", tracking_build)
+
+        with pytest.raises(PermissionError, match="read denied"):
+            mgr._load_vectors()
+        assert rebuild_calls == []  # no rebuild attempted
+
+    def test_missing_index_cold_builds_without_rebuild_loop(
+        self, index_vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fully-missing index (.npy absent) takes the cold-build path, not rebuild.
+
+        The .npy-exists guard must still steer a never-built vault to an empty
+        VectorIndex rather than a force rebuild — verify the broadened catch did
+        not disturb that branch.
+        """
+        from markdown_vault_mcp.vector_index import VectorIndex
+        from tests.conftest import MockEmbeddingProvider
+
+        embeddings_path = tmp_path / "embeddings"
+        holder: dict = {"vectors": None}
+        mgr, _fts, _ = _make_index_mgr(
+            index_vault,
+            tmp_path,
+            embeddings_path=embeddings_path,
+            embedding_provider=MockEmbeddingProvider(),
+            get_vectors=lambda: holder["vectors"],
+            set_vectors=lambda v: holder.__setitem__("vectors", v),
+        )
+        # No build_embeddings() call — sidecars never written.
+        assert not embeddings_path.with_suffix(".npy").exists()
+
+        rebuild_calls: list[bool] = []
+        original_build = mgr.build_embeddings
+
+        def tracking_build(*args: object, **kwargs: object) -> int:
+            rebuild_calls.append(True)
+            return original_build(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(mgr, "build_embeddings", tracking_build)
+        result = mgr._load_vectors()
+
+        assert isinstance(result, VectorIndex)
+        assert result.count == 0  # empty cold-build index
+        assert rebuild_calls == []  # cold path, not a rebuild
+
+
+# ---------------------------------------------------------------------------
 # embeddings_status
 # ---------------------------------------------------------------------------
 

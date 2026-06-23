@@ -164,6 +164,36 @@ class IndexManager:
                     raise ValueError(
                         "Failed to rebuild vector index after a compatibility error."
                     ) from exc
+            except (
+                json.JSONDecodeError,
+                ValueError,
+                EOFError,
+                FileNotFoundError,
+            ) as exc:
+                # A corrupt/incomplete sidecar wedges every boot until a manual
+                # rebuild (#720 follow-up): an interrupted save can leave a
+                # truncated or zero-byte file. Self-heal by routing to the same
+                # force-rebuild path as a compatibility mismatch.
+                #   ValueError — truncated/garbage .json (JSONDecodeError is a
+                #     ValueError subclass) and corrupt/bad-version .npy.
+                #   EOFError — a zero-byte .npy (the canonical interrupted-save
+                #     residue; numpy raises EOFError, not ValueError/OSError).
+                #   FileNotFoundError — a missing .json while the .npy exists
+                #     (an incomplete pair); the .npy-exists guard above means a
+                #     FileNotFoundError here can only be the gone .json sidecar.
+                # Deliberately NOT broad OSError: PermissionError / disk-IO
+                # errors are environmental — a destructive rebuild would be
+                # futile and mask the real problem, so they must propagate.
+                logger.warning(
+                    "vector_index_corrupt_rebuilding path=%s error=%s",
+                    self._embeddings_path,
+                    exc,
+                )
+                self.build_embeddings(force=True)
+                if self._get_vectors() is None:
+                    raise ValueError(
+                        "Failed to rebuild vector index after a corrupt sidecar."
+                    ) from exc
         else:
             vi = VectorIndex(self._embedding_provider)
             self._set_vectors(vi)
