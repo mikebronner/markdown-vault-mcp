@@ -132,10 +132,25 @@ class IndexManager:
             )
 
     def _load_vectors(self) -> VectorIndex:
-        """Load or return the cached VectorIndex.
+        """Load or return the cached VectorIndex, self-healing corrupt sidecars.
+
+        Returns the cached index if already loaded. Otherwise deserialises it
+        from disk; on an incompatible, corrupt, or incomplete sidecar
+        (``VectorIndexCompatibilityError``, ``VectorIndexCorruptError``,
+        ``json.JSONDecodeError``/``ValueError``, ``EOFError``,
+        ``FileNotFoundError``) it routes to a ``force=True`` rebuild. A vault
+        with no persisted index cold-builds an empty one. Environmental errors
+        (e.g. ``PermissionError``) are not caught and propagate.
 
         Returns:
             A :class:`~markdown_vault_mcp.vector_index.VectorIndex` instance.
+
+        Raises:
+            RuntimeError: If called without a prior ``_require_vectors()``
+                (a call-ordering fault; ``_embedding_provider`` or
+                ``_embeddings_path`` is ``None`` at entry). ``_require_vectors``
+                itself raises ``ValueError`` for the unconfigured case.
+            ValueError: If a self-heal rebuild fails to produce a usable index.
         """
         vectors = self._get_vectors()
         if vectors is not None:
@@ -144,6 +159,7 @@ class IndexManager:
         from markdown_vault_mcp.vector_index import (
             VectorIndex,
             VectorIndexCompatibilityError,
+            VectorIndexCorruptError,
         )
 
         if self._embeddings_path is None or self._embedding_provider is None:
@@ -165,6 +181,7 @@ class IndexManager:
                         "Failed to rebuild vector index after a compatibility error."
                     ) from exc
             except (
+                VectorIndexCorruptError,
                 json.JSONDecodeError,
                 ValueError,
                 EOFError,
@@ -174,6 +191,10 @@ class IndexManager:
                 # rebuild (#720 follow-up): an interrupted save can leave a
                 # truncated or zero-byte file. Self-heal by routing to the same
                 # force-rebuild path as a compatibility mismatch.
+                #   VectorIndexCorruptError — embeddings/metadata row-count
+                #     mismatch (#734; a crash between the two atomic sidecar
+                #     replaces). A RuntimeError, so this entry is load-bearing
+                #     — it is NOT covered by the ValueError arm below.
                 #   ValueError — truncated/garbage .json (JSONDecodeError is a
                 #     ValueError subclass) and corrupt/bad-version .npy.
                 #   EOFError — a zero-byte .npy (the canonical interrupted-save

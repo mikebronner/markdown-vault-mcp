@@ -26,6 +26,18 @@ class VectorIndexCompatibilityError(RuntimeError):
     """Raised when a persisted vector index is incompatible with current provider."""
 
 
+class VectorIndexCorruptError(RuntimeError):
+    """A persisted index is internally inconsistent and must be rebuilt.
+
+    Raised by :meth:`VectorIndex.load` when the embeddings sidecar
+    (``.npy``) and the metadata sidecar (``.json``) disagree on row count
+    — the residue of a crash between the two atomic sidecar replaces
+    (#734). A :class:`RuntimeError` (like its sibling
+    :class:`VectorIndexCompatibilityError`), signalling a storage-integrity
+    fault rather than a caller value error.
+    """
+
+
 class VectorIndex:
     """Cosine-similarity vector index backed by numpy.
 
@@ -85,6 +97,8 @@ class VectorIndex:
         Raises:
             ImportError: If ``numpy`` is not installed.
             FileNotFoundError: If either sidecar file is missing.
+            VectorIndexCorruptError: If the embeddings and metadata sidecars
+                disagree on row count (an incomplete atomic save).
         """
         if not _NUMPY_AVAILABLE:
             raise ImportError(
@@ -124,6 +138,15 @@ class VectorIndex:
                     f"current provider={expected_provider!r}, "
                     f"current model={expected_model!r}."
                 )
+
+        # Gate the parity invariant before constructing the index, so a
+        # mismatched pair never yields even a transient inconsistent object.
+        if embeddings.shape[0] != len(metadata):
+            raise VectorIndexCorruptError(
+                "VectorIndex.load: sidecar row count mismatch at "
+                f"{path}: {embeddings.shape[0]} embedding rows vs "
+                f"{len(metadata)} metadata rows (incomplete atomic save)."
+            )
 
         index = cls(provider)
         index._embeddings = embeddings

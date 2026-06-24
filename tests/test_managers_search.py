@@ -828,3 +828,189 @@ def test_semantic_search_does_not_have_flush_embeddings_attr(tmp_path):
         col.reader.search(query="hello", mode="semantic")
     finally:
         col.close()
+
+
+class TestSearchLoadVectorsSelfHeal:
+    """SearchManager._load_vectors must self-heal a corrupt sidecar.
+
+    SearchManager owns the shared VectorIndex and has its own ``_load_vectors``
+    that loads the sidecar from disk; if a search query is the first access
+    after a crash-interrupted save, it — not IndexManager — sees the corrupt
+    pair. ``VectorIndex.load`` raises ``VectorIndexCorruptError`` (a
+    ``RuntimeError``) on a row-count mismatch, so this path must catch it and
+    route to the injected rebuild rather than crash the search call (#734).
+    """
+
+    @staticmethod
+    def _corrupt_json_drop_row(mgr: SearchManager) -> None:
+        """Drop the last metadata row from the on-disk .json (count mismatch)."""
+        import json
+
+        json_path = mgr._embeddings_path.with_suffix(".json")  # type: ignore[union-attr]
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        payload["rows"] = payload["rows"][:-1]
+        json_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    @staticmethod
+    def _arm_rebuild(mgr: SearchManager) -> None:
+        """Wire a rebuild callback that repopulates the shared slot, then drop cache.
+
+        Mirrors what the coordinator's writer-routed rebuild does — sets
+        ``mgr.vectors`` to a populated index — so the self-heal path returns a
+        usable index rather than tripping the rebuild-failure guard.
+        """
+        from markdown_vault_mcp.vector_index import VectorIndex
+
+        assert mgr._embedding_provider is not None
+        rebuilt = VectorIndex(mgr._embedding_provider)
+        rebuilt.add(["alpha"], [{"path": "a.md", "title": "A", "heading": None}])
+        mgr._rebuild_embeddings = lambda: setattr(mgr, "vectors", rebuilt)
+        mgr._vectors = None  # force a re-read from disk
+
+    def test_corrupt_sidecar_triggers_rebuild(
+        self,
+        search_mgr_with_embeddings: SearchManager,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A count-mismatched sidecar routes to the rebuild callback, not a crash."""
+        import logging
+
+        from markdown_vault_mcp.vector_index import VectorIndex
+
+        mgr = search_mgr_with_embeddings
+        self._corrupt_json_drop_row(mgr)
+        mgr._vectors = None  # force a re-read from disk
+
+        # Mirror what the coordinator's rebuild does: repopulate the shared slot.
+        assert mgr._embedding_provider is not None
+        rebuilt = VectorIndex(mgr._embedding_provider)
+        rebuilt.add(["alpha"], [{"path": "a.md", "title": "A", "heading": None}])
+
+        def rebuild() -> None:
+            mgr.vectors = rebuilt
+
+        mgr._rebuild_embeddings = rebuild
+
+        with caplog.at_level(
+            logging.WARNING, logger="markdown_vault_mcp.managers.search"
+        ):
+            result = mgr._load_vectors()
+
+        assert result is rebuilt
+        assert any(
+            "vector_index_corrupt_rebuilding" in r.getMessage() for r in caplog.records
+        )
+
+    def test_corrupt_sidecar_rebuild_failure_raises(
+        self, search_mgr_with_embeddings: SearchManager
+    ) -> None:
+        """If the rebuild leaves no index, a corrupt sidecar surfaces a ValueError."""
+        mgr = search_mgr_with_embeddings
+        self._corrupt_json_drop_row(mgr)
+        mgr._vectors = None
+        mgr._rebuild_embeddings = lambda: None  # no-op leaves _vectors None
+
+        with pytest.raises(
+            ValueError, match="Failed to rebuild vector index after a corrupt sidecar"
+        ):
+            mgr._load_vectors()
+
+    def test_zero_byte_npy_triggers_rebuild(
+        self,
+        search_mgr_with_embeddings: SearchManager,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A zero-byte .npy raises EOFError from numpy — must rebuild, not propagate.
+
+        EOFError is neither a ValueError nor an OSError, so the SearchManager
+        catch tuple must name it explicitly (parity with IndexManager).
+        """
+        import logging
+
+        mgr = search_mgr_with_embeddings
+        npy_path = mgr._embeddings_path.with_suffix(".npy")  # type: ignore[union-attr]
+        npy_path.write_bytes(b"")
+        self._arm_rebuild(mgr)
+
+        with caplog.at_level(
+            logging.WARNING, logger="markdown_vault_mcp.managers.search"
+        ):
+            result = mgr._load_vectors()
+
+        assert result.count >= 1
+        assert any(
+            "vector_index_corrupt_rebuilding" in r.getMessage() for r in caplog.records
+        )
+
+    def test_garbage_npy_triggers_rebuild(
+        self,
+        search_mgr_with_embeddings: SearchManager,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A garbage (non-numpy) .npy raises ValueError — must rebuild."""
+        import logging
+
+        mgr = search_mgr_with_embeddings
+        npy_path = mgr._embeddings_path.with_suffix(".npy")  # type: ignore[union-attr]
+        npy_path.write_bytes(b"this is not a numpy array at all")
+        self._arm_rebuild(mgr)
+
+        with caplog.at_level(
+            logging.WARNING, logger="markdown_vault_mcp.managers.search"
+        ):
+            result = mgr._load_vectors()
+
+        assert result.count >= 1
+        assert any(
+            "vector_index_corrupt_rebuilding" in r.getMessage() for r in caplog.records
+        )
+
+    def test_missing_json_with_present_npy_triggers_rebuild(
+        self,
+        search_mgr_with_embeddings: SearchManager,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A missing .json while the .npy exists (incomplete pair) rebuilds."""
+        import logging
+
+        mgr = search_mgr_with_embeddings
+        mgr._embeddings_path.with_suffix(".json").unlink()  # type: ignore[union-attr]
+        self._arm_rebuild(mgr)
+
+        with caplog.at_level(
+            logging.WARNING, logger="markdown_vault_mcp.managers.search"
+        ):
+            result = mgr._load_vectors()
+
+        assert result.count >= 1
+        assert any(
+            "vector_index_corrupt_rebuilding" in r.getMessage() for r in caplog.records
+        )
+
+    def test_permission_error_propagates_without_rebuild(
+        self,
+        search_mgr_with_embeddings: SearchManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An environmental OSError on load must propagate, not trigger a rebuild.
+
+        PermissionError is an OSError but not one of the corruption types, so it
+        is deliberately excluded from the catch tuple. Pins that contract on the
+        SearchManager path too (parity with IndexManager), so a future widening
+        to OSError cannot silently slip through here.
+        """
+        from markdown_vault_mcp.vector_index import VectorIndex
+
+        mgr = search_mgr_with_embeddings
+        mgr._vectors = None
+
+        def boom(*_args: object, **_kwargs: object) -> VectorIndex:
+            raise PermissionError("read denied")
+
+        monkeypatch.setattr(VectorIndex, "load", boom)
+        rebuild_calls: list[bool] = []
+        mgr._rebuild_embeddings = lambda: rebuild_calls.append(True)
+
+        with pytest.raises(PermissionError, match="read denied"):
+            mgr._load_vectors()
+        assert rebuild_calls == []  # no rebuild attempted

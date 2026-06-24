@@ -297,8 +297,10 @@ class SearchManager:
         attachment_extensions: Allowed non-.md extensions.  ``None`` uses
             the default set.
         link_manager: Optional :class:`LinkManager` for context queries.
-        rebuild_embeddings: Callback to rebuild all embeddings from scratch
-            (used when vector index compatibility fails).
+        rebuild_embeddings: Callback to rebuild all embeddings from scratch.
+            Invoked by ``_load_vectors`` on any unrecoverable sidecar fault —
+            a provider/model mismatch, a row-count mismatch, or a
+            truncated/zero-byte/incomplete sidecar.
     """
 
     def __init__(
@@ -371,10 +373,27 @@ class SearchManager:
             )
 
     def _load_vectors(self) -> VectorIndex:
-        """Load or return the cached VectorIndex.
+        """Load or return the cached VectorIndex, self-healing corrupt sidecars.
+
+        Returns the cached index if already loaded. Otherwise deserialises it
+        from disk; on an incompatible, corrupt, or incomplete sidecar
+        (``VectorIndexCompatibilityError``, ``VectorIndexCorruptError``,
+        ``json.JSONDecodeError``/``ValueError``, ``EOFError``,
+        ``FileNotFoundError``) it routes to the injected ``rebuild_embeddings``
+        callback. A vault with no persisted index cold-builds an empty one.
+        Environmental errors (e.g. ``PermissionError``) are not caught and
+        propagate. Mirrors ``IndexManager._load_vectors`` over the shared
+        index (#734); the two are tracked for unification in #736.
 
         Returns:
             A :class:`~markdown_vault_mcp.vector_index.VectorIndex` instance.
+
+        Raises:
+            RuntimeError: If called without a prior ``_require_vectors()``
+                (a call-ordering fault; ``_embedding_provider`` or
+                ``_embeddings_path`` is ``None`` at entry). ``_require_vectors``
+                itself raises ``ValueError`` for the unconfigured case.
+            ValueError: If a self-heal rebuild fails to produce a usable index.
         """
         if self._vectors is not None:
             return self._vectors
@@ -382,6 +401,7 @@ class SearchManager:
         from markdown_vault_mcp.vector_index import (
             VectorIndex,
             VectorIndexCompatibilityError,
+            VectorIndexCorruptError,
         )
 
         if self._embeddings_path is None or self._embedding_provider is None:
@@ -402,6 +422,35 @@ class SearchManager:
                 if self._vectors is None:
                     raise ValueError(
                         "Failed to rebuild vector index after a compatibility error."
+                    ) from exc
+            except (
+                VectorIndexCorruptError,
+                json.JSONDecodeError,
+                ValueError,
+                EOFError,
+                FileNotFoundError,
+            ) as exc:
+                # SearchManager loads the same shared sidecar as IndexManager and
+                # must self-heal the identical corruption set (#734); a search
+                # query can be the first access after a crash-interrupted save.
+                #   VectorIndexCorruptError — embeddings/metadata row-count
+                #     mismatch (a RuntimeError; not covered by the ValueError
+                #     entry, so this must be listed explicitly).
+                #   ValueError — truncated/garbage .json/.npy (JSONDecodeError
+                #     is a ValueError subclass).
+                #   EOFError — a zero-byte .npy (numpy raises EOFError).
+                #   FileNotFoundError — a missing .json while the .npy exists.
+                # Broad OSError stays uncaught: PermissionError / disk-IO faults
+                # are environmental and must propagate, not trigger a rebuild.
+                logger.warning(
+                    "vector_index_corrupt_rebuilding path=%s error=%s",
+                    self._embeddings_path,
+                    exc,
+                )
+                self._rebuild_embeddings()
+                if self._vectors is None:
+                    raise ValueError(
+                        "Failed to rebuild vector index after a corrupt sidecar."
                     ) from exc
         else:
             self._vectors = VectorIndex(self._embedding_provider)
