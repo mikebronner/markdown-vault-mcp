@@ -627,7 +627,7 @@ _RE_INLINE_LINK = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")
 _RE_REF_USAGE = re.compile(r"\[([^\]]*)\]\[([^\]]*)\]")
 # Reference definition: [ref]: target  (at start of line, optional leading whitespace)
 _RE_REF_DEF = re.compile(r"^\s*\[([^\]]+)\]:\s*(.+)$", re.MULTILINE)
-# Wikilink: [[path]] or [[path|alias]]
+# Wikilink: [[path]], [[path|alias]], or [[path\|alias]] (Obsidian table-cell escape)
 _RE_WIKILINK = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 
 
@@ -776,6 +776,12 @@ def extract_links(content: str, source_path: str) -> list[LinkInfo]:
     # --- Wikilinks ---
     for m in _RE_WIKILINK.finditer(clean):
         raw_path = m.group(1).strip()
+        # Obsidian escapes the alias pipe as `\|` in table cells, so the target
+        # keeps a trailing `\` (#731). Strip it BEFORE wikilink_raw_target is
+        # built — raw_target is the resolve_vault_wikilinks() anchor and must be
+        # the clean stem, else the link never resolves.
+        if raw_path.endswith("\\"):
+            raw_path = raw_path[:-1]
         alias = m.group(2)
         link_text = alias.strip() if alias else raw_path
 
