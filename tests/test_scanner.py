@@ -13,6 +13,9 @@ from markdown_vault_mcp.scanner import (
     ChunkStrategy,
     HeadingChunker,
     WholeDocumentChunker,
+    extract_section,
+    list_section_headings,
+    normalize_heading,
     parse_note,
     scan_directory,
 )
@@ -636,3 +639,118 @@ def test_parse_note_strips_bom_so_frontmatter_parses(tmp_path: Path) -> None:
     # The YAML block must not appear in any body chunk.
     all_body = "".join(c.content for c in note.chunks)
     assert "title:" not in all_body
+
+
+# ---------------------------------------------------------------------------
+# Section extraction helpers (#741)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractSection:
+    def test_spans_subsections_until_next_same_level(self) -> None:
+        """A section's span includes its sub-sections and stops at the next
+        heading of the same or higher level."""
+        text = (
+            "# Title\n"
+            "## Parent\n"
+            "parent preamble.\n"
+            "### Child\n"
+            "child body.\n"
+            "## Sibling\n"
+            "sibling body.\n"
+        )
+        out = extract_section(text, "Parent")
+        assert out is not None
+        assert "parent preamble." in out
+        assert "child body." in out
+        assert "sibling body." not in out
+        # The heading line itself is excluded.
+        assert "## Parent" not in out
+
+    def test_last_section_spans_to_end(self) -> None:
+        text = "# Title\n## First\nfirst.\n## Last\nlast line one.\nlast line two.\n"
+        out = extract_section(text, "Last")
+        assert out is not None
+        # Spans both lines of the final section, excludes the earlier section.
+        # (Frontmatter parsing may drop a trailing newline, so compare loosely.)
+        assert out.splitlines() == ["last line one.", "last line two."]
+
+    def test_fenced_hash_line_acts_as_boundary(self) -> None:
+        """A '#'-prefixed line inside a code fence ends the span, matching the
+        (deliberately non-code-fence-aware) chunker. Characterises the current
+        contract so a future fence-aware change to one side cannot silently
+        desync extraction from indexing."""
+        text = (
+            "# Title\n"
+            "## Section\n"
+            "before fence.\n"
+            "```sh\n"
+            "# not really a heading\n"
+            "```\n"
+            "after fence.\n"
+            "## Next\nnext body.\n"
+        )
+        out = extract_section(text, "Section")
+        assert out is not None
+        assert "before fence." in out
+        # The fenced '#' line is treated as an H1 boundary, so the span ends
+        # there — content after the fence is not part of this section.
+        assert "after fence." not in out
+
+    def test_empty_section_returns_empty_string_not_none(self) -> None:
+        """A present-but-empty section (heading immediately followed by a
+        same-or-higher heading) returns "" — distinct from the None that a
+        *missing* heading returns. _read_section keys 'not found' on None, so
+        this `"" is not None` boundary must hold."""
+        text = "# A\n## Empty\n## Next\nnext body.\n"
+        assert extract_section(text, "Empty") == ""
+        assert extract_section(text, "Missing") is None
+
+    def test_returns_none_for_missing_heading(self) -> None:
+        assert extract_section("# A\nbody.\n", "Nope") is None
+
+    def test_returns_none_for_empty_heading(self) -> None:
+        assert extract_section("# A\nbody.\n", "   ") is None
+
+    def test_whitespace_normalized_match(self) -> None:
+        text = "# Title\n## 1.3.  Reducing deps\nbody content.\n"
+        out = extract_section(text, "1.3. Reducing deps")
+        assert out is not None
+        assert "body content." in out
+
+    def test_strips_frontmatter_before_scanning(self) -> None:
+        text = "---\ntitle: Doc\ntags: [x]\n---\n# Title\n## Section\nsection body.\n"
+        out = extract_section(text, "Section")
+        assert out is not None
+        assert "section body." in out
+        assert "tags:" not in out
+
+    def test_first_occurrence_when_duplicate(self) -> None:
+        text = (
+            "# Title\n"
+            "## Repeat\nfirst body.\n"
+            "## Middle\nmid.\n"
+            "## Repeat\nsecond body.\n"
+        )
+        out = extract_section(text, "Repeat")
+        assert out is not None
+        assert "first body." in out
+        assert "second body." not in out
+
+
+class TestListSectionHeadings:
+    def test_returns_headings_in_order(self) -> None:
+        text = "# A\n## One\nx\n### Deep\ny\n## Two\nz\n"
+        assert list_section_headings(text) == ["A", "One", "Deep", "Two"]
+
+    def test_empty_when_no_headings(self) -> None:
+        assert list_section_headings("just plain text\nno headings here\n") == []
+
+    def test_strips_frontmatter(self) -> None:
+        text = "---\ntitle: Doc\n---\n# Only\nbody\n"
+        assert list_section_headings(text) == ["Only"]
+
+
+def test_normalize_heading_collapses_whitespace() -> None:
+    assert normalize_heading("1.3.   Reducing   deps  ") == "1.3. Reducing deps"
+    assert normalize_heading("\tA\nB\t") == "A B"
