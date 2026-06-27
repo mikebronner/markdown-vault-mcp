@@ -279,6 +279,33 @@ class RenameResult:
 
 
 @dataclass
+class MoveFolderResult:
+    """Result of a folder-level move operation.
+
+    Not frozen — ``failed_links`` is a mutable list (matching the other
+    result dataclasses such as :class:`RenameResult` and :class:`IndexStats`),
+    and a frozen dataclass holding a list neither prevents in-place mutation
+    nor stays hashable.
+
+    Attributes:
+        old_dir: Original relative folder prefix that was moved.
+        new_dir: New relative folder prefix after the move.
+        files_moved: Total number of files moved (notes + attachments +
+            other files).
+        updated_links: Number of source documents whose links were
+            successfully rewritten to point into the new prefix.
+        failed_links: Relative paths of source documents whose link rewrite
+            failed (best-effort; logged and skipped, not aborted).
+    """
+
+    old_dir: str
+    new_dir: str
+    files_moved: int
+    updated_links: int = 0
+    failed_links: list[str] = field(default_factory=list)
+
+
+@dataclass
 class IndexStats:
     """Statistics from :meth:`~markdown_vault_mcp.facets.index.IndexFacet.build_index`.
 
