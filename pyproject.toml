@@ -1,6 +1,6 @@
 [project]
 name = "markdown-vault-mcp"
-version = "3.0.3"
+version = "3.0.4"
 description = "Generic markdown vault MCP server with FTS5 + semantic search"
 readme = "README.md"
 license = "MIT"  # project-owned — keep across copier updates
