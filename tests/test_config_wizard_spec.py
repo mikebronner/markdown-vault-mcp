@@ -39,7 +39,8 @@ import markdown_vault_mcp
 PREFIX = "MARKDOWN_VAULT_MCP"
 
 # Base names of the env-reading helpers (config_sections/_helpers.py). Files may
-# import them aliased (config.py uses ``env as _env``), resolved per file.
+# import them directly or aliased (the extractor resolves aliases per file);
+# config.py now imports ``env`` without an alias (#767).
 _HELPER_BASENAMES = {"env", "env_int", "env_float", "opt_int"}
 
 # Local names that stand in for the env prefix inside f-strings such as
@@ -258,8 +259,11 @@ def test_domain_inventory_includes_bare_name_var() -> None:
     assert "OPENAI_API_KEY" in inv
 
 
-def test_domain_inventory_includes_aliased_helper_var() -> None:
-    # config.py reads these via the aliased helper ``env as _env`` -> ``_env``.
+def test_domain_inventory_includes_top_level_helper_vars() -> None:
+    # config.py reads these via the (un-aliased) ``env()`` helper at the top
+    # level of ``from_env`` — the inventory extractor must catch plain reads.
+    # (Its import-alias resolution is now exercised only by its own unit tests;
+    #  no production file aliases the helper — see #767.)
     inv = domain_inventory()
     assert f"{PREFIX}_SOURCE_DIR" in inv
     assert f"{PREFIX}_READ_ONLY" in inv
