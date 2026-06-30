@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from typing import Any, Literal
+    from typing import Literal
 
     from markdown_vault_mcp.managers.document import DocumentManager
     from markdown_vault_mcp.managers.git_query import GitQueryManager
@@ -30,6 +30,8 @@ if TYPE_CHECKING:
         NoteContent,
         NoteContext,
         NoteInfo,
+        SubtreeToc,
+        TocEntry,
         VaultStats,
     )
 
@@ -178,12 +180,13 @@ class ReaderFacet:
         *,
         max_level: int | None = None,
         max_notes: int = 200,
-    ) -> list[dict[str, Any]] | dict[str, Any]:
+    ) -> list[TocEntry] | SubtreeToc:
         """Return a table of contents for a note or a folder subtree.
 
-        Note paths (ending in ``.md``) return a flat ``[{"heading", "level"}]``
-        outline with the title as a synthetic H1. Folder paths return a
-        nested-per-note object ``{"path", "notes", "truncated"}``. The result
+        Note paths (ending in ``.md``) return a flat
+        :class:`~markdown_vault_mcp.types.TocEntry` list with the title as a
+        synthetic H1. Folder paths return a
+        :class:`~markdown_vault_mcp.types.SubtreeToc`. The result
         depends on the FTS index, so cold-start callers must build the index
         first (bucket 3).
 
@@ -193,11 +196,8 @@ class ReaderFacet:
             max_notes: Folder mode cap on distinct notes (default 200).
 
         Returns:
-            Note path → ``list[{"heading": str, "level": int}]`` with the
-            document title prepended as a synthetic H1.
-            Folder path → ``{"path": str, "notes": list[{"path": str,
-            "title": str, "headings": list[{"heading": str, "level": int}]}],
-            "truncated": bool}``.
+            Note path → ``list[TocEntry]`` with the document title prepended
+            as a synthetic H1. Folder path → :class:`~markdown_vault_mcp.types.SubtreeToc`.
 
         Raises:
             IndexUnavailableError: If :meth:`IndexFacet.build_index` has not been called.

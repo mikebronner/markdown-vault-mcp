@@ -589,6 +589,54 @@ class CommitDiff:
     diff: str
 
 
+@dataclass
+class TocEntry:
+    """A single heading in a table of contents.
+
+    Attributes:
+        heading: Section heading text; non-empty (NULL headings are filtered
+            at the DB layer).
+        level: Markdown heading depth, 1 (H1) through 6 (H6).
+    """
+
+    heading: str
+    level: int
+
+
+@dataclass
+class SubtreeNote:
+    """One note's TOC within a folder-subtree table of contents.
+
+    Attributes:
+        path: Relative note path (ends in ``.md``).
+        title: Document title.
+        headings: Ordered list of headings. As returned by the public
+            ``DocumentManager.get_toc`` / ``ReaderFacet.get_toc`` the first
+            entry is the synthetic H1 title; the raw ``FTSIndex.get_subtree_toc``
+            result omits it (the manager layer prepends it).
+    """
+
+    path: str
+    title: str
+    headings: list[TocEntry]
+
+
+@dataclass
+class SubtreeToc:
+    """A folder-subtree table of contents: per-note headings under a prefix.
+
+    Attributes:
+        path: Folder prefix (no trailing slash, no ``.md`` extension).
+        notes: Per-note TOCs, ordered by path ascending.
+        truncated: True when more notes matched than ``max_notes`` (the count
+            strictly exceeded the cap) and the list was capped.
+    """
+
+    path: str
+    notes: list[SubtreeNote]
+    truncated: bool
+
+
 WriteOperation = Literal["write", "edit", "delete", "rename"]
 
 WriteCallback = Callable[[Path, str, WriteOperation], None]
