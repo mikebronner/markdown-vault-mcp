@@ -252,6 +252,7 @@ class TestToolManifest:
             "get_outlinks",
             "get_recent",
             "get_similar",
+            "get_toc",
             "git_sync",
             "list_documents",
             "list_folders",
@@ -290,6 +291,7 @@ class TestToolAnnotations:
             "get_broken_links",
             "get_similar",
             "get_recent",
+            "get_toc",
         ):
             ann = by_name[name].annotations
             assert ann is not None, f"{name} missing annotations"
@@ -2000,6 +2002,30 @@ class TestSimilarTool:
         assert isinstance(_parse_tool_data(result), list)
 
 
+class TestGetTocTool:
+    """Integration tests for get_toc tool."""
+
+    @pytest.mark.usefixtures("_mcp_env_writable")
+    async def test_get_toc_tool_note(self) -> None:
+        async with Client(make_server()) as client:
+            result = await client.call_tool("get_toc", {"path": "simple.md"})
+        data = _parse_tool_data(result)
+        assert isinstance(data, list)
+        assert data[0]["level"] == 1
+        assert result.structured_content == {"result": data}
+
+    @pytest.mark.usefixtures("_mcp_env_writable")
+    async def test_get_toc_tool_folder(self) -> None:
+        async with Client(make_server()) as client:
+            result = await client.call_tool("get_toc", {"path": "subfolder"})
+        data = _parse_tool_data(result)
+        assert isinstance(data, dict)
+        assert "notes" in data and "truncated" in data
+        assert isinstance(data["notes"], list)
+        assert result.structured_content is not None
+        assert result.structured_content == {"result": data}
+
+
 class TestRecentTool:
     """Integration tests for get_recent tool and recent://vault resource."""
 
@@ -2282,6 +2308,21 @@ class TestResources:
         async with Client(server) as client:
             with pytest.raises(McpError, match="Document not found"):
                 await client.read_resource("toc://vault/does_not_exist.md")
+
+    @pytest.mark.usefixtures("_mcp_env")
+    async def test_toc_resource_folder_traversal_raises(self) -> None:
+        async with Client(make_server()) as client:
+            with pytest.raises(McpError):
+                await client.read_resource("toc://vault/..%2Fetc")
+
+    @pytest.mark.usefixtures("_mcp_env")
+    async def test_toc_resource_folder_returns_nested(self) -> None:
+        async with Client(make_server()) as client:
+            result = await client.read_resource("toc://vault/subfolder")
+            data = json.loads(result[0].text)
+            assert isinstance(data, dict)
+            assert "notes" in data and data["path"] == "subfolder"
+            assert isinstance(data["notes"], list)
 
 
 # ---------------------------------------------------------------------------
@@ -3672,6 +3713,8 @@ class TestIndexStaleSignal:
                 {"source": "notes/topic.md", "target": "index.md"},
                 dict,
             ),
+            ("get_toc", {"path": "notes/topic.md"}, list),
+            ("get_toc", {"path": "notes"}, dict),
         ],
     )
     async def test_index_stale_true_uniform_across_index_tools(

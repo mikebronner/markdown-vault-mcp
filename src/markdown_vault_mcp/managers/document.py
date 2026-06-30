@@ -233,7 +233,8 @@ class DocumentManager:
         """Resolve a relative folder path and validate it is inside the vault.
 
         Unlike :meth:`_validate_path`, this does not require a ``.md`` suffix —
-        it is for directory prefixes used by :meth:`move_folder`.
+        it is for directory prefixes used by :meth:`move_folder` and
+        :meth:`_subtree_toc`.
 
         Args:
             path: Relative folder path (e.g. ``"drafts"`` or ``"a/b"``).
@@ -492,36 +493,84 @@ class DocumentManager:
             etag=etag,
         )
 
-    def get_toc(self, path: str) -> list[dict[str, Any]]:
-        """Return table of contents for a document.
+    def get_toc(
+        self,
+        path: str,
+        *,
+        max_level: int | None = None,
+        max_notes: int = 200,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Return a table of contents for a note or a folder subtree.
 
-        Queries the FTS sections table for headings and prepends the document
-        title as a synthetic H1 entry.
+        When *path* ends in ``.md`` the result is a single note's flat
+        outline: a list of ``{"heading", "level"}`` with the document title
+        prepended as a synthetic H1. Otherwise *path* is treated as a folder
+        prefix and the result is a nested-per-note object aggregating the
+        subtree.
 
         Args:
-            path: Relative path to the document (e.g. ``"notes/intro.md"``).
+            path: Note path (``"a/b.md"``) or folder prefix (``"a/b"``).
+            max_level: If set, drop headings with ``level`` above this; must be
+                ``>= 1``. The synthetic H1 title is always present regardless of
+                ``max_level`` (it is prepended after the level filter).
+            max_notes: Folder mode only — cap on distinct notes (default 200);
+                must be ``>= 1``.
 
         Returns:
-            List of ``{"heading": str, "level": int}`` dicts ordered by
-            position, with the document title prepended as level 1.
+            Note mode: ``list[{"heading", "level"}]``.
+            Folder mode: ``{"path", "notes": [...], "truncated": bool}`` where
+            each note is ``{"path", "title", "headings": [...]}``.
 
         Raises:
-            ValueError: If no document exists at the given path.
+            ValueError: If ``max_notes < 1`` or ``max_level < 1``; note mode, if
+                no document exists at *path* or if the path escapes the vault;
+                folder mode, if *path* is empty, the vault root
+                (```.```/```/```), or escaping the vault.
         """
-        self._validate_path(path)
+        if max_notes < 1:
+            raise ValueError(f"max_notes must be >= 1, got {max_notes!r}")
+        if max_level is not None and max_level < 1:
+            raise ValueError(f"max_level must be >= 1, got {max_level!r}")
+        if path.endswith(".md"):
+            return self._note_toc(path, max_level=max_level)
+        return self._subtree_toc(path, max_level=max_level, max_notes=max_notes)
 
-        row = self._fts.get_note(path)
-        if row is None:
-            raise ValueError(f"Document not found: {path}")
-
-        title: str = row["title"]
-        headings = self._fts.get_toc(path)
-
+    @staticmethod
+    def _prepend_title_h1(
+        title: str, headings: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Prepend the document title as a synthetic H1, dropping any real H1 whose text matches the title."""
         toc: list[dict[str, Any]] = [{"heading": title, "level": 1}]
         toc.extend(
             h for h in headings if not (h["level"] == 1 and h["heading"] == title)
         )
         return toc
+
+    def _note_toc(self, path: str, *, max_level: int | None) -> list[dict[str, Any]]:
+        """Return a single note's flat outline, title prepended as a synthetic H1."""
+        self._validate_path(path)
+        row = self._fts.get_note(path)
+        if row is None:
+            raise ValueError(f"Document not found: {path}")
+        title: str = row["title"]
+        headings = self._fts.get_toc(path, max_level=max_level)
+        return self._prepend_title_h1(title, headings)
+
+    def _subtree_toc(
+        self, path: str, *, max_level: int | None, max_notes: int
+    ) -> dict[str, Any]:
+        """Return the nested-per-note TOC for every note under a folder prefix."""
+        prefix = path.rstrip("/")
+        self._validate_dir_path(prefix)
+        notes_raw, truncated = self._fts.get_subtree_toc(
+            prefix, max_level=max_level, max_notes=max_notes
+        )
+        notes: list[dict[str, Any]] = []
+        for note in notes_raw:
+            title = note["title"]
+            headings = self._prepend_title_h1(title, note["headings"])
+            notes.append({"path": note["path"], "title": title, "headings": headings})
+        return {"path": prefix, "notes": notes, "truncated": truncated}
 
     # ------------------------------------------------------------------
     # Write operations
