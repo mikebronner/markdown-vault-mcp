@@ -356,9 +356,12 @@ for built-in names, or pass a custom instance.
 
 - **State file** (the JSON persistence layer for hash-based change detection):
   versioned format `{"version": 2, "indexed": {relative_path: sha256_hash},
-  "skipped": {relative_path: sha256_hash}}` as JSON (#665). The legacy flat
-  `{relative_path: sha256_hash}` format still loads (every entry is treated
-  as indexed), so upgrades need no migration step.
+  "skipped": {relative_path: sha256_hash}, "skip_reasons": {relative_path:
+  {"category": ..., "detail": ...}}}` as JSON (#665, #775). `skip_reasons`
+  is a strict subset of `skipped` covering the surfaced deterministic skips
+  (parse / encoding / missing-frontmatter); a version-2 file without it loads
+  it as `{}`. The legacy flat `{relative_path: sha256_hash}` format still
+  loads (every entry is treated as indexed), so upgrades need no migration.
 - **Default path**: `{source_dir}/.markdown_vault_mcp/state.json` (when
   `state_path=None`).
 - On `reindex()`: scan all files, compare hashes to stored state, re-parse and
@@ -376,6 +379,12 @@ for built-in names, or pass a custom instance.
   `OSError` skips are deliberately not recorded, so those files retry on
   every scan. A skipped file deleted from disk is dropped silently; it was
   never indexed, so it is not counted as `deleted`.
+  The surfaced deterministic skips (parse / encoding / missing-frontmatter,
+  but not exclude-pattern or transient `OSError`) are also recorded with a
+  `{category, detail}` reason in the state file's `skip_reasons` map and
+  exposed through `get_index_status`'s `skipped_files` field, so a dropped
+  note is discoverable via the MCP API rather than only the container logs
+  (#775).
 
 **Trigger model**: boot reconciliation reindex (submitted by the server
 lifespan behind the initial build job, #665) + explicit `reindex` tool call
@@ -1792,15 +1801,20 @@ class ChangeTracker:
     def detect_changes(self, source_dir: Path,
                        glob_pattern: str = "**/*.md") -> ChangeSet: ...
     def update_state(self, notes: list[ParsedNote],
-                     skipped: dict[str, str] | None = None) -> None: ...
+                     skipped: dict[str, str] | None = None,
+                     skip_reasons: dict[str, dict[str, str]] | None = None) -> None: ...
+    def skip_reasons(self) -> dict[str, dict[str, str]]: ...
     def reset(self) -> None: ...
 ```
 
 `tracker.py` is entirely new code (no ifcraftcorpus equivalent). State file
-format (version 2, #665): `{"version": 2, "indexed": {"Journal/note.md":
-"sha256hex", ...}, "skipped": {"CLAUDE.md": "sha256hex", ...}}` as JSON.
-The legacy flat `{"Journal/note.md": "sha256hex", ...}` format loads with
-every entry treated as indexed.
+format (version 2, #665, #775): `{"version": 2, "indexed": {"Journal/note.md":
+"sha256hex", ...}, "skipped": {"CLAUDE.md": "sha256hex", ...}, "skip_reasons":
+{"CLAUDE.md": {"category": "missing_frontmatter", "detail": "..."}}}` as JSON.
+`skip_reasons` is a strict subset of `skipped` covering the surfaced
+deterministic skips (parse / encoding / missing-frontmatter); a version-2 file
+without it loads it as empty. The legacy flat `{"Journal/note.md":
+"sha256hex", ...}` format loads with every entry treated as indexed.
 
 ### `server.py`: Generic MCP Server
 

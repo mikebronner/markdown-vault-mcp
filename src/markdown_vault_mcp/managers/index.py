@@ -22,7 +22,7 @@ from markdown_vault_mcp.fts_index import _derive_folder, should_optimize
 from markdown_vault_mcp.hashing import compute_file_hash
 from markdown_vault_mcp.managers._vector_loader import load_or_self_heal
 from markdown_vault_mcp.scanner import parse_note, scan_directory
-from markdown_vault_mcp.types import IndexStats, ParsedNote, ReindexResult
+from markdown_vault_mcp.types import IndexStats, ParsedNote, ReindexResult, SkippedFile
 from markdown_vault_mcp.utils import is_path_excluded
 from markdown_vault_mcp.utils.fs import GLOB_SYMLINK_KWARGS
 
@@ -191,12 +191,18 @@ class IndexManager:
 
         logger.info("build_index: scanning %s", self._source_dir)
 
+        skip_reasons: dict[str, dict[str, str]] = {}
+
+        def _collect_skip(sf: SkippedFile) -> None:
+            skip_reasons[sf.path] = {"category": sf.category, "detail": sf.detail}
+
         notes = list(
             scan_directory(
                 self._source_dir,
                 required_frontmatter=self._required_frontmatter,
                 chunk_strategy=self._chunk_strategy,
                 exclude_patterns=self._exclude_patterns,
+                on_skip=_collect_skip,
             )
         )
 
@@ -286,7 +292,9 @@ class IndexManager:
                 )
 
         # Update tracker state so reindex() knows the baseline.
-        self._tracker.update_state(notes, skipped=skipped_state)
+        self._tracker.update_state(
+            notes, skipped=skipped_state, skip_reasons=skip_reasons
+        )
 
         if errored:
             logger.warning(
@@ -362,13 +370,20 @@ class IndexManager:
         # scan; it is only re-evaluated when its content changes.  Transient
         # I/O errors are NOT recorded, so those files retry on every scan.
         newly_skipped: dict[str, str] = {}
+        newly_skip_reasons: dict[str, dict[str, str]] = {}
 
-        def _record_skip(rel_path: str, abs_file: Path) -> None:
-            """Record a deterministically skipped file's current hash."""
+        def _record_skip(
+            rel_path: str, abs_file: Path, category: str, detail: str
+        ) -> None:
+            """Record a deterministically skipped file's hash and reason (#775)."""
             try:
                 newly_skipped[rel_path] = compute_file_hash(abs_file)
             except OSError as exc:
+                # File vanished/unreadable since parse — treat as transient:
+                # record neither the hash nor the reason so it retries.
                 logger.debug("reindex_skip_hash_failed path=%s err=%s", rel_path, exc)
+                return
+            newly_skip_reasons[rel_path] = {"category": category, "detail": detail}
 
         # Pre-parse notes outside the lock to minimise lock hold time.
         parsed: list[tuple[str, ParsedNote]] = []
@@ -386,7 +401,7 @@ class IndexManager:
                 continue
             except UnicodeDecodeError as exc:
                 logger.warning("reindex: skipping %s — %s", path, exc)
-                _record_skip(path, abs_path)
+                _record_skip(path, abs_path, "encoding_error", str(exc))
                 continue
             except Exception as exc:
                 logger.warning(
@@ -395,7 +410,7 @@ class IndexManager:
                     exc,
                     exc_info=True,
                 )
-                _record_skip(path, abs_path)
+                _record_skip(path, abs_path, "parse_error", str(exc))
                 continue
 
             if self._required_frontmatter:
@@ -409,6 +424,10 @@ class IndexManager:
                         missing,
                     )
                     newly_skipped[path] = note.content_hash
+                    newly_skip_reasons[path] = {
+                        "category": "missing_frontmatter",
+                        "detail": f"missing: {missing}",
+                    }
                     continue
 
             parsed.append((path, note))
@@ -519,7 +538,9 @@ class IndexManager:
             )
             for r in self._fts.list_notes()
         ]
-        self._tracker.update_state(state_notes, skipped=newly_skipped)
+        self._tracker.update_state(
+            state_notes, skipped=newly_skipped, skip_reasons=newly_skip_reasons
+        )
 
         return ReindexResult(
             added=indexed_added,
@@ -817,6 +838,29 @@ class IndexManager:
             up_to_date,
         )
         return added
+
+    def skipped_files(self) -> list[SkippedFile]:
+        """Return files dropped from the index for a surfaced reason (#775).
+
+        Reads the tracker's persisted ``skip_reasons`` map and returns one
+        :class:`~markdown_vault_mcp.types.SkippedFile` per path, sorted by
+        path. Covers the deterministic, non-excluded skips (parse / encoding /
+        missing-frontmatter); exclude-pattern and transient-``OSError`` skips
+        are intentionally absent.
+
+        Returns:
+            Path-sorted list of :class:`SkippedFile`. Empty when nothing was
+            skipped for a surfaced reason.
+        """
+        reasons = self._tracker.skip_reasons()
+        return [
+            SkippedFile(
+                path=path,
+                category=reason.get("category", ""),
+                detail=reason.get("detail", ""),
+            )
+            for path, reason in sorted(reasons.items())
+        ]
 
     def embeddings_status(self) -> dict[str, Any]:
         """Return status information about the vector index.
