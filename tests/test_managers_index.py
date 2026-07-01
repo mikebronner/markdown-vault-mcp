@@ -1273,6 +1273,39 @@ class TestBuildIndexSkipReasons:
             vault.close()
         assert by_path["latin.md"].category == "encoding_error"
 
+    def test_pass2_hash_failure_on_surfaced_skip_warns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        import logging
+
+        from markdown_vault_mcp.vault import Vault
+
+        (tmp_path / "good.md").write_text("---\ntitle: ok\n---\nbody", encoding="utf-8")
+        (tmp_path / "bad.md").write_text(
+            "---\ntitle: [unclosed\n---\n", encoding="utf-8"
+        )
+        import markdown_vault_mcp.managers.index as index_module
+
+        def failing_hash(_path):
+            raise OSError("vanished")
+
+        # Only non-indexed files (bad.md) are hashed in build_index's second
+        # pass; good.md is indexed and skipped there. So this forces the
+        # OSError only for the already-surfaced skip.
+        monkeypatch.setattr(index_module, "compute_file_hash", failing_hash)
+        vault = Vault(source_dir=tmp_path)
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="markdown_vault_mcp.managers.index"
+            ):
+                vault.index.build_index()
+        finally:
+            vault.close()
+        assert any(
+            "build_index_surfaced_skip_dropped" in r.message and "bad.md" in r.message
+            for r in caplog.records
+        )
+
 
 class TestReindexSkipReasons:
     """reindex records surfaced skips into tracker skip_reasons (#775)."""
@@ -1285,6 +1318,10 @@ class TestReindexSkipReasons:
         return vault
 
     def test_invalid_yaml_recorded_as_parse_error(self, tmp_path: Path) -> None:
+        # Regression guard for the reindex yaml.YAMLError split (#802): without
+        # the dedicated yaml.YAMLError branch (ahead of the generic Exception
+        # branch, which records internal_error), a malformed-YAML file would be
+        # mislabelled internal_error. Do not remove as "redundant".
         (tmp_path / "seed.md").write_text("---\na: 1\n---\nx", encoding="utf-8")
         vault = self._build(tmp_path)
         try:
@@ -1296,6 +1333,32 @@ class TestReindexSkipReasons:
         finally:
             vault.close()
         assert by_path["bad.md"].category == "parse_error"
+
+    def test_unexpected_exception_recorded_as_internal_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "seed.md").write_text("---\na: 1\n---\nx", encoding="utf-8")
+        vault = self._build(tmp_path)
+        try:
+            (tmp_path / "boom.md").write_text(
+                "---\ntitle: ok\n---\nbody", encoding="utf-8"
+            )
+            import markdown_vault_mcp.managers.index as index_module
+
+            real_parse = index_module.parse_note
+
+            def maybe_explode(abs_path, source_dir, chunk_strategy):
+                if abs_path.name == "boom.md":
+                    raise RuntimeError("chunker exploded")
+                return real_parse(abs_path, source_dir, chunk_strategy)
+
+            monkeypatch.setattr(index_module, "parse_note", maybe_explode)
+            vault.index.reindex()
+            by_path = {sf.path: sf for sf in vault.index.skipped_files()}
+        finally:
+            vault.close()
+        assert by_path["boom.md"].category == "internal_error"
+        assert "chunker exploded" in by_path["boom.md"].detail
 
     def test_missing_field_recorded_as_missing_frontmatter(
         self, tmp_path: Path
