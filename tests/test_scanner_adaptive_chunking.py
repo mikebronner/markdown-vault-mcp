@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from markdown_vault_mcp.scanner import HeadingChunker
+from markdown_vault_mcp.types import Chunk
 
 
 def _doc(*sections: tuple[int, str, int]) -> str:
@@ -313,3 +314,151 @@ def test_adaptive_mode_h3_only_doc_splits_at_h3():
     assert len(chunks) == 2
     assert {c.heading for c in chunks} == {"A", "B"}
     assert all(c.heading_level == 3 for c in chunks)
+
+
+def _frag(content: str, start_line: int = 0) -> Chunk:
+    """A same-section fragment (heading identity fixed) for overlap tests."""
+    return Chunk(heading="S", heading_level=2, content=content, start_line=start_line)
+
+
+def test_overlap_can_exceed_char_budget_without_resplitting() -> None:
+    """Overlap is applied after the char-budget split and is not re-checked: an
+    overlapped fragment may exceed max_chunk_chars, and no extra split occurs
+    (pins the "may exceed either budget" contract for the char cap)."""
+    text = " ".join("x" * 8 for _ in range(20))
+    baseline = HeadingChunker(
+        max_chunk_words=1000, max_chunk_chars=40, chunk_overlap_words=0
+    ).chunk(text, {})
+    assert len(baseline) >= 2  # the char budget forced a split
+    assert all(len(c.content) <= 40 for c in baseline)
+    overlapped = HeadingChunker(
+        max_chunk_words=1000, max_chunk_chars=40, chunk_overlap_words=2
+    ).chunk(text, {})
+    # Same fragment count: overlap did not trigger re-splitting under the char cap.
+    assert len(overlapped) == len(baseline)
+    # And at least one fragment now exceeds the char cap by the overlap words.
+    assert any(len(c.content) > 40 for c in overlapped)
+
+
+def test_overlap_can_exceed_word_budget_without_resplitting() -> None:
+    """Word-budget mirror of the char-budget test: overlap is applied after the
+    word-budget split and is not re-checked, so an overlapped fragment may exceed
+    max_chunk_words and no extra split occurs."""
+    text = " ".join(f"w{i}" for i in range(40))
+    baseline = HeadingChunker(
+        max_chunk_words=8, max_chunk_chars=None, chunk_overlap_words=0
+    ).chunk(text, {})
+    assert len(baseline) >= 2  # the word budget forced a split
+    assert all(len(c.content.split()) <= 8 for c in baseline)
+    overlapped = HeadingChunker(
+        max_chunk_words=8, max_chunk_chars=None, chunk_overlap_words=3
+    ).chunk(text, {})
+    # Same fragment count: overlap did not trigger re-splitting under the word cap.
+    assert len(overlapped) == len(baseline)
+    # And at least one fragment now exceeds the word cap by the overlap words.
+    assert any(len(c.content.split()) > 8 for c in overlapped)
+
+
+def test_apply_overlap_prepends_previous_tail() -> None:
+    """Fragment i begins with the last N words of the ORIGINAL fragment i-1."""
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=2)
+    frags = [_frag("a b c"), _frag("d e f"), _frag("g h i")]
+    out = chunker._apply_overlap(frags)
+    assert out[0].content == "a b c"  # first fragment unchanged
+    assert out[1].content == "b c\n\nd e f"  # last 2 words of frag 0
+    # frag 2 overlaps the ORIGINAL frag 1 ("d e f"), not the overlapped one:
+    assert out[2].content == "e f\n\ng h i"
+
+
+def test_apply_overlap_disabled_is_identity() -> None:
+    """chunk_overlap_words=0 leaves fragments untouched."""
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=0)
+    frags = [_frag("a b c"), _frag("d e f")]
+    out = chunker._apply_overlap(frags)
+    assert [c.content for c in out] == ["a b c", "d e f"]
+
+
+def test_apply_overlap_clamps_to_available_words() -> None:
+    """An overlap larger than the previous fragment uses all its words."""
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=100)
+    frags = [_frag("a b"), _frag("c d")]
+    out = chunker._apply_overlap(frags)
+    assert out[1].content == "a b\n\nc d"
+
+
+def test_apply_overlap_single_fragment_unchanged() -> None:
+    """A one-element list is returned as-is."""
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=3)
+    frags = [_frag("only one")]
+    assert chunker._apply_overlap(frags) == frags
+
+
+def test_apply_overlap_preserves_start_line() -> None:
+    """Overlapped fragments keep their own start_line."""
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=1)
+    frags = [_frag("a b", start_line=5), _frag("c d", start_line=9)]
+    out = chunker._apply_overlap(frags)
+    assert out[1].start_line == 9
+
+
+def test_overlap_within_section_via_chunk() -> None:
+    """A single oversize section: adjacent chunks share the overlap words."""
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=3)
+    text = " ".join(f"w{i}" for i in range(40))
+    chunks = chunker.chunk(text, {})
+    assert len(chunks) >= 2
+    assert chunks[1].content.split()[:3] == chunks[0].content.split()[-3:]
+
+
+def test_overlap_not_applied_across_heading_sections() -> None:
+    """The first fragment of section B is not prefixed with section A's tail.
+
+    One word per line so the doc exceeds the 30-line short-doc bypass and is
+    actually split on headings first (each section goes through _budget_split
+    separately, so overlap is applied within each section, not across the pair).
+    """
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=3)
+    a_body = "\n".join(f"a{i}" for i in range(40))
+    b_body = "\n".join(f"b{i}" for i in range(40))
+    text = f"## Section A\n{a_body}\n## Section B\n{b_body}\n"
+    chunks = chunker.chunk(text, {})
+    b_chunks = [c for c in chunks if "b0" in c.content]
+    assert b_chunks, "expected a chunk containing section B content"
+    # The chunk that opens section B must not carry section A's last word.
+    assert "a39" not in b_chunks[0].content
+
+
+def test_apply_overlap_no_accumulation_sharp() -> None:
+    """Overlap for fragment i reads the ORIGINAL fragment i-1, never the
+    already-overlapped one. With n=3 a naive (accumulating) implementation would
+    produce "c d e" for fragment 2; the correct one produces "d e f"."""
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=3)
+    frags = [_frag("a b c"), _frag("d e f"), _frag("g h i")]
+    out = chunker._apply_overlap(frags)
+    assert out[1].content == "a b c\n\nd e f"
+    assert out[2].content == "d e f\n\ng h i"
+
+
+def test_apply_overlap_empty_previous_fragment() -> None:
+    """A previous fragment with no words yields no prefix (no leading blank)."""
+    chunker = HeadingChunker(max_chunk_words=10, chunk_overlap_words=3)
+    out = chunker._apply_overlap([_frag(""), _frag("d e f")])
+    assert out[1].content == "d e f"
+
+
+def test_overlap_not_applied_between_small_adjacent_sections() -> None:
+    """Two adjacent heading sections that each fit the budget stay separate
+    chunks with no overlap between them (overlap is wired only in _budget_split).
+
+    One word per line so the doc exceeds the 30-line short-doc bypass and is
+    split on headings; max_chunk_words is high enough that neither section is
+    budget-split, so _budget_split (hence _apply_overlap) never runs.
+    """
+    chunker = HeadingChunker(max_chunk_words=100, chunk_overlap_words=3)
+    a_body = "\n".join(f"a{i}" for i in range(40))
+    b_body = "\n".join(f"b{i}" for i in range(40))
+    text = f"## Section A\n{a_body}\n## Section B\n{b_body}\n"
+    chunks = chunker.chunk(text, {})
+    b_chunks = [c for c in chunks if "b0" in c.content]
+    assert b_chunks, "expected a chunk containing section B content"
+    assert "a39" not in b_chunks[0].content

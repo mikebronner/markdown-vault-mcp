@@ -91,7 +91,9 @@ class HeadingChunker:
     :meth:`_budget_split` falls back to paragraph, line, and word boundaries
     so the invariant ``not _over_budget(chunk.content)`` holds for every
     emitted chunk regardless of source structure (the sole exception being a
-    single token longer than ``max_chunk_chars``, which is unsplittable).
+    single token longer than ``max_chunk_chars``, which is unsplittable; and,
+    when ``chunk_overlap_words`` is greater than zero, an overlapped fragment
+    may exceed either budget by up to ``chunk_overlap_words`` words).
 
     The ``max_chunk_chars`` cap bounds token-dense content — text with a high
     character-per-word ratio that fits ``max_chunk_words`` yet exceeds the
@@ -111,6 +113,7 @@ class HeadingChunker:
         *,
         max_chunk_words: int | None = None,
         max_chunk_chars: int | None = None,
+        chunk_overlap_words: int = 0,
     ) -> None:
         """Initialise the chunker.
 
@@ -125,10 +128,14 @@ class HeadingChunker:
                 word) that fits the word budget yet exceeds the embedding
                 model's context. ``None`` disables the char cap; splitting
                 then depends on ``max_chunk_words`` alone.
+            chunk_overlap_words: Words of overlap prepended to each budget-split
+                fragment from the previous fragment of the same section. ``0``
+                disables overlap. Never crosses a heading boundary.
         """
         self.short_doc_lines = short_doc_lines
         self.max_chunk_words = max_chunk_words
         self.max_chunk_chars = max_chunk_chars
+        self.chunk_overlap_words = chunk_overlap_words
 
     def _has_budget(self) -> bool:
         """True when either a word budget or a char budget is configured."""
@@ -267,7 +274,8 @@ class HeadingChunker:
         reached H6), :meth:`_budget_split` fragments it on paragraph and
         word boundaries so the invariant ``not _over_budget(chunk.content)``
         holds for every emitted chunk — including preamble chunks with no
-        heading at all.
+        heading at all. See the class docstring for the two exceptions to
+        this invariant, including the ``chunk_overlap_words`` case.
         """
         assert self._has_budget()  # guarded by caller
         out: list[Chunk] = []
@@ -303,7 +311,10 @@ class HeadingChunker:
 
     def _budget_split(self, chunk: Chunk) -> list[Chunk]:
         """Split *chunk* on paragraph, line, and word boundaries until each
-        fragment fits within the configured word **and** char budgets.
+        fragment fits within the configured word **and** char budgets, then
+        applies ``chunk_overlap_words`` overlap via :meth:`_apply_overlap`,
+        which may push a returned fragment over either budget by up to that
+        many words.
 
         Used as the last-resort splitter when no deeper heading is available
         (e.g. an H6 section longer than the budget, or a preamble with no
@@ -329,9 +340,11 @@ class HeadingChunker:
             chunk: A chunk whose word or char count exceeds the budget.
 
         Returns:
-            One or more chunks, each respecting the budget.  Returns
-            ``[chunk]`` unchanged when the content is whitespace-only (no
-            paragraphs to split on).
+            One or more chunks. Each fits the word and char budgets from the
+            bin-packing phase; after ``chunk_overlap_words`` overlap is applied
+            a fragment may exceed either budget by up to that many words.
+            Returns ``[chunk]`` unchanged when the content is whitespace-only
+            (no paragraphs to split on).
         """
         assert self._has_budget()  # guarded by caller
         word_budget = self.max_chunk_words
@@ -426,6 +439,32 @@ class HeadingChunker:
             pending_chars += chars_in_para
 
         emit()
+        return self._apply_overlap(out)
+
+    def _apply_overlap(self, fragments: list[Chunk]) -> list[Chunk]:
+        """Prepend each fragment's trailing words to the next (same section).
+
+        Applied only to the budget-split fragments of one leaf section, so
+        overlap never crosses a heading or heading-refined boundary. Words come
+        from the original previous fragment (no accumulation); start_line is
+        preserved (overlap is duplicated retrieval context, not new source).
+        """
+        n = self.chunk_overlap_words
+        if n <= 0 or len(fragments) < 2:
+            return fragments
+        out: list[Chunk] = [fragments[0]]
+        for i in range(1, len(fragments)):
+            overlap = " ".join(fragments[i - 1].content.split()[-n:])
+            cur = fragments[i]
+            content = f"{overlap}\n\n{cur.content}" if overlap else cur.content
+            out.append(
+                Chunk(
+                    heading=cur.heading,
+                    heading_level=cur.heading_level,
+                    content=content,
+                    start_line=cur.start_line,
+                )
+            )
         return out
 
     def _budget_split_lines(
