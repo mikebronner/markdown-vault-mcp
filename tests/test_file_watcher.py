@@ -524,6 +524,63 @@ def test_lifespan_starts_and_stops_watcher_when_no_git(tmp_path: Path) -> None:
     asyncio.run(_run())
 
 
+def test_lifespan_passes_configured_internal_dirs_to_watcher(tmp_path: Path) -> None:
+    """Explicit state/index/embeddings paths flow into the watcher's internal_dirs.
+
+    Covers the non-``None`` branches of the ``internal_dirs`` construction in
+    ``make_vault_lifespan`` (custom ``state_path`` fallback plus the
+    ``index_path``/``embeddings_path`` parent-append loop, #830): each configured
+    directory, and ``.git``, must be protected from watching so the watcher can
+    never observe the writes reindex makes into them.
+    """
+    import asyncio
+
+    from markdown_vault_mcp.config import ProjectConfig
+    from markdown_vault_mcp.config_sections import IndexingConfig
+
+    (tmp_path / "note.md").write_text("# note\n\nbody", encoding="utf-8")
+    state_dir = tmp_path / "state_area"
+    index_dir = tmp_path / "index_area"
+    emb_dir = tmp_path / "emb_area"
+    for d in (state_dir, index_dir, emb_dir):
+        d.mkdir()
+
+    config = ProjectConfig(
+        source_dir=tmp_path,
+        read_only=False,
+        indexing=IndexingConfig(
+            state_path=state_dir / "state.json",
+            index_path=index_dir / "index.db",
+            embeddings_path=emb_dir / "embeddings",
+        ),
+    )
+    lifespan_fn = make_vault_lifespan(config)
+
+    captured: dict[str, object] = {}
+    real_init = VaultFileWatcher.__init__
+
+    def spy_init(self: VaultFileWatcher, *args: object, **kwargs: object) -> None:
+        captured["internal_dirs"] = kwargs.get("internal_dirs")
+        real_init(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    async def _run() -> None:
+        with (
+            patch.object(VaultFileWatcher, "__init__", spy_init),
+            patch.object(VaultFileWatcher, "start"),
+            patch.object(VaultFileWatcher, "stop"),
+        ):
+            async with lifespan_fn(None):  # type: ignore[arg-type]
+                pass
+
+    asyncio.run(_run())
+
+    internal = set(captured["internal_dirs"])  # type: ignore[arg-type]
+    assert state_dir in internal
+    assert index_dir in internal
+    assert emb_dir in internal
+    assert tmp_path / ".git" in internal
+
+
 def test_lifespan_skips_watcher_when_git_pull_active(tmp_path: Path) -> None:
     """The lifespan does not start the watcher when the git pull loop is active.
 
@@ -620,6 +677,86 @@ def test_derive_watch_roots_falls_back_on_enumeration_error(tmp_path: Path) -> N
     missing = tmp_path / "gone"
     roots = _derive_watch_roots(missing, None)
     assert roots == [_WatchRoot(missing, recursive=False)]
+
+
+def test_derive_watch_roots_skips_internal_state_and_git_dirs(tmp_path: Path) -> None:
+    """The vault's own state dir and ``.git`` are never watch roots (#830).
+
+    With no ``exclude_patterns`` the scoped-watch change would otherwise promote
+    every top-level dir — including the default state dir ``.markdown_vault_mcp``
+    (which ``reindex`` writes ``state.json`` into on every run) and ``.git`` — to
+    a recursive watch root, closing a self-feedback reindex loop. A deliberately
+    watched *user* dot-root like ``.claude`` must still be watched; only the
+    vault's internal write targets are skipped.
+    """
+    (tmp_path / ".markdown_vault_mcp").mkdir()
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".claude").mkdir()
+    roots = _derive_watch_roots(
+        tmp_path,
+        None,
+        internal_dirs=[tmp_path / ".markdown_vault_mcp", tmp_path / ".git"],
+    )
+    names = _root_names(roots)
+    assert ".markdown_vault_mcp" not in names, "state dir must not be a watch root"
+    assert ".git" not in names, ".git must not be a watch root"
+    assert ".claude" in names, "a user dot-root must still be watched"
+
+
+def test_derive_watch_roots_skips_top_level_dir_containing_internal_dir(
+    tmp_path: Path,
+) -> None:
+    """A top-level dir that *contains* an internal write dir is not watched.
+
+    Guards against reintroducing the loop when the state dir is configured
+    beneath a top-level directory: watching that directory recursively would
+    still deliver the state-file writes. The whole subtree is skipped so the
+    loop can never form (a limitation documented for nested state paths).
+    """
+    state_dir = tmp_path / "data" / "state"
+    state_dir.mkdir(parents=True)
+    roots = _derive_watch_roots(tmp_path, None, internal_dirs=[state_dir])
+    assert "data" not in _root_names(roots)
+
+
+def test_start_does_not_schedule_watch_on_internal_state_dir(tmp_path: Path) -> None:
+    """``start()`` forwards ``internal_dirs`` so the state dir is never scheduled.
+
+    Exercises the wiring, not just ``_derive_watch_roots``: a pre-existing state
+    dir (present before the watcher starts, as at lifespan startup) must not get
+    a recursive watch, while a sibling content dir must (#830).
+    """
+    (tmp_path / ".markdown_vault_mcp").mkdir()
+    (tmp_path / "notes").mkdir()
+
+    class _RecordingObserver:
+        def __init__(self) -> None:
+            self.scheduled: list[str] = []
+
+        def schedule(self, _handler: object, path: str, **_kwargs: object) -> None:
+            self.scheduled.append(path)
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            pass
+
+    fake = _RecordingObserver()
+    watcher = VaultFileWatcher(
+        tmp_path,
+        lambda: None,  # type: ignore[arg-type]
+        internal_dirs=[tmp_path / ".markdown_vault_mcp"],
+    )
+    with patch("markdown_vault_mcp._file_watcher.Observer", lambda: fake):
+        watcher.start()
+        watcher.stop()
+
+    assert str(tmp_path / ".markdown_vault_mcp") not in fake.scheduled
+    assert str(tmp_path / "notes") in fake.scheduled
 
 
 def test_derive_watch_roots_root_floor_false_omits_non_recursive_root(
