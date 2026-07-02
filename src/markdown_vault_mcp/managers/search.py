@@ -21,6 +21,7 @@ from dataclasses import replace as _dc_replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
 
+from markdown_vault_mcp.exceptions import EmbeddingsNotConfiguredError
 from markdown_vault_mcp.managers._vector_loader import load_or_self_heal
 from markdown_vault_mcp.types import (
     AttachmentInfo,
@@ -366,9 +367,9 @@ class SearchManager:
         validate_path(path, self._source_dir)
 
     def _require_vectors(self) -> None:
-        """Raise ValueError if semantic search is not configured."""
+        """Raise :class:`EmbeddingsNotConfiguredError` if semantic search is unconfigured."""
         if self._embedding_provider is None or self._embeddings_path is None:
-            raise ValueError(
+            raise EmbeddingsNotConfiguredError(
                 "Semantic search requires both 'embedding_provider' and "
                 "'embeddings_path' to be configured."
             )
@@ -525,8 +526,9 @@ class SearchManager:
             by descending file score (max of section scores).
 
         Raises:
-            ValueError: If *mode* is ``"semantic"`` or ``"hybrid"`` but no
-                embedding provider or embeddings path is configured.
+            EmbeddingsNotConfiguredError: If *mode* is ``"semantic"`` or
+                ``"hybrid"`` but no embedding provider or embeddings path is
+                configured (a ``ValueError`` subclass).
         """
         eff_cap = (
             chunks_per_file if chunks_per_file is not None else self._chunks_per_file
@@ -1327,8 +1329,13 @@ class SearchManager:
                 similar_grouped = self.get_similar(
                     path, limit=similar_limit, chunks_per_file=1
                 )
-            except ValueError:
-                logger.debug("get_context: get_similar raised for %s, similar=[]", path)
+            except ValueError as exc:
+                # The outer guard + get_similar's own not-configured check mean
+                # this only fires on a genuine internal failure (e.g. a corrupt
+                # vector sidecar surfaced by _load_vectors()) — surface it at
+                # WARNING instead of silently reducing the dossier to similar=[]
+                # (#804). Not broadened to Exception: unexpected types propagate.
+                logger.warning("get_context: get_similar failed for %s — %s", path, exc)
 
         # Folder peers — other notes in the same folder, capped.
         folder = row["folder"]
