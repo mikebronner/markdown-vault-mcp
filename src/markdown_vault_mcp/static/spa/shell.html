@@ -64,6 +64,21 @@
     </div>
     <div id="graph-container" style="flex:1;position:relative;">
       <div id="graph-mini-card" class="graph-mini-card" style="display:none;"></div>
+      <div class="graph-overlay" id="graph-overlay">
+        <span class="graph-count" id="graph-count">0 notes</span>
+        <div class="graph-zoom">
+          <button id="graph-zoom-out" title="Zoom out">&#8722;</button>
+          <button id="graph-zoom-in" title="Zoom in">&#43;</button>
+        </div>
+      </div>
+    </div>
+    <button class="graph-legend-chip" id="graph-legend-chip" title="Show legend">&#9432; legend</button>
+    <div class="graph-legend" id="graph-legend">
+      <span class="lg-item"><span class="lg-line lg-solid"></span>wikilink</span>
+      <span class="lg-item"><span class="lg-line lg-dashed"></span>semantic</span>
+      <span class="lg-item"><span class="lg-pill lg-focus"></span>focus note</span>
+      <span class="lg-item"><span class="lg-pill lg-linked"></span>linked note</span>
+      <span class="lg-item"><span class="lg-dot"></span>more (hover)</span>
     </div>
   </div>
   <div class="tab-panel" id="panel-browse" data-tab="browse">

@@ -24,7 +24,9 @@ Interactive force-directed link graph of the vault, powered by vis-network. Two 
 - **Neighborhood**: shows a note and its direct connections (configurable depth, soft-capped at `max_nodes=200` by default; the response carries `truncated=true` when the BFS hit the cap so the SPA can warn the user)
 - **Hubs**: shows the most-linked notes in the vault and their connections
 
-Click a node to view that note's context card. Toggle semantic similarity edges when embeddings are available.
+Click a node to view that note's context card. Toggle semantic similarity edges when embeddings are available (semantic edges render as dashed accent-colored lines, distinct from the solid wikilink edges).
+
+Node labels follow a level-of-detail rule. The focus note, its direct neighbors, and hub notes keep their labels; other farther-out notes render as unlabelled dots (their names appear on hover, or once you zoom in past a threshold). A separate hover text with the note's title and backlink count is always available, regardless of zoom level. A count chip in the top-right corner of the canvas reports how many notes are currently visible, next to zoom-in and zoom-out buttons. A legend below the canvas explains the edge and node styles; on a narrow panel it collapses behind an "ⓘ legend" chip to save space.
 
 ### Vault Browser
 

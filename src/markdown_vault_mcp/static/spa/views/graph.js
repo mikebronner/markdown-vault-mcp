@@ -6,6 +6,10 @@
   let graphCenterPath = null;
   let selectedNodeId = null;
   let semanticEnabled = false;
+  let _depths = new Map();
+  const LABEL_ZOOM_THRESHOLD = 1.35;
+  let _zoomedIn = false;
+  let _hoveredId = null;
 
   // Folder-based node colors — chosen to stand out on both light and dark backgrounds
   const _FOLDER_COLORS = [
@@ -25,38 +29,46 @@
     return _FOLDER_COLORS[h % _FOLDER_COLORS.length];
   }
 
-  // Color scheme for edges and UI chrome
+  // Paper palette for edges and canvas chrome, read from CSS vars so the graph
+  // re-themes when the host flips theme (see refreshColors / vault-theme-changed).
   function getColors() {
     const s = getComputedStyle(document.documentElement);
+    const v = (name, fallback) => s.getPropertyValue(name).trim() || fallback;
     return {
-      fg: s.getPropertyValue('--color-text-primary').trim() || '#1a1a1a',
-      accent: s.getPropertyValue('--color-text-info').trim() || '#6366f1',
-      muted: s.getPropertyValue('--color-text-secondary').trim() || '#6b7280',
-      border: s.getPropertyValue('--color-border-primary').trim() || '#e0e0e0',
+      panel:      v('--panel', '#fbf8f1'),
+      panel2:     v('--panel-2', '#f2ecdf'),
+      ink:        v('--ink', '#2a2620'),
+      ink2:       v('--ink-2', '#5c5446'),
+      muted:      v('--muted', '#928975'),
+      edge:       v('--edge', '#d3c7ad'),
+      accent:     v('--accent', '#b25a35'),
+      accentInk:  v('--accent-ink', '#ffffff'),
+      accentSoft: v('--accent-soft', '#f3e4d8'),
+      border:     v('--border', '#e4dbc9'),
     };
   }
 
-  const _SEMANTIC_EDGE_COLOR = '#a855f7'; // purple — distinct from folder node colors
-
-  function edgeColorByType(type, c) {
-    if (type === 'semantic') return _SEMANTIC_EDGE_COLOR;
-    if (type === 'wikilink') return c.accent;
-    if (type === 'reference') return c.muted;
-    return c.border; // markdown = default
+  // Edge styling: solid --edge for link edges (thinner + lower opacity when the
+  // farthest endpoint is distant), dashed --accent for semantic similarity.
+  function edgeStyle(type, depthMax, c) {
+    if (type === 'semantic') {
+      return { color: { color: c.accent, opacity: 0.75 }, dashes: [5, 4], width: 1 };
+    }
+    const far = depthMax >= 2;
+    return { color: { color: c.edge, opacity: far ? 0.5 : 1 }, dashes: false, width: far ? 1 : 1.6 };
   }
 
   function initNetwork() {
     if (network) return;
     const container = document.getElementById('graph-container');
     if (!container || typeof vis === 'undefined') return;
-    const c = getColors();
     nodesDS = new vis.DataSet();
     edgesDS = new vis.DataSet();
     const options = {
       physics: { enabled: true, solver: 'forceAtlas2Based', forceAtlas2Based: { gravitationalConstant: -40 } },
       nodes: {
         shape: 'dot',
-        scaling: { min: 8, max: 30, label: { enabled: true, min: 10, max: 16 } },
+        scaling: { min: 8, max: 30, label: { enabled: true, min: 10, max: 16, drawThreshold: 6 } },
       },
       edges: {
         arrows: { to: { enabled: true, scaleFactor: 0.5 } }, font: { size: 9 }, smooth: { type: 'continuous' },
@@ -89,6 +101,13 @@
         loadGraph(nodeId);
       }
     });
+
+    network.on('zoom', (params) => {
+      const zoomed = params.scale >= LABEL_ZOOM_THRESHOLD;
+      if (zoomed !== _zoomedIn) { _zoomedIn = zoomed; applyLOD(); }  // only on crossing
+    });
+    network.on('hoverNode', (params) => { _hoveredId = params.node; applyLOD(); });
+    network.on('blurNode', () => { _hoveredId = null; applyLOD(); });
   }
 
   function addGraphData(data) {
@@ -97,21 +116,12 @@
     for (const n of data.nodes) {
       if (!nodesDS.get(n.id)) {
         const bc = n.backlink_count || 0;
-        const baseColor = n.group === 'orphan' ? '#94a3b8' : _folderColor(n.folder);
         nodesDS.add({
           id: n.id, label: n.label,
-          value: Math.max(bc, 1),
           title: n.label + (n.folder ? ' (' + n.folder + ')' : '') + (bc > 0 ? ' \u2014 ' + bc + ' backlinks' : ''),
-          color: {
-            background: baseColor,
-            border: n.group === 'hub' ? '#ffffff' : baseColor,
-            highlight: { background: baseColor, border: '#ffffff' },
-            hover: { background: baseColor, border: '#ffffff' },
-          },
-          font: { color: '#ffffff', size: 12 },
-          borderWidth: n.group === 'hub' ? 3 : (n.group === 'orphan' ? 1 : 2),
-          borderWidthSelected: 4,
-          shapeProperties: n.group === 'orphan' ? { borderDashes: [5, 5] } : {},
+          _label: n.label, _folder: n.folder, _group: n.group,
+          _folderColor: n.group === 'orphan' ? '#94a3b8' : _folderColor(n.folder),
+          _backlinks: bc,
         });
       }
     }
@@ -122,17 +132,130 @@
         ? 'sem:' + [e.from, e.to].sort().join('<>')
         : e.from + '->' + e.to;
       if (!edgesDS.get(edgeId)) {
+        const es = edgeStyle(e.type, 0, c);
         edgesDS.add({
           id: edgeId, from: e.from, to: e.to,
-          color: { color: edgeColorByType(e.type, c), highlight: _SEMANTIC_EDGE_COLOR },
-          title: e.type,
-          dashes: isSemantic,
-          width: isSemantic ? 1 : 1.5,
+          color: es.color, title: e.type, dashes: es.dashes, width: es.width,
           arrows: isSemantic ? '' : { to: { enabled: true, scaleFactor: 0.5 } },
         });
       }
     }
+    _depths = computeDepths();
+    styleNodes(_depths);
+    styleEdges(_depths);
+    applyLOD();
+    updateCountChip();
   }
+
+  // BFS distance-from-focus over the accumulated edge set. Unreachable nodes are
+  // absent from the returned map; callers treat a missing entry as Infinity.
+  function computeDepths() {
+    const depths = new Map();
+    if (!nodesDS || !graphCenterPath || !nodesDS.get(graphCenterPath)) return depths;
+    const adj = new Map();
+    for (const e of edgesDS.get()) {
+      if (!adj.has(e.from)) adj.set(e.from, []);
+      if (!adj.has(e.to)) adj.set(e.to, []);
+      adj.get(e.from).push(e.to);
+      adj.get(e.to).push(e.from);
+    }
+    const queue = [graphCenterPath];
+    depths.set(graphCenterPath, 0);
+    while (queue.length) {
+      const id = queue.shift();
+      const d = depths.get(id);
+      for (const nb of adj.get(id) || []) {
+        if (!depths.has(nb)) { depths.set(nb, d + 1); queue.push(nb); }
+      }
+    }
+    return depths;
+  }
+
+  // A node is "semantic-match" if every edge touching it is a semantic edge.
+  function _semanticMatch(id) {
+    const touching = edgesDS.get().filter(e => e.from === id || e.to === id);
+    return touching.length > 0 && touching.every(e => e.title === 'semantic');
+  }
+
+  // Map each node to its Paper role by distance. Focus is the accent pill;
+  // depth-1 and hub nodes are box pills, and among those the semantic-match ones
+  // (every touching edge semantic) get the dashed-pill styling; all other nodes
+  // are dots with `label: ''`. applyLOD then promotes/demotes labels by zoom/hover.
+  function styleNodes(depths) {
+    if (!nodesDS) return;
+    const c = getColors();
+    const updates = [];
+    for (const n of nodesDS.get()) {
+      const d = depths.has(n.id) ? depths.get(n.id) : Infinity;
+      const folder = n._folderColor || _folderColor(n._folder);
+      let u;
+      if (d === 0) {
+        u = { id: n.id, shape: 'box', shapeProperties: { borderRadius: 20 },
+              color: { background: c.accent, border: c.accent }, borderWidth: 2,
+              font: { color: c.accentInk, size: 13 },
+              label: n._label };
+      } else if (d === 1 || (n._group === 'hub')) {
+        if (_semanticMatch(n.id)) {
+          u = { id: n.id, shape: 'box', shapeProperties: { borderRadius: 20, borderDashes: [4, 3] },
+                color: { background: c.accentSoft, border: c.accent }, borderWidth: 1.5,
+                font: { color: c.ink2, size: 12 }, label: n._label };
+        } else {
+          u = { id: n.id, shape: 'box', shapeProperties: { borderRadius: 20 },
+                color: { background: c.panel, border: folder },
+                borderWidth: n._group === 'hub' ? 3 : 1.5,
+                font: { color: c.ink2, size: 12 },
+                shadow: { enabled: true, size: 6, x: 0, y: 1, color: 'rgba(0,0,0,0.12)' },
+                label: n._label };
+        }
+      } else {
+        u = { id: n.id, shape: 'dot', value: Math.max(n._backlinks, 1),
+              color: { background: folder, border: c.edge }, borderWidth: 1.5,
+              shapeProperties: n._group === 'orphan' ? { borderDashes: [5, 5] } : {},
+              font: { color: c.ink2 },
+              label: '' };
+      }
+      updates.push(u);
+    }
+    nodesDS.update(updates);
+  }
+
+  // Coherence predicate: a node's label shows iff it is near the focus, OR it
+  // is a hub node, OR the graph is zoomed in past the threshold, OR the node
+  // is currently hovered.
+  function labelVisible(n) {
+    const d = _depths.has(n.id) ? _depths.get(n.id) : Infinity;
+    return d <= 1 || n._group === 'hub' || _zoomedIn || n.id === _hoveredId;
+  }
+
+  // Re-derive every node's label from labelVisible (never toggled ad hoc).
+  function applyLOD() {
+    if (!nodesDS) return;
+    const updates = nodesDS.get().map(n => ({
+      id: n.id, label: labelVisible(n) ? n._label : '',
+    }));
+    nodesDS.update(updates);
+  }
+
+  function styleEdges(depths) {
+    if (!edgesDS) return;
+    const c = getColors();
+    const updates = edgesDS.get().map(e => {
+      const dm = Math.max(depths.get(e.from) ?? Infinity, depths.get(e.to) ?? Infinity);
+      const es = edgeStyle(e.title, dm, c);
+      return { id: e.id, color: es.color, dashes: es.dashes, width: es.width };
+    });
+    edgesDS.update(updates);
+  }
+
+  // Re-read Paper vars and restyle everything (a canvas doesn't inherit CSS-var
+  // changes, so the graph must re-read on host theme flips).
+  function refreshColors() {
+    if (!nodesDS) return;
+    styleNodes(_depths);
+    styleEdges(_depths);
+    applyLOD();
+  }
+  window.addEventListener('vault-theme-changed', refreshColors);
 
   async function expandNode(path) {
     try {
@@ -229,6 +352,22 @@
     document.getElementById('graph-mini-card').style.display = 'none';
   }
 
+  function updateCountChip() {
+    const chip = document.getElementById('graph-count');
+    if (chip && nodesDS) chip.textContent = nodesDS.length + (nodesDS.length === 1 ? ' note' : ' notes');
+  }
+  document.getElementById('graph-zoom-in')?.addEventListener('click', () => {
+    if (network) network.moveTo({ scale: network.getScale() * 1.3 });
+  });
+  document.getElementById('graph-zoom-out')?.addEventListener('click', () => {
+    if (network) network.moveTo({ scale: network.getScale() / 1.3 });
+  });
+
+  // Narrow-panel legend collapse chip
+  document.getElementById('graph-legend-chip')?.addEventListener('click', () => {
+    document.getElementById('graph-legend')?.classList.toggle('open');
+  });
+
   // Send graph summary to Claude
   document.getElementById('graph-send-btn').addEventListener('click', () => {
     if (!nodesDS || nodesDS.length === 0) return;
@@ -248,15 +387,7 @@
   document.getElementById('graph-semantic-btn').addEventListener('click', () => {
     semanticEnabled = !semanticEnabled;
     const btn = document.getElementById('graph-semantic-btn');
-    if (semanticEnabled) {
-      btn.style.background = _SEMANTIC_EDGE_COLOR;
-      btn.style.color = '#ffffff';
-      btn.style.border = 'none';
-    } else {
-      btn.style.background = 'var(--color-background-secondary)';
-      btn.style.color = 'var(--color-text-primary)';
-      btn.style.border = '1px solid var(--color-border-primary)';
-    }
+    btn.classList.toggle('active', semanticEnabled);
     // Reload current graph with updated setting
     if (graphCenterPath) loadGraph(graphCenterPath);
   });

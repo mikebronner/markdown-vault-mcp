@@ -81,10 +81,51 @@ class TestGraphExplorerHTML:
         html = await get_app_html()
         # Node size proportional to backlink_count via value
         assert "backlink_count" in html
-        # Edge color by type
-        assert "edgeColorByType" in html
+        # Edge color/style by type
+        assert "edgeStyle" in html
         # Orphan dashed border
         assert "borderDashes" in html
+        # Edge styling applied via styleEdges
+        assert "styleEdges" in html
+
+    async def test_bfs_distance_computed(self) -> None:
+        html = await get_app_html()
+        assert "computeDepths" in html
+        # BFS from the center over the current edge set.
+        assert "graphCenterPath" in html
+
+    async def test_node_roles_pills_and_dots(self) -> None:
+        html = await get_app_html()
+        assert "styleNodes" in html
+        # Focus/neighbor nodes are box pills; distant nodes are dots.
+        assert "'box'" in html
+        assert "shapeProperties" in html
+        # Folder colors preserved for node fills.
+        assert "_folderColor" in html
+        # Label gate: distant nodes get an empty label.
+        assert "label: ''" in html or "label:''" in html
+
+    async def test_focus_node_accent_pill(self) -> None:
+        html = await get_app_html()
+        assert "background: c.accent, border: c.accent" in html
+
+    async def test_lod_zoom_reveal(self) -> None:
+        html = await get_app_html()
+        assert "network.on('zoom'" in html
+        assert "LABEL_ZOOM_THRESHOLD" in html
+        assert "1.35" in html
+
+    async def test_lod_hover_reveal(self) -> None:
+        html = await get_app_html()
+        assert "network.on('hoverNode'" in html
+        assert "network.on('blurNode'" in html
+        assert "_hoveredId = params.node" in html
+        assert "applyLOD" in html
+
+    async def test_lod_graceful_font_floor(self) -> None:
+        html = await get_app_html()
+        # scaling.label acts as a graceful adjunct, not the mechanism.
+        assert "drawThreshold: 6" in html
 
     async def test_send_to_claude_button(self) -> None:
         html = await get_app_html()
@@ -113,7 +154,92 @@ class TestGraphExplorerHTML:
     async def test_host_css_variables_in_graph(self) -> None:
         html = await get_app_html()
         assert "getColors" in html
-        assert "--color-text-info" in html
+
+    async def test_graph_reads_paper_tokens(self) -> None:
+        html = await get_app_html()
+        assert "getColors" in html
+        # Pin the actual getColors read sites, not the shared CSS tokens.
+        assert "v('--accent'" in html
+        assert "v('--edge'" in html
+
+    async def test_graph_semantic_match_labelled(self) -> None:
+        html = await get_app_html()
+        # _semanticMatch drives the dashed-pill styling in styleNodes.
+        assert "_semanticMatch" in html
+
+    async def test_graph_edge_lod_fade(self) -> None:
+        html = await get_app_html()
+        # edgeStyle fades link edges once the farthest endpoint is >= depth 2.
+        assert "depthMax >= 2" in html
+
+    async def test_graph_hub_labels_always_visible(self) -> None:
+        html = await get_app_html()
+        # labelVisible must treat hub nodes as always-labelled.
+        assert "n._group === 'hub'" in html
+
+    async def test_lod_predicate_pinned(self) -> None:
+        html = await get_app_html()
+        # Pin the whole label-visibility decision so it can't be gutted silently.
+        assert (
+            "return d <= 1 || n._group === 'hub' || _zoomedIn || n.id === _hoveredId"
+            in html
+        )
+
+    async def test_edge_lod_fade_outcome(self) -> None:
+        html = await get_app_html()
+        # Pin the fade itself, not just the `depthMax >= 2` threshold.
+        assert "opacity: far ? 0.5 : 1" in html
+        assert "width: far ? 1 : 1.6" in html
+
+    async def test_semantic_match_dashed_pill_styling(self) -> None:
+        html = await get_app_html()
+        assert "borderDashes: [4, 3]" in html
+        assert "background: c.accentSoft, border: c.accent" in html
+
+    async def test_zoom_crossing_triggers_relabel(self) -> None:
+        html = await get_app_html()
+        assert "if (zoomed !== _zoomedIn) { _zoomedIn = zoomed; applyLOD(); }" in html
+
+    async def test_legend_chip_toggle_wired(self) -> None:
+        html = await get_app_html()
+        assert "classList.toggle('open')" in html
+
+    async def test_graph_dotted_grid_surface(self) -> None:
+        html = await get_app_html()
+        assert "radial-gradient" in html
+        assert "#graph-container" in html
+
+    async def test_zoom_control_overlay(self) -> None:
+        html = await get_app_html()
+        assert 'id="graph-zoom-in"' in html
+        assert 'id="graph-zoom-out"' in html
+        assert "network.moveTo" in html
+
+    async def test_node_count_chip(self) -> None:
+        html = await get_app_html()
+        assert 'id="graph-count"' in html
+        assert "updateCountChip" in html
+
+    async def test_graph_legend_matches_drawing(self) -> None:
+        html = await get_app_html()
+        assert 'id="graph-legend"' in html
+        # "semantic" and "more" also occur elsewhere in the bundle (Paper
+        # semantic tokens, "N more properties"), so pin the exact legend
+        # entry markup rather than the bare words.
+        for entry_markup in (
+            '<span class="lg-line lg-solid"></span>wikilink',
+            '<span class="lg-line lg-dashed"></span>semantic',
+            '<span class="lg-pill lg-focus"></span>focus note',
+            '<span class="lg-pill lg-linked"></span>linked note',
+            '<span class="lg-dot"></span>more (hover)',
+        ):
+            assert entry_markup in html
+
+    async def test_graph_legend_collapse_chip(self) -> None:
+        html = await get_app_html()
+        assert 'id="graph-legend-chip"' in html
+        assert "graph-legend-chip" in html
+        assert "legend" in html
 
 
 # ---------------------------------------------------------------------------
@@ -318,9 +444,17 @@ class TestSemanticGraphHTML:
         assert "include_semantic" in html
         assert "semanticEnabled" in html
 
-    async def test_semantic_edge_color_constant(self) -> None:
+    async def test_semantic_edge_is_dashed_accent_not_purple(self) -> None:
         html = await get_app_html()
-        assert "_SEMANTIC_EDGE_COLOR" in html
+        # The old purple semantic constant is gone; semantic reads as dashed accent.
+        assert "#a855f7" not in html
+        assert "_SEMANTIC_EDGE_COLOR" not in html
+        assert "isSemantic" in html
+        assert "dashes" in html
+
+    async def test_semantic_edge_accent_color(self) -> None:
+        html = await get_app_html()
+        assert "color: c.accent, opacity: 0.75" in html
 
     async def test_semantic_edge_dashed(self) -> None:
         html = await get_app_html()
@@ -336,6 +470,21 @@ class TestSemanticGraphHTML:
     async def test_cross_view_currentpath(self) -> None:
         html = await get_app_html()
         assert "currentPath" in html
+
+    async def test_graph_refreshes_on_theme_change(self) -> None:
+        html = await get_app_html()
+        # Pin the actual event binding (listener + dispatch), not just the
+        # string, so a stub can't satisfy the test.
+        assert "window.addEventListener('vault-theme-changed', refreshColors)" in html
+        # Pins core.js's dispatch specifically, not only graph.js's listener.
+        assert "new CustomEvent('vault-theme-changed'" in html
+
+    async def test_semantic_toggle_active_is_accent(self) -> None:
+        html = await get_app_html()
+        # Pins the toggle wiring + the CSS rule (accent-soft alone is a
+        # shared token used by other components).
+        assert "classList.toggle('active', semanticEnabled)" in html
+        assert ".action-btn.active {" in html
 
 
 # ---------------------------------------------------------------------------
