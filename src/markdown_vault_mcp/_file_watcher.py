@@ -139,7 +139,16 @@ def _resolve_internal_dirs(internal_dirs: Sequence[Path]) -> list[Path]:
     for d in internal_dirs:
         try:
             resolved.append(d.resolve())
-        except OSError:
+        except (OSError, RuntimeError):
+            # Unresolvable dir (see _resolve_or_original for the two cases).
+            # Dropping a protected dir fails open on the #830 guard — its child
+            # could then be watched — so warn rather than drop silently.
+            logger.warning(
+                "file_watcher: could not resolve internal dir=%s; it will not "
+                "be protected from watching",
+                d,
+                exc_info=True,
+            )
             continue
     return resolved
 
@@ -157,15 +166,60 @@ def _contains_internal_dir(child: Path, internal_dirs: frozenset[Path]) -> bool:
         internal_dirs: Resolved vault-internal directories to protect.
 
     Returns:
-        ``True`` when *child* should not be watched.
+        ``True`` when *child* should not be watched. An unresolvable *child*
+        returns ``False`` (a symlink-loop child is already screened out earlier
+        by the caller's ``is_dir`` check).
     """
     try:
         child_resolved = child.resolve()
-    except OSError:
+    except (OSError, RuntimeError):
+        # Unresolvable child (see _resolve_or_original for the two cases); it
+        # cannot be matched against the resolved internal dirs, so classify it as
+        # non-internal. A symlink-loop child is screened by is_dir() upstream, so
+        # the realistic trigger here is OSError; log so it is not silent.
+        logger.debug(
+            "file_watcher: could not resolve child=%s; treating as non-internal",
+            child,
+            exc_info=True,
+        )
         return False
     return any(
         d == child_resolved or d.is_relative_to(child_resolved) for d in internal_dirs
     )
+
+
+def _resolve_or_original(path: Path) -> Path:
+    """Resolve *path* to its realpath, falling back to *path* on ``OSError`` /
+    ``RuntimeError``.
+
+    A watch root must be scheduled on its resolved form so it matches watchdog's
+    realpath-prefixed FSEvents delivery (see :func:`_derive_watch_roots`).
+    ``Path.resolve`` (``strict=False``) resolves best-effort and does *not* raise
+    on a broken symlink or a missing / unreadable intermediate component — it
+    returns the partially-resolved path. Two failure modes remain, and this guard
+    catches both: a **symlink loop** raises ``RuntimeError`` on Python < 3.13
+    (3.13+ returns the partially-resolved path instead), and a pathological path
+    can raise ``OSError`` on some platforms / filesystems.
+    On either we keep the unresolved path — the pre-resolution behavior, correct on
+    inotify / ReadDirectoryChangesW — rather than dropping the watch or crashing
+    ``start()``, and log at WARNING so the degraded case is visible.
+
+    Args:
+        path: Watch path (``source_dir`` or a top-level child) to resolve.
+
+    Returns:
+        The resolved path, or *path* unchanged when resolution raises
+        ``OSError`` / ``RuntimeError``.
+    """
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        logger.warning(
+            "file_watcher: could not resolve watch path=%s; using it unresolved",
+            path,
+            exc_info=True,
+        )
+        return path
 
 
 def _derive_watch_roots(
@@ -194,6 +248,23 @@ def _derive_watch_roots(
     zero-``source_dir``-rooted-FSEvents guarantee exactly where the caller cannot
     observe it. The WARNING still logs.
 
+    Every returned root is resolved with :meth:`Path.resolve` where it can be
+    (a root whose path cannot be resolved — a symlink loop, or a rare
+    ``OSError`` — is kept unresolved with a WARNING via
+    :func:`_resolve_or_original` rather than dropped, degrading to the
+    pre-resolution behavior). watchdog's
+    FSEvents emitter (macOS) resolves the scheduled watch path with
+    ``os.path.realpath`` and delivers events with realpath-prefixed
+    ``src_path``s, so a watch scheduled on a symlinked child (farm layouts) or
+    on a ``source_dir`` under a symlinked prefix (``/var`` vs ``/private/var``)
+    would filter every event against a root that is never a prefix of the
+    delivered paths — ``relative_to`` raises and each event is silently
+    dropped. Scheduling and filtering on the resolved root keeps the two in
+    agreement on every platform: inotify and ReadDirectoryChangesW deliver
+    events prefixed with the path as scheduled, which is then the resolved
+    path too. Prune rules still match the child's name *inside* ``source_dir``
+    (the vault-visible name), not its resolved target's basename.
+
     Reuses :func:`~markdown_vault_mcp.utils.fs._dir_prune_rules` and
     :func:`~markdown_vault_mcp.utils.fs._should_prune_dir` as the single source
     of truth for prune rules, matching ``iter_markdown_files``.
@@ -210,13 +281,15 @@ def _derive_watch_roots(
             that is or contains one of these is skipped entirely.
 
     Returns:
-        Watch roots to schedule, the non-recursive ``source_dir`` root last when
-        ``root_floor`` is True. On an unreadable or vanished ``source_dir``, the
-        single non-recursive ``source_dir`` root when ``root_floor`` is True, or
-        ``[]`` when it is False.
+        Resolved watch roots to schedule, the non-recursive resolved
+        ``source_dir`` root last when ``root_floor`` is True. On an unreadable
+        or vanished ``source_dir``, the single non-recursive resolved
+        ``source_dir`` root when ``root_floor`` is True, or ``[]`` when it is
+        False.
     """
     anchored, anydepth = _dir_prune_rules(exclude_patterns or ())
     protected = frozenset(_resolve_internal_dirs(internal_dirs))
+    source_dir = _resolve_or_original(source_dir)
     roots: list[_WatchRoot] = []
     try:
         children = sorted(source_dir.iterdir())
@@ -239,7 +312,7 @@ def _derive_watch_roots(
             continue
         if _contains_internal_dir(child, protected):
             continue
-        roots.append(_WatchRoot(child, recursive=True))
+        roots.append(_WatchRoot(_resolve_or_original(child), recursive=True))
 
     if root_floor:
         roots.append(_WatchRoot(source_dir, recursive=False))
