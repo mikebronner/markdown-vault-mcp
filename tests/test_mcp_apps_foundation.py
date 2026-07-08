@@ -855,6 +855,9 @@ class TestAppToolLinkedData:
     async def test_vault_graph_hubs_with_links(self) -> None:
         server = make_server()
         async with Client(server) as client:
+            # Drain the boot BuildIndex first: the hubs backlink path
+            # requires a built index (see test_hubs_returns_graph).
+            await wait_for_mcp_writer_drain(client)
             result = await client.call_tool(_hashed("vault_graph_hubs"), {})
             data = _parse_tool_data(result)
             assert "nodes" in data

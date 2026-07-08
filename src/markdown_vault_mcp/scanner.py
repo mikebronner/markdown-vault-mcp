@@ -722,33 +722,55 @@ def extract_section(text: str, heading: str) -> str | None:
     return None
 
 
-def _resolve_title(metadata: dict[str, Any], content: str, path: Path) -> str:
+def _frontmatter_title(metadata: dict[str, Any], key: str) -> str | None:
+    """Return the stripped string value of *key*, or ``None`` when unusable."""
+    value = metadata.get(key)
+    if isinstance(value, str):
+        title = value.strip()
+        if title:
+            return title
+    return None
+
+
+def _resolve_title(
+    metadata: dict[str, Any],
+    content: str,
+    path: Path,
+    title_field: str = "title",
+) -> str:
     """Resolve the document title using the priority order from the design spec.
 
-    Priority: frontmatter ``title`` field → first H1 heading → filename
-    without extension.
+    Priority: frontmatter *title_field* → frontmatter ``title`` (only when
+    *title_field* is not ``"title"``) → first H1 heading → filename without
+    extension. Non-string or empty frontmatter values are skipped.
 
     Args:
         metadata: Parsed frontmatter dict.
         content: Markdown body (frontmatter stripped).
         path: Absolute path to the file (used for filename fallback).
+        title_field: Frontmatter key consulted first for the title.
 
     Returns:
         Resolved title string.
     """
-    # 1. Frontmatter title field.
-    if "title" in metadata and isinstance(metadata["title"], str):
-        title = metadata["title"].strip()
-        if title:
+    # 1. Configured frontmatter title field.
+    title = _frontmatter_title(metadata, title_field)
+    if title is not None:
+        return title
+
+    # 2. Standard ``title`` field, when a custom field was configured.
+    if title_field != "title":
+        title = _frontmatter_title(metadata, "title")
+        if title is not None:
             return title
 
-    # 2. First H1 heading in content.
+    # 3. First H1 heading in content.
     for line in content.splitlines():
         m = re.match(r"^#\s+(.+)$", line.rstrip())
         if m:
             return m.group(1).strip()
 
-    # 3. Filename without extension.
+    # 4. Filename without extension.
     return path.stem
 
 
@@ -965,6 +987,8 @@ def parse_note(
     path: Path,
     source_dir: Path,
     chunk_strategy: ChunkStrategy | None = None,
+    *,
+    title_field: str = "title",
 ) -> ParsedNote:
     """Parse a single markdown file into a ParsedNote.
 
@@ -977,6 +1001,8 @@ def parse_note(
             document's relative identity path.
         chunk_strategy: Chunking strategy to apply. Defaults to
             :class:`HeadingChunker`.
+        title_field: Frontmatter key consulted first when resolving the
+            document title (see :func:`_resolve_title`).
 
     Returns:
         A :class:`~markdown_vault_mcp.types.ParsedNote` instance.
@@ -1002,7 +1028,7 @@ def parse_note(
     metadata: dict[str, Any] = dict(post.metadata)
     body: str = post.content
 
-    title = _resolve_title(metadata, body, path)
+    title = _resolve_title(metadata, body, path, title_field)
 
     # Relative path from source_dir, always using forward slashes.
     rel_path = path.relative_to(source_dir)
@@ -1038,6 +1064,7 @@ def scan_directory(
     required_frontmatter: list[str] | None = None,
     chunk_strategy: ChunkStrategy | None = None,
     on_skip: Callable[[SkippedFile], None] | None = None,
+    title_field: str = "title",
 ) -> Iterator[ParsedNote]:
     """Discover and parse all markdown files under ``source_dir``.
 
@@ -1069,6 +1096,8 @@ def scan_directory(
             transient ``OSError`` skips (self-healing). ``None`` (default)
             preserves the historical behaviour of silently skipping such
             files (#775).
+        title_field: Frontmatter key consulted first when resolving each
+            document's title; passed through to :func:`parse_note`.
 
     Yields:
         Parsed notes in filesystem traversal order.
@@ -1107,7 +1136,9 @@ def scan_directory(
 
         # Parse the file; skip on decode / I/O / YAML errors.
         try:
-            note = parse_note(abs_path, source_dir, chunk_strategy)
+            note = parse_note(
+                abs_path, source_dir, chunk_strategy, title_field=title_field
+            )
         except UnicodeDecodeError as exc:
             logger.warning(
                 "Skipping %s: cannot decode as UTF-8", abs_path, exc_info=False

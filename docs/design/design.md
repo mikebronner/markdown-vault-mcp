@@ -191,7 +191,15 @@ searches and merge client-side.
 See the [Database Schema](#database-schema) section for full DDL.
 
 Generic columns replacing the corpus-specific `cluster`/`topics`:
-`path`, `title`, `folder`, `heading`, `content`.
+`path`, `title`, `folder`, `heading`, `content`, `summary`. The trailing
+`summary` column carries the newline-joined scalar values of the configured
+`SEARCHABLE_FIELDS` on each document's chunk-0 row only (empty everywhere
+else), making frontmatter text keyword-searchable — including `summary:term`
+column filters — without perturbing per-chunk `content`. FTS5 cannot
+`ALTER TABLE ADD COLUMN`, so a legacy five-column table is migrated in place
+at open: dropped, recreated with six columns, and repopulated in pure SQL
+from `sections`/`documents` (no filesystem rescan; the `meta` table — and
+with it the warm-restart sentinel — survives).
 
 Domain-specific filtering (by cluster, topic, tag) happens via the
 `document_tags` table, not FTS5 columns.
@@ -245,7 +253,50 @@ Four complementary mechanisms improve result diversity and bound LLM context cos
 | `MARKDOWN_VAULT_MCP_LENGTH_DOWNWEIGHT_ALPHA` | `0.25` | Strength of length downweight. `0` disables. |
 | `MARKDOWN_VAULT_MCP_MAX_CHUNK_WORDS` | `400` | Adaptive chunker threshold. Set to a large value to disable. |
 
-**Pipeline order:** Per-channel length downweight → fuse (RRF for hybrid) → cap per path → snippet projection → return `limit` results. See **Field collapsing** below for the post-433 grouping step.
+**Pipeline order:** Per-channel length downweight → folder boost → fuse (RRF for hybrid; the folder boost then applies to the fused scores) → cap per path → snippet projection → return `limit` results. See **Field collapsing** below for the post-433 grouping step.
+
+### Curated Ranking
+
+Five opt-in knobs let an operator tune retrieval for curated vaults (all
+defaults are exact behavioural no-ops):
+
+1. **Title field** (`MARKDOWN_VAULT_MCP_TITLE_FIELD`). Title resolution
+   consults the configured frontmatter field first, then falls back to
+   `title` (when a custom field is set), the first H1 heading, and the
+   filename stem. Threaded to every `parse_note` call site — including
+   `DocumentManager` — so `read()` titles never diverge from search titles.
+2. **Searchable frontmatter** (`MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS`).
+   Scalar values of the listed fields populate the FTS `summary` column
+   (chunk-0 row only), making summaries/descriptions keyword-searchable.
+3. **Weighted BM25** (`MARKDOWN_VAULT_MCP_FTS_WEIGHTS`). Per-column weights
+   are persisted into the FTS5 rank configuration
+   (`INSERT INTO notes_fts(notes_fts, rank) VALUES('rank', 'bm25(...)')`)
+   at init, so every `f.rank` read — including the snippet re-query — ranks
+   consistently. All-`1.0`/unset writes the default `bm25()` back
+   (idempotent reset).
+4. **Folder ranking boost** (`MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS`). Positive
+   scores are scaled by the deepest matching folder-prefix weight in all
+   three search modes, immediately before per-file grouping (post-RRF and
+   multiplicative in hybrid). Query-time only; `get_similar`/`get_context`
+   are deliberately unaffected.
+5. **Context-enriched embeddings** (`MARKDOWN_VAULT_MCP_EMBED_CONTEXT`). A
+   single shared `EmbedTextBuilder` (constructed once in `Vault.__init__`)
+   prefixes embedding input with the note title, chunk heading, and — first
+   chunk only — the searchable-field preamble. Every embedding site (hot
+   reindex, cold build, boot convergence, deferred flush) uses the builder,
+   so convergence cannot "heal" enriched vectors back to plain; the chunk's
+   preamble participates in the convergence signature so offline
+   summary-only edits re-embed. The active format token
+   (`v1` / `v2;fields=...`) is persisted in the vector sidecar's
+   `index_metadata`; a mismatch at load raises
+   `VectorIndexCompatibilityError`, which routes to the existing
+   `build_embeddings(force=True)` self-heal.
+
+`TITLE_FIELD` and `SEARCHABLE_FIELDS` are recorded in the FTS chunking
+provenance (alongside the embedding model and char-cap override, #649), so
+flipping either rejects the warm-restart short-circuit and cold-rebuilds
+once; absent keys read back as the defaults, keeping pre-upgrade indexes
+warm.
 
 ### Field collapsing
 
@@ -1398,6 +1449,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
     folder,
     heading,
     content,
+    summary,
     tokenize='porter unicode61'
 );
 ```
@@ -2051,6 +2103,11 @@ For MCP server deployment:
 | `MARKDOWN_VAULT_MCP_INDEX_PATH` | SQLite index path | in-memory |
 | `MARKDOWN_VAULT_MCP_EMBEDDINGS_PATH` | Embeddings directory | disabled |
 | `MARKDOWN_VAULT_MCP_INDEXED_FIELDS` | Comma-separated frontmatter fields to index | none |
+| `MARKDOWN_VAULT_MCP_TITLE_FIELD` | Frontmatter field used as the document title | `title` |
+| `MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS` | Comma-separated frontmatter fields indexed into the FTS `summary` column | none |
+| `MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS` | Folder-prefix score multipliers (`prefix:weight,...`) | none |
+| `MARKDOWN_VAULT_MCP_FTS_WEIGHTS` | Per-column BM25 weights (`column:weight,...`) | all `1.0` |
+| `MARKDOWN_VAULT_MCP_EMBED_CONTEXT` | Enrich embedding input with title/heading/searchable-field context | `false` |
 | `MARKDOWN_VAULT_MCP_REQUIRED_FIELDS` | Comma-separated required frontmatter fields | none |
 | `MARKDOWN_VAULT_MCP_EXCLUDE` | Comma-separated glob patterns to exclude | none |
 | `MARKDOWN_VAULT_MCP_TEMPLATES_FOLDER` | Relative folder path for note templates used by `create_from_template` | `_templates` |

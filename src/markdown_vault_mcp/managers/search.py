@@ -117,6 +117,67 @@ def _apply_length_downweight(
     return [r for r, _ in adjusted]
 
 
+class _FolderBoostableRow(Protocol):
+    """Row contract consumed by the folder-boost helper.
+
+    :class:`~markdown_vault_mcp.types.FTSResult`, :class:`_SemanticRow`, and
+    :class:`_GroupableFTS` all satisfy this Protocol structurally.  All
+    callers are dataclasses so :func:`dataclasses.replace` is used to
+    produce adjusted-score copies without mutating the input.
+    """
+
+    folder: str
+    score: float
+
+
+_FolderBoostableT = TypeVar("_FolderBoostableT", bound=_FolderBoostableRow)
+
+
+def _folder_weight(folder: str, weights: dict[str, float]) -> float:
+    """Return the weight of the deepest configured prefix matching *folder*.
+
+    A prefix ``K`` matches folder ``F`` when ``F == K`` or ``F`` starts with
+    ``K + "/"`` (boundary match, so ``"Project"`` never matches
+    ``"Projects"``).  When several prefixes match, the longest (deepest)
+    one wins.  No match returns ``1.0``.
+    """
+    best_key: str | None = None
+    for key in weights:
+        if (folder == key or folder.startswith(key + "/")) and (
+            best_key is None or len(key) > len(best_key)
+        ):
+            best_key = key
+    return 1.0 if best_key is None else weights[best_key]
+
+
+def _apply_folder_boost(
+    rows: list[_FolderBoostableT], *, weights: dict[str, float] | None
+) -> list[_FolderBoostableT]:
+    """Scale positive row scores by their folder's configured weight.
+
+    Returns a new list re-sorted by descending adjusted score; input rows
+    are not mutated (adjusted rows are :func:`dataclasses.replace` copies).
+    Only positive scores are scaled — a negative score (possible only for
+    raw cosine similarities) is left untouched so a demoting weight cannot
+    accidentally promote it.  Empty/absent *weights* is the identity.
+    """
+    if not weights or not rows:
+        return list(rows)
+
+    out: list[_FolderBoostableT] = []
+    for row in rows:
+        weight = _folder_weight(row.folder, weights)
+        if weight != 1.0 and row.score > 0:
+            # Protocols can't promise __dataclass_fields__; the helper's
+            # contract is "callers pass dataclasses" (FTSResult /
+            # _SemanticRow / _GroupableFTS all are), enforced at runtime by
+            # replace() itself.
+            row = _dc_replace(row, score=row.score * weight)  # type: ignore[type-var]
+        out.append(row)
+    out.sort(key=lambda r: r.score, reverse=True)
+    return out
+
+
 class _GroupableRow(Protocol):
     """Row contract consumed by :func:`_group_by_path`.
 
@@ -309,8 +370,14 @@ class SearchManager:
         link_manager: Optional :class:`LinkManager` for context queries.
         rebuild_embeddings: Callback to rebuild all embeddings from scratch.
             Invoked by ``_load_vectors`` on any unrecoverable sidecar fault —
-            a provider/model mismatch, a row-count mismatch, or a
-            truncated/zero-byte/incomplete sidecar.
+            a provider/model mismatch, an embedding-text format mismatch, a
+            row-count mismatch, or a truncated/zero-byte/incomplete sidecar.
+        folder_weights: Folder-prefix score multipliers applied to every
+            search mode just before file grouping.  ``None`` disables the
+            boost.
+        embed_text_format: The current embedding-text format token; a
+            persisted vector sidecar with a different token routes to
+            ``rebuild_embeddings``.
     """
 
     def __init__(
@@ -328,6 +395,8 @@ class SearchManager:
         chunks_per_file: int = 2,
         snippet_words: int = 200,
         length_downweight_alpha: float = 0.25,
+        folder_weights: dict[str, float] | None = None,
+        embed_text_format: str = "v1",
     ) -> None:
         self._fts = fts
         self._source_dir = source_dir
@@ -341,6 +410,8 @@ class SearchManager:
         self._chunks_per_file = chunks_per_file
         self._snippet_words = snippet_words
         self._length_downweight_alpha = length_downweight_alpha
+        self._folder_weights = folder_weights
+        self._embed_text_format = embed_text_format
 
         # Vector index is loaded lazily (only if embeddings_path is set).
         self._vectors: VectorIndex | None = None
@@ -411,6 +482,7 @@ class SearchManager:
             set_vectors=lambda v: setattr(self, "_vectors", v),
             rebuild=self._rebuild_embeddings,
             logger=logger,
+            embed_text_format=self._embed_text_format,
         )
 
     def _get_frontmatter(self, path: str) -> dict[str, Any]:
@@ -632,6 +704,7 @@ class SearchManager:
         downweighted = _apply_length_downweight(
             raw, alpha=self._length_downweight_alpha
         )
+        downweighted = _apply_folder_boost(downweighted, weights=self._folder_weights)
         groupable: list[_GroupableFTS] = [
             _GroupableFTS(
                 path=r.path,
@@ -787,6 +860,7 @@ class SearchManager:
         downweighted = _apply_length_downweight(
             rows, alpha=self._length_downweight_alpha
         )
+        downweighted = _apply_folder_boost(downweighted, weights=self._folder_weights)
         groups = _group_by_path(
             downweighted, chunks_per_file=chunks_per_file, file_limit=limit
         )
@@ -946,6 +1020,11 @@ class SearchManager:
             )
             for k in sorted_keys
         ]
+        # Post-RRF multiplicative boost: RRF scores are always positive, so
+        # the folder weight scales them directly before file grouping.
+        groupable_rows = _apply_folder_boost(
+            groupable_rows, weights=self._folder_weights
+        )
         groups = _group_by_path(
             groupable_rows, chunks_per_file=chunks_per_file, file_limit=limit
         )

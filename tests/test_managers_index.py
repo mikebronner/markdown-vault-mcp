@@ -331,9 +331,9 @@ class TestSkipStateMemory:
         parse_calls: list[str] = []
         original_parse = index_module.parse_note
 
-        def counting_parse(abs_path, source_dir, chunk_strategy):
+        def counting_parse(abs_path, source_dir, chunk_strategy, **kwargs):
             parse_calls.append(str(abs_path))
-            return original_parse(abs_path, source_dir, chunk_strategy)
+            return original_parse(abs_path, source_dir, chunk_strategy, **kwargs)
 
         monkeypatch.setattr(index_module, "parse_note", counting_parse)
 
@@ -421,7 +421,7 @@ class TestSkipStateMemory:
 
         original_parse = index_module.parse_note
 
-        def failing_parse(abs_path, source_dir, chunk_strategy):  # noqa: ARG001
+        def failing_parse(abs_path, source_dir, chunk_strategy, **kwargs):  # noqa: ARG001
             raise OSError("transient I/O error")
 
         monkeypatch.setattr(index_module, "parse_note", failing_parse)
@@ -448,7 +448,7 @@ class TestSkipStateMemory:
 
         parse_calls: list[str] = []
 
-        def broken_parse(abs_path, source_dir, chunk_strategy):  # noqa: ARG001
+        def broken_parse(abs_path, source_dir, chunk_strategy, **kwargs):  # noqa: ARG001
             parse_calls.append(str(abs_path))
             raise ValueError("malformed note")
 
@@ -492,7 +492,7 @@ class TestSkipStateMemory:
 
         # A non-OSError parse failure is a deterministic skip recorded via
         # _record_skip (the path that hashes the file).
-        def failing_parse(abs_path, source_dir, chunk_strategy):  # noqa: ARG001
+        def failing_parse(abs_path, source_dir, chunk_strategy, **kwargs):  # noqa: ARG001
             raise ValueError("unparseable")
 
         monkeypatch.setattr(index_module, "parse_note", failing_parse)
@@ -1456,10 +1456,10 @@ class TestReindexSkipReasons:
 
             real_parse = index_module.parse_note
 
-            def maybe_explode(abs_path, source_dir, chunk_strategy):
+            def maybe_explode(abs_path, source_dir, chunk_strategy, **kwargs):
                 if abs_path.name == "boom.md":
                     raise RuntimeError("chunker exploded")
-                return real_parse(abs_path, source_dir, chunk_strategy)
+                return real_parse(abs_path, source_dir, chunk_strategy, **kwargs)
 
             monkeypatch.setattr(index_module, "parse_note", maybe_explode)
             vault.index.reindex()
@@ -1550,3 +1550,120 @@ class TestReindexSkipReasons:
             assert second["bad.md"].detail == first["bad.md"].detail
         finally:
             vault.close()
+
+
+# ---------------------------------------------------------------------------
+# Context-enriched embedding text (curated ranking)
+# ---------------------------------------------------------------------------
+
+
+class _CapturingProvider:
+    """Deterministic provider that records every embedded text."""
+
+    provider_name = "capturing"
+    model_name = "capturing-model"
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.texts.extend(texts)
+        return [[1.0, 0.0] for _ in texts]
+
+
+def _enriched_vault(tmp_path: Path) -> Path:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "doc.md").write_text(
+        "---\ntitle: Enriched Doc\nsummary: A crisp summary.\n---\n"
+        "# Enriched Doc\n\nplain chunk body\n",
+        encoding="utf-8",
+    )
+    return vault
+
+
+def _enriched_mgr(
+    vault: Path, tmp_path: Path, provider: _CapturingProvider
+) -> tuple[IndexManager, FTSIndex, dict]:
+    from markdown_vault_mcp.embed_text import EmbedTextBuilder
+
+    builder = EmbedTextBuilder(embed_context=True, searchable_fields=("summary",))
+    return _make_index_mgr(
+        vault,
+        tmp_path,
+        fts=FTSIndex(db_path=":memory:", searchable_frontmatter_fields=["summary"]),
+        embeddings_path=tmp_path / "embeddings",
+        embedding_provider=provider,
+        embed_text_builder=builder,
+    )
+
+
+class TestEmbedTextEnrichment:
+    def test_cold_build_embeds_enriched_text_and_stores_preamble(
+        self, tmp_path: Path
+    ) -> None:
+        provider = _CapturingProvider()
+        vault = _enriched_vault(tmp_path)
+        mgr, _fts, holder = _enriched_mgr(vault, tmp_path, provider)
+        mgr.build_index()
+        assert mgr.build_embeddings() == 1
+
+        # Short doc -> one heading-less chunk whose content is the whole
+        # body; v2 prefixes the title line and the first-chunk preamble.
+        assert provider.texts == [
+            "Enriched Doc\nA crisp summary.\n\n# Enriched Doc\n\nplain chunk body"
+        ]
+        rows = holder["vectors"].chunks_by_path()["doc.md"]
+        assert rows[0]["preamble"] == "A crisp summary."
+        # Displayed content stays the raw chunk text.
+        assert rows[0]["content"] == "# Enriched Doc\n\nplain chunk body"
+
+    def test_hot_reindex_embeds_enriched_text(self, tmp_path: Path) -> None:
+        provider = _CapturingProvider()
+        vault = _enriched_vault(tmp_path)
+        mgr, _fts, holder = _enriched_mgr(vault, tmp_path, provider)
+        mgr.build_index()
+        mgr.build_embeddings()
+        provider.texts.clear()
+
+        (vault / "doc.md").write_text(
+            "---\ntitle: Enriched Doc\nsummary: A crisp summary.\n---\n"
+            "# Enriched Doc\n\nedited chunk body\n",
+            encoding="utf-8",
+        )
+        result = mgr.reindex()
+        assert result.modified == 1
+        assert provider.texts == [
+            "Enriched Doc\nA crisp summary.\n\n# Enriched Doc\n\nedited chunk body"
+        ]
+        rows = holder["vectors"].chunks_by_path()["doc.md"]
+        assert rows[0]["preamble"] == "A crisp summary."
+
+    def test_flush_dirty_embeds_enriched_text(self, tmp_path: Path) -> None:
+        provider = _CapturingProvider()
+        vault = _enriched_vault(tmp_path)
+        mgr, _fts, holder = _enriched_mgr(vault, tmp_path, provider)
+        mgr.build_index()
+        mgr.build_embeddings()
+        provider.texts.clear()
+
+        mgr.flush_dirty_embeddings({"doc.md"})
+        assert provider.texts == [
+            "Enriched Doc\nA crisp summary.\n\n# Enriched Doc\n\nplain chunk body"
+        ]
+        rows = holder["vectors"].chunks_by_path()["doc.md"]
+        assert rows[0]["preamble"] == "A crisp summary."
+
+    def test_default_builder_embeds_raw_content(self, tmp_path: Path) -> None:
+        """v1 (default) stays a byte-exact no-op on embedding input."""
+        provider = _CapturingProvider()
+        vault = _enriched_vault(tmp_path)
+        mgr, _fts, _holder = _make_index_mgr(
+            vault,
+            tmp_path,
+            embeddings_path=tmp_path / "embeddings",
+            embedding_provider=provider,
+        )
+        mgr.build_index()
+        mgr.build_embeddings()
+        assert provider.texts == ["# Enriched Doc\n\nplain chunk body"]

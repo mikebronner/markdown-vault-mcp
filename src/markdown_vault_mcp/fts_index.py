@@ -15,6 +15,7 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
+from markdown_vault_mcp.embed_text import fields_text as _fields_text
 from markdown_vault_mcp.types import FTSResult, ParsedNote, SubtreeNote, TocEntry
 
 if TYPE_CHECKING:
@@ -218,7 +219,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_modified_at
     ON documents(modified_at DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
-    path, title, folder, heading, content,
+    path, title, folder, heading, content, summary,
     tokenize='porter unicode61'
 );
 
@@ -248,10 +249,16 @@ _META_BUILD_COMPLETED_KEY = "build_completed_at"
 # read back as ``None``.
 _META_EMBED_MODEL_KEY = "embed_model_name"
 _META_MAX_CHUNK_CHARS_OVERRIDE_KEY = "max_chunk_chars_override"
+# Curated-ranking provenance: the title field and searchable frontmatter
+# fields in force at build time. Stored as "" when equal to the default so a
+# pre-upgrade index (absent keys) reads back as defaults and keeps the
+# warm-restart short-circuit intact.
+_META_TITLE_FIELD_KEY = "title_field"
+_META_SEARCHABLE_FIELDS_KEY = "searchable_fields"
 
 
 class ChunkingMeta(NamedTuple):
-    """Embedding provenance recorded with an FTS build (#649).
+    """Embedding/indexing provenance recorded with an FTS build (#649).
 
     Attributes:
         model: Embedding model name, or ``None`` when no provider is
@@ -259,10 +266,17 @@ class ChunkingMeta(NamedTuple):
         max_chunk_chars_override: The explicit operator ``MAX_CHUNK_CHARS``
             override in force, or ``None`` when the cap was derived from the
             model context.
+        title_field: Frontmatter key used for title resolution at build time
+            (default ``"title"``).
+        searchable_fields: Comma-joined canonical form of the searchable
+            frontmatter fields feeding the FTS ``summary`` column (default
+            ``""`` — none configured).
     """
 
     model: str | None
     max_chunk_chars_override: int | None
+    title_field: str = "title"
+    searchable_fields: str = ""
 
 
 def _escape_like(value: str) -> str:
@@ -350,15 +364,34 @@ class FTSIndex:
         indexed_frontmatter_fields: Frontmatter keys whose values are
             promoted to the ``document_tags`` table.  ``None`` means no tag
             indexing.
+        searchable_frontmatter_fields: Frontmatter keys whose scalar values
+            are newline-joined into the ``notes_fts.summary`` column on each
+            document's chunk-0 row, making them keyword-searchable.  ``None``
+            (default) stores an empty summary.
+        fts_weights: Per-column BM25 weights (keys are FTS column names in
+            ``path``, ``title``, ``folder``, ``heading``, ``content``,
+            ``summary``; missing keys default to ``1.0``).  Persisted into
+            the FTS5 rank configuration at init; ``None`` or all-``1.0``
+            resets to the default ``bm25()``.
     """
+
+    # notes_fts column order — bm25() weight argument order must match.
+    _FTS_COLUMNS = ("path", "title", "folder", "heading", "content", "summary")
 
     def __init__(
         self,
         db_path: Path | str = ":memory:",
         indexed_frontmatter_fields: list[str] | None = None,
+        *,
+        searchable_frontmatter_fields: list[str] | None = None,
+        fts_weights: dict[str, float] | None = None,
     ) -> None:
         self._db_path = db_path
         self._indexed_fields: list[str] = indexed_frontmatter_fields or []
+        self._searchable_fields: tuple[str, ...] = tuple(
+            searchable_frontmatter_fields or ()
+        )
+        self._fts_weights: dict[str, float] = dict(fts_weights or {})
         # Resolve URI (translates ``:memory:`` to a shared-cache URI so that
         # per-thread opens see the same in-memory DB).
         self._connect_uri, self._uses_uri, self._is_memory = _resolve_connect_uri(
@@ -484,6 +517,8 @@ class FTSIndex:
             "CREATE INDEX IF NOT EXISTS idx_sections_docid ON sections(document_id)"
         )
         conn.commit()
+        self._migrate_notes_fts_summary(conn)
+        self._persist_rank_config(conn)
         # WAL is a DB-header pragma — persists across opens. Skip for in-memory
         # databases (SQLite silently falls back to 'memory' journal mode there).
         if not self._is_memory:
@@ -495,6 +530,72 @@ class FTSIndex:
                     result[0] if result else "no result",
                 )
         conn.commit()
+
+    def _migrate_notes_fts_summary(self, conn: sqlite3.Connection) -> None:
+        """Migrate a legacy 5-column ``notes_fts`` to the 6-column schema.
+
+        FTS5 virtual tables do not support ``ALTER TABLE ADD COLUMN``, so a
+        pre-``summary`` table is dropped, recreated with the current schema,
+        and repopulated in pure SQL from the ``sections``/``documents``
+        source of truth — no filesystem rescan.  Migrated rows carry an
+        empty ``summary`` (correct for the default configuration; a
+        non-default ``searchable_frontmatter_fields`` change flips the
+        chunking provenance and triggers a cold rebuild anyway).  The
+        ``meta`` table is untouched, so the warm-restart completeness
+        sentinel survives the migration.
+
+        Args:
+            conn: The primary connection (inside :meth:`_init_schema`).
+        """
+        cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(notes_fts)").fetchall()
+        }
+        if "summary" in cols:
+            return
+        conn.executescript(
+            """
+            DROP TABLE notes_fts;
+            CREATE VIRTUAL TABLE notes_fts USING fts5(
+                path, title, folder, heading, content, summary,
+                tokenize='porter unicode61'
+            );
+            INSERT INTO notes_fts(path, title, folder, heading, content, summary)
+            SELECT d.path, d.title, d.folder, COALESCE(s.heading, ''),
+                   s.content, ''
+            FROM sections s
+            JOIN documents d ON d.id = s.document_id;
+            """
+        )
+        conn.commit()
+        logger.info(
+            "fts_index: migrated notes_fts — added summary column and "
+            "repopulated from sections"
+        )
+
+    def _persist_rank_config(self, conn: sqlite3.Connection) -> None:
+        """Persist the BM25 per-column weights into the FTS5 rank config.
+
+        When any configured weight differs from ``1.0``, writes a weighted
+        ``bm25(...)`` rank function (arguments in ``notes_fts`` column
+        order; unspecified columns weigh ``1.0``).  Otherwise writes the
+        default ``bm25()`` — an idempotent reset so removing the
+        ``FTS_WEIGHTS`` configuration restores default ranking.  ``f.rank``
+        reads pick the persisted function up transparently.
+
+        Args:
+            conn: The primary connection (inside :meth:`_init_schema`).
+        """
+        weights = [self._fts_weights.get(col, 1.0) for col in self._FTS_COLUMNS]
+        if any(w != 1.0 for w in weights):
+            rank = "bm25({})".format(", ".join(f"{w:g}" for w in weights))
+        else:
+            rank = "bm25()"
+        conn.execute(
+            "INSERT INTO notes_fts(notes_fts, rank) VALUES('rank', ?)",
+            (rank,),
+        )
+        conn.commit()
+        logger.debug("fts_index: persisted rank config %s", rank)
 
     def _probe_shared_cache(self) -> None:
         """Verify that a second connection to the same in-memory URI sees the schema.
@@ -629,6 +730,11 @@ class FTSIndex:
         """Insert all chunks for a document into ``sections``.
 
         Also inserts one row per chunk into the ``notes_fts`` virtual table.
+        The ``summary`` column carries the newline-joined scalar values of
+        the configured ``searchable_frontmatter_fields`` on the chunk-0 row
+        only (``""`` for every other row and when no fields are configured),
+        so frontmatter text is keyword-searchable without perturbing the
+        per-chunk ``content`` column.
 
         Args:
             cur: Active cursor inside the current transaction.
@@ -636,7 +742,8 @@ class FTSIndex:
             note: Parsed document whose chunks are to be inserted.
         """
         folder = _derive_folder(note.path)
-        for chunk in note.chunks:
+        summary = _fields_text(note.frontmatter, self._searchable_fields)
+        for i, chunk in enumerate(note.chunks):
             cur.execute(
                 """
                 INSERT INTO sections (document_id, heading, heading_level,
@@ -653,8 +760,9 @@ class FTSIndex:
             )
             cur.execute(
                 """
-                INSERT INTO notes_fts (path, title, folder, heading, content)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO notes_fts (path, title, folder, heading, content,
+                                       summary)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     note.path,
@@ -662,6 +770,7 @@ class FTSIndex:
                     folder,
                     chunk.heading or "",
                     chunk.content,
+                    summary if i == 0 else "",
                 ),
             )
 
@@ -1022,15 +1131,20 @@ class FTSIndex:
 
     @_retry_on_locked
     def set_chunking_meta(
-        self, *, model: str | None, max_chunk_chars_override: int | None
+        self,
+        *,
+        model: str | None,
+        max_chunk_chars_override: int | None,
+        title_field: str = "title",
+        searchable_fields: str = "",
     ) -> None:
-        """Record the embedding provenance used for this build.
+        """Record the embedding/indexing provenance used for this build.
 
-        Persists the two stable inputs that determine the shared chunker's
-        char cap — the embedding model name and the explicit operator
-        override — so a later warm-restart can detect a genuine model or
-        override change and reject the short-circuit, triggering a cold
-        rebuild (#649).
+        Persists the stable inputs that determine the FTS build's contents —
+        the embedding model name, the explicit char-cap override, the title
+        field, and the searchable frontmatter fields — so a later
+        warm-restart can detect a genuine option change and reject the
+        short-circuit, triggering a cold rebuild (#649).
 
         Args:
             model: Embedding model name, or ``None`` when no provider is
@@ -1039,6 +1153,11 @@ class FTSIndex:
                 in force, or ``None`` when the cap was derived from the model
                 context. ``None`` is stored as the empty string; an int is
                 stored as its decimal string form.
+            title_field: Frontmatter key used for title resolution. The
+                default ``"title"`` is stored as the empty string so a
+                pre-upgrade index (absent key) reads back as the default.
+            searchable_fields: Comma-joined canonical searchable-field list.
+                The default (no fields) is already the empty string.
         """
         conn = self._conn()
         model_value = "" if model is None else model
@@ -1047,30 +1166,40 @@ class FTSIndex:
             if max_chunk_chars_override is None
             else str(int(max_chunk_chars_override))
         )
+        title_value = "" if title_field == "title" else title_field
         with conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+            for key, value in (
                 (_META_EMBED_MODEL_KEY, model_value),
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                 (_META_MAX_CHUNK_CHARS_OVERRIDE_KEY, override_value),
-            )
+                (_META_TITLE_FIELD_KEY, title_value),
+                (_META_SEARCHABLE_FIELDS_KEY, searchable_fields),
+            ):
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                    (key, value),
+                )
 
     @_retry_on_locked
     def get_chunking_meta(self) -> ChunkingMeta:
-        """Return the recorded embedding provenance, with ``None`` for absent.
+        """Return the recorded provenance, with defaults for absent keys.
 
         Returns:
             A :class:`ChunkingMeta`. An absent key or a stored empty string
-            reads back as ``None``; ``max_chunk_chars_override`` reads back as
-            ``int``.
+            reads back as the default (``None`` for ``model`` and
+            ``max_chunk_chars_override``, ``"title"`` for ``title_field``,
+            ``""`` for ``searchable_fields``);
+            ``max_chunk_chars_override`` reads back as ``int``.
         """
         conn = self._conn()
         with conn:
             rows = conn.execute(
-                "SELECT key, value FROM meta WHERE key IN (?, ?)",
-                (_META_EMBED_MODEL_KEY, _META_MAX_CHUNK_CHARS_OVERRIDE_KEY),
+                "SELECT key, value FROM meta WHERE key IN (?, ?, ?, ?)",
+                (
+                    _META_EMBED_MODEL_KEY,
+                    _META_MAX_CHUNK_CHARS_OVERRIDE_KEY,
+                    _META_TITLE_FIELD_KEY,
+                    _META_SEARCHABLE_FIELDS_KEY,
+                ),
             ).fetchall()
         stored = {row[0]: row[1] for row in rows}
         model_raw = stored.get(_META_EMBED_MODEL_KEY)
@@ -1079,7 +1208,12 @@ class FTSIndex:
         # An empty string (a stored ``None``) is falsy → reads back as None;
         # config rejects a 0 override so truthiness is safe here.
         override: int | None = int(override_raw) if override_raw else None
-        return ChunkingMeta(model=model, max_chunk_chars_override=override)
+        return ChunkingMeta(
+            model=model,
+            max_chunk_chars_override=override,
+            title_field=stored.get(_META_TITLE_FIELD_KEY) or "title",
+            searchable_fields=stored.get(_META_SEARCHABLE_FIELDS_KEY) or "",
+        )
 
     @_retry_on_locked
     def search(
@@ -1365,18 +1499,28 @@ class FTSIndex:
 
         Returns:
             List of dicts with keys ``path``, ``title``, ``folder``,
-            ``heading`` (may be ``None``), ``content``, and
-            ``start_line``, ordered by document path then chunk position.
+            ``heading`` (may be ``None``), ``content``, ``start_line``,
+            ``frontmatter_json`` (the document's stored frontmatter), and
+            ``is_first_chunk`` (``True`` on each document's first row),
+            ordered by document path then chunk position.
         """
         cur = self._conn().execute(
             """
-            SELECT d.path, d.title, d.folder, s.heading, s.content, s.start_line
+            SELECT d.path, d.title, d.folder, s.heading, s.content,
+                   s.start_line, d.frontmatter_json
             FROM sections AS s
             JOIN documents AS d ON d.id = s.document_id
             ORDER BY d.path, s.id
             """
         )
-        return [dict(row) for row in cur.fetchall()]
+        rows: list[dict[str, Any]] = []
+        prev_path: str | None = None
+        for raw in cur.fetchall():
+            row = dict(raw)
+            row["is_first_chunk"] = row["path"] != prev_path
+            prev_path = row["path"]
+            rows.append(row)
+        return rows
 
     @_retry_on_locked
     def get_toc(self, path: str, *, max_level: int | None = None) -> list[TocEntry]:

@@ -854,7 +854,7 @@ class TestScanDirectoryOnSkip:
 
         (tmp_path / "boom.md").write_text("---\ntitle: ok\n---\nbody", encoding="utf-8")
 
-        def exploding_parse(abs_path, source_dir, chunk_strategy):  # noqa: ARG001
+        def exploding_parse(abs_path, source_dir, chunk_strategy, **kwargs):  # noqa: ARG001
             raise RuntimeError("chunker exploded")
 
         monkeypatch.setattr(scanner_module, "parse_note", exploding_parse)
@@ -868,3 +868,68 @@ class TestScanDirectoryOnSkip:
         assert [s.category for s in skips] == ["internal_error"]
         assert skips[0].path == "boom.md"
         assert "chunker exploded" in skips[0].detail
+
+
+# ---------------------------------------------------------------------------
+# Configurable title field (curated ranking)
+# ---------------------------------------------------------------------------
+
+
+class TestTitleField:
+    """parse_note resolves titles via the configured frontmatter field."""
+
+    def test_custom_field_wins_over_title(self, tmp_path: Path) -> None:
+        (tmp_path / "n.md").write_text(
+            "---\nname: Custom Name\ntitle: Standard Title\n---\n# H1 Heading\n",
+            encoding="utf-8",
+        )
+        note = parse_note(tmp_path / "n.md", tmp_path, title_field="name")
+        assert note.title == "Custom Name"
+
+    def test_missing_custom_field_falls_back_to_title(self, tmp_path: Path) -> None:
+        (tmp_path / "n.md").write_text(
+            "---\ntitle: Standard Title\n---\n# H1 Heading\n", encoding="utf-8"
+        )
+        note = parse_note(tmp_path / "n.md", tmp_path, title_field="name")
+        assert note.title == "Standard Title"
+
+    def test_falls_back_to_h1_then_stem(self, tmp_path: Path) -> None:
+        (tmp_path / "h1.md").write_text("# From Heading\n\nbody\n", encoding="utf-8")
+        note = parse_note(tmp_path / "h1.md", tmp_path, title_field="name")
+        assert note.title == "From Heading"
+
+        (tmp_path / "bare.md").write_text("just a body\n", encoding="utf-8")
+        note = parse_note(tmp_path / "bare.md", tmp_path, title_field="name")
+        assert note.title == "bare"
+
+    def test_non_string_custom_value_is_skipped(self, tmp_path: Path) -> None:
+        (tmp_path / "n.md").write_text(
+            "---\nname: 42\ntitle: Standard Title\n---\nbody\n", encoding="utf-8"
+        )
+        note = parse_note(tmp_path / "n.md", tmp_path, title_field="name")
+        assert note.title == "Standard Title"
+
+    def test_empty_custom_value_is_skipped(self, tmp_path: Path) -> None:
+        (tmp_path / "n.md").write_text(
+            "---\nname: '   '\ntitle: Standard Title\n---\nbody\n", encoding="utf-8"
+        )
+        note = parse_note(tmp_path / "n.md", tmp_path, title_field="name")
+        assert note.title == "Standard Title"
+
+    def test_default_title_field_unchanged(self, tmp_path: Path) -> None:
+        (tmp_path / "n.md").write_text(
+            "---\nname: Custom Name\ntitle: Standard Title\n---\nbody\n",
+            encoding="utf-8",
+        )
+        note = parse_note(tmp_path / "n.md", tmp_path)
+        assert note.title == "Standard Title"
+
+    def test_scan_directory_passes_title_field_through(self, tmp_path: Path) -> None:
+        (tmp_path / "a.md").write_text(
+            "---\nname: A Name\ntitle: A Title\n---\nbody\n", encoding="utf-8"
+        )
+        (tmp_path / "b.md").write_text(
+            "---\ntitle: B Title\n---\nbody\n", encoding="utf-8"
+        )
+        titles = {n.path: n.title for n in scan_directory(tmp_path, title_field="name")}
+        assert titles == {"a.md": "A Name", "b.md": "B Title"}

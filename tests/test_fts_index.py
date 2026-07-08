@@ -987,3 +987,263 @@ def test_chunking_meta_stores_none_as_empty(tmp_path):
     assert idx.get_chunking_meta() == ChunkingMeta(
         model=None, max_chunk_chars_override=None
     )
+
+
+# ---------------------------------------------------------------------------
+# Curated ranking: summary column, legacy migration, persisted rank config
+# ---------------------------------------------------------------------------
+
+
+def _two_chunk_note(frontmatter: dict | None = None) -> ParsedNote:
+    return make_note(
+        path="doc.md",
+        title="Doc",
+        frontmatter=frontmatter or {},
+        chunks=[
+            Chunk(heading="One", heading_level=1, content="first body", start_line=0),
+            Chunk(heading="Two", heading_level=1, content="second body", start_line=5),
+        ],
+    )
+
+
+class TestSummaryColumn:
+    def test_summary_indexed_on_chunk0_row_only(self) -> None:
+        idx = FTSIndex(searchable_frontmatter_fields=["summary"])
+        idx.upsert_note(_two_chunk_note({"summary": "quantum entanglement overview"}))
+        rows = (
+            idx._conn()
+            .execute("SELECT heading, summary FROM notes_fts ORDER BY rowid")
+            .fetchall()
+        )
+        assert [tuple(r) for r in rows] == [
+            ("One", "quantum entanglement overview"),
+            ("Two", ""),
+        ]
+        results = idx.search("entanglement")
+        assert len(results) == 1
+        assert results[0].heading == "One"
+        idx.close()
+
+    def test_summary_column_filter_works(self) -> None:
+        idx = FTSIndex(searchable_frontmatter_fields=["summary"])
+        idx.upsert_note(_two_chunk_note({"summary": "quantum entanglement"}))
+        assert len(idx.search("summary:entanglement")) == 1
+        assert idx.search("content:entanglement") == []
+        idx.close()
+
+    def test_without_configured_fields_summary_is_empty(self) -> None:
+        idx = FTSIndex()
+        idx.upsert_note(_two_chunk_note({"summary": "quantum entanglement"}))
+        assert idx.search("entanglement") == []
+        idx.close()
+
+    def test_snippet_stays_content_based(self) -> None:
+        """A summary-only match still snippets from the content column."""
+        idx = FTSIndex(searchable_frontmatter_fields=["summary"])
+        idx.upsert_note(_two_chunk_note({"summary": "zebra sighting notes"}))
+        results = idx.search("zebra", snippet_words=3)
+        assert len(results) == 1
+        # The chunk content carries no match, so snippet() falls back to the
+        # leading tokens of the CONTENT column — never the summary text.
+        assert "first" in results[0].content
+        assert "zebra" not in results[0].content
+        idx.close()
+
+    def test_list_chunks_includes_frontmatter_json_and_first_flag(self) -> None:
+        idx = FTSIndex(searchable_frontmatter_fields=["summary"])
+        idx.upsert_note(_two_chunk_note({"summary": "s"}))
+        rows = idx.list_chunks()
+        assert [r["is_first_chunk"] for r in rows] == [True, False]
+        assert all(json.loads(r["frontmatter_json"]) == {"summary": "s"} for r in rows)
+        idx.close()
+
+
+_LEGACY_SCHEMA = """
+CREATE TABLE documents (
+    id INTEGER PRIMARY KEY,
+    path TEXT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    folder TEXT NOT NULL DEFAULT '',
+    frontmatter_json TEXT,
+    content_hash TEXT NOT NULL,
+    modified_at REAL NOT NULL,
+    chunk_count INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE sections (
+    id INTEGER PRIMARY KEY,
+    document_id INTEGER NOT NULL,
+    heading TEXT,
+    heading_level INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+CREATE VIRTUAL TABLE notes_fts USING fts5(
+    path, title, folder, heading, content,
+    tokenize='porter unicode61'
+);
+CREATE TABLE meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+class TestNotesFtsSummaryMigration:
+    def test_legacy_five_column_table_migrates_without_rescan(
+        self, tmp_path: Path
+    ) -> None:
+        """A pre-summary index gains the column and keeps rows + sentinel."""
+        db = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(_LEGACY_SCHEMA)
+        conn.execute(
+            "INSERT INTO documents (id, path, title, folder, frontmatter_json,"
+            " content_hash, modified_at, chunk_count)"
+            " VALUES (1, 'a.md', 'Alpha', '', '{}', 'h1', 1000.0, 2)"
+        )
+        conn.execute(
+            "INSERT INTO sections (document_id, heading, heading_level, content,"
+            " start_line) VALUES (1, 'Intro', 1, 'hello world body', 0)"
+        )
+        conn.execute(
+            "INSERT INTO sections (document_id, heading, heading_level, content,"
+            " start_line) VALUES (1, NULL, 0, 'preamble text', 5)"
+        )
+        conn.execute(
+            "INSERT INTO notes_fts (path, title, folder, heading, content)"
+            " VALUES ('a.md', 'Alpha', '', 'Intro', 'hello world body')"
+        )
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('build_completed_at', 'ts')"
+        )
+        conn.commit()
+        conn.close()
+
+        idx = FTSIndex(db_path=db)
+        cols = [
+            r[1] for r in idx._conn().execute("PRAGMA table_info(notes_fts)").fetchall()
+        ]
+        assert cols == ["path", "title", "folder", "heading", "content", "summary"]
+        # Rows were repopulated in pure SQL from sections/documents — both
+        # section rows are searchable, with empty summaries and NULL headings
+        # coalesced to ''.
+        fts_rows = (
+            idx._conn()
+            .execute(
+                "SELECT path, title, heading, content, summary FROM notes_fts"
+                " ORDER BY rowid"
+            )
+            .fetchall()
+        )
+        assert [tuple(r) for r in fts_rows] == [
+            ("a.md", "Alpha", "Intro", "hello world body", ""),
+            ("a.md", "Alpha", "", "preamble text", ""),
+        ]
+        assert len(idx.search("preamble")) == 1
+        # The meta table — and with it the warm-restart sentinel — survives.
+        assert idx.is_build_completed() is True
+        idx.close()
+
+    def test_six_column_table_is_left_alone(self, tmp_path: Path) -> None:
+        """Reopening a current-schema index does not drop/repopulate."""
+        db = tmp_path / "current.db"
+        idx = FTSIndex(db_path=db, searchable_frontmatter_fields=["summary"])
+        idx.upsert_note(_two_chunk_note({"summary": "quantum entanglement"}))
+        idx.close()
+
+        idx2 = FTSIndex(db_path=db, searchable_frontmatter_fields=["summary"])
+        # Summary text survives a reopen (a migration would have wiped it).
+        assert len(idx2.search("summary:entanglement")) == 1
+        idx2.close()
+
+
+class TestPersistedRankConfig:
+    @staticmethod
+    def _populate(idx: FTSIndex) -> None:
+        idx.upsert_note(
+            make_note(
+                path="title_doc.md",
+                title="alpha reference",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="body without the term",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        idx.upsert_note(
+            make_note(
+                path="content_doc.md",
+                title="other",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="alpha appears in this body",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+
+    def test_persisted_weights_flip_ordering_vs_default(self, tmp_path: Path) -> None:
+        """f.rank picks up the persisted rank config: zeroing the column the
+        default-first document matched on demotes it below the other."""
+        default_idx = FTSIndex(db_path=tmp_path / "default.db")
+        self._populate(default_idx)
+        default_results = default_idx.search("alpha")
+        assert [r.score > 0 for r in default_results] == [True, True]
+        default_first = default_results[0].path
+        default_idx.close()
+
+        # Zero out whichever column the default winner matched on.
+        zeroed_column = "title" if default_first == "title_doc.md" else "content"
+        weighted_idx = FTSIndex(
+            db_path=tmp_path / "weighted.db",
+            fts_weights={zeroed_column: 0.0},
+        )
+        self._populate(weighted_idx)
+        weighted_results = weighted_idx.search("alpha")
+        assert weighted_results[0].path != default_first
+        assert weighted_results[-1].path == default_first
+        assert weighted_results[-1].score == 0.0
+        weighted_idx.close()
+
+    def test_all_ones_weights_match_default_scores(self, tmp_path: Path) -> None:
+        default_idx = FTSIndex(db_path=tmp_path / "default.db")
+        self._populate(default_idx)
+        default_scores = {r.path: r.score for r in default_idx.search("alpha")}
+        default_idx.close()
+
+        ones_idx = FTSIndex(
+            db_path=tmp_path / "ones.db",
+            fts_weights=dict.fromkeys(FTSIndex._FTS_COLUMNS, 1.0),
+        )
+        self._populate(ones_idx)
+        ones_scores = {r.path: r.score for r in ones_idx.search("alpha")}
+        ones_idx.close()
+
+        assert ones_scores == default_scores
+
+    def test_reopen_without_weights_resets_to_default(self, tmp_path: Path) -> None:
+        """Removing FTS_WEIGHTS restores default bm25() (idempotent reset)."""
+        db = tmp_path / "shared.db"
+        weighted_idx = FTSIndex(db_path=db, fts_weights={"content": 0.0})
+        self._populate(weighted_idx)
+        assert any(r.score == 0.0 for r in weighted_idx.search("alpha"))
+        weighted_idx.close()
+
+        reset_idx = FTSIndex(db_path=db)
+        reset_scores = {r.path: r.score for r in reset_idx.search("alpha")}
+        reset_idx.close()
+
+        default_idx = FTSIndex(db_path=tmp_path / "default.db")
+        self._populate(default_idx)
+        default_scores = {r.path: r.score for r in default_idx.search("alpha")}
+        default_idx.close()
+
+        assert reset_scores == default_scores

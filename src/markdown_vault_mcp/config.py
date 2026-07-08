@@ -162,6 +162,9 @@ class ProjectConfig:
             "indexed_frontmatter_fields": self.indexing.indexed_frontmatter_fields,
             "required_frontmatter": self.indexing.required_frontmatter,
             "exclude_patterns": self.indexing.exclude_patterns,
+            "title_field": self.indexing.title_field,
+            "searchable_frontmatter_fields": self.indexing.searchable_frontmatter,
+            "embed_context": self.embeddings.embed_context,
             "attachment_extensions": self.content.attachment_extensions,
             "max_attachment_size_mb": self.content.max_attachment_size_mb,
             "max_note_read_bytes": self.content.max_note_read_bytes,
@@ -171,6 +174,18 @@ class ProjectConfig:
             "length_downweight_alpha": self.search.length_downweight_alpha,
             "max_chunk_words": self.search.max_chunk_words,
             "chunk_overlap_words": self.search.chunk_overlap_words,
+            # Weight maps are stored as frozen sorted tuples on the config
+            # (#639); the Vault API takes plain dicts.
+            "folder_weights": (
+                dict(self.search.folder_weights)
+                if self.search.folder_weights is not None
+                else None
+            ),
+            "fts_weights": (
+                dict(self.search.fts_weights)
+                if self.search.fts_weights is not None
+                else None
+            ),
         }
 
         # Semantic search is gated by the storage path in config.indexing,
@@ -329,6 +344,19 @@ class ProjectConfig:
           frontmatter fields; default none.
         - ``MARKDOWN_VAULT_MCP_EXCLUDE``: comma-separated glob patterns to
           exclude; default none.
+        - ``MARKDOWN_VAULT_MCP_TITLE_FIELD``: frontmatter field used as the
+          document title; default ``title``.
+        - ``MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS``: comma-separated
+          frontmatter fields whose scalar values are keyword-searchable via
+          the FTS ``summary`` column; default none.
+
+        **Search ranking:**
+
+        - ``MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS``: ``prefix:weight,...`` map
+          scaling result scores by folder prefix (weights > 0); default none.
+        - ``MARKDOWN_VAULT_MCP_FTS_WEIGHTS``: ``column:weight,...`` per-column
+          BM25 weights (columns ``path``, ``title``, ``folder``, ``heading``,
+          ``content``, ``summary``; weights >= 0); default all ``1.0``.
 
         **Git:**
 
@@ -397,6 +425,9 @@ class ProjectConfig:
           ``"BAAI/bge-small-en-v1.5"``.
         - ``MARKDOWN_VAULT_MCP_FASTEMBED_CACHE_DIR``: FastEmbed model cache
           directory; default ``None``.
+        - ``MARKDOWN_VAULT_MCP_EMBED_CONTEXT``: enrich embedding input with
+          the document title, chunk heading, and searchable-field preamble;
+          default ``false``.
 
         **Transfer links:**
 

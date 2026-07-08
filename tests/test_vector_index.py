@@ -746,3 +746,79 @@ class TestSearchByPath:
         index.add(texts, meta)
         results = index.search_by_path("doc0.md", limit=2)
         assert len(results) == 2
+
+
+# ---------------------------------------------------------------------------
+# Embedding-text format token (curated ranking)
+# ---------------------------------------------------------------------------
+
+
+class TestEmbedTextFormatToken:
+    def test_token_roundtrips_through_sidecar(
+        self, mock_provider: MockEmbeddingProvider, tmp_path: Path
+    ) -> None:
+        index = VectorIndex(mock_provider, embed_text_format="v2;fields=summary")
+        index.add(["text"], [_make_meta("a.md")])
+        base = tmp_path / "embeddings"
+        index.save(base)
+
+        payload = json.loads((tmp_path / "embeddings.json").read_text("utf-8"))
+        assert payload["index_metadata"]["embed_text_format"] == "v2;fields=summary"
+
+        loaded = VectorIndex.load(
+            base, mock_provider, expected_embed_text_format="v2;fields=summary"
+        )
+        assert loaded.count == 1
+        # The loaded index re-saves with the persisted token.
+        loaded.save(base)
+        payload = json.loads((tmp_path / "embeddings.json").read_text("utf-8"))
+        assert payload["index_metadata"]["embed_text_format"] == "v2;fields=summary"
+
+    def test_default_token_is_v1(
+        self, mock_provider: MockEmbeddingProvider, tmp_path: Path
+    ) -> None:
+        index = VectorIndex(mock_provider)
+        index.add(["text"], [_make_meta("a.md")])
+        base = tmp_path / "embeddings"
+        index.save(base)
+        payload = json.loads((tmp_path / "embeddings.json").read_text("utf-8"))
+        assert payload["index_metadata"]["embed_text_format"] == "v1"
+
+    def test_format_mismatch_raises_compatibility_error(
+        self, mock_provider: MockEmbeddingProvider, tmp_path: Path
+    ) -> None:
+        index = VectorIndex(mock_provider, embed_text_format="v1")
+        index.add(["text"], [_make_meta("a.md")])
+        base = tmp_path / "embeddings"
+        index.save(base)
+
+        with pytest.raises(VectorIndexCompatibilityError, match="format mismatch"):
+            VectorIndex.load(
+                base, mock_provider, expected_embed_text_format="v2;fields=summary"
+            )
+
+    def test_legacy_sidecar_without_token_loads_clean_as_v1(
+        self, mock_provider: MockEmbeddingProvider, tmp_path: Path
+    ) -> None:
+        """A pre-upgrade sidecar (absent key) reads as v1 and loads clean."""
+        index = VectorIndex(mock_provider)
+        index.add(["text"], [_make_meta("a.md")])
+        base = tmp_path / "embeddings"
+        index.save(base)
+        json_path = tmp_path / "embeddings.json"
+        payload = json.loads(json_path.read_text("utf-8"))
+        del payload["index_metadata"]["embed_text_format"]
+        json_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        loaded = VectorIndex.load(base, mock_provider, expected_embed_text_format="v1")
+        assert loaded.count == 1
+
+    def test_no_expected_token_skips_the_check(
+        self, mock_provider: MockEmbeddingProvider, tmp_path: Path
+    ) -> None:
+        index = VectorIndex(mock_provider, embed_text_format="v2;fields=summary")
+        index.add(["text"], [_make_meta("a.md")])
+        base = tmp_path / "embeddings"
+        index.save(base)
+        loaded = VectorIndex.load(base, mock_provider)
+        assert loaded.count == 1

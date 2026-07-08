@@ -29,6 +29,7 @@ def load_or_self_heal(
     set_vectors: Callable[[VectorIndex], None],
     rebuild: Callable[[], object],
     logger: logging.Logger,
+    embed_text_format: str = "v1",
 ) -> VectorIndex:
     """Load the vector sidecar into the caller's slot, self-healing corruption.
 
@@ -53,6 +54,13 @@ def load_or_self_heal(
             repopulates the slot.
         logger: The caller's logger, so records are attributed to the calling
             manager's module.
+        embed_text_format: The current embedding-text format token (see
+            :meth:`~markdown_vault_mcp.embed_text.EmbedTextBuilder.format_token`).
+            A persisted sidecar with a different token (absent key reads as
+            ``"v1"``) raises ``VectorIndexCompatibilityError`` inside
+            :meth:`VectorIndex.load` and routes to the same rebuild path as
+            a provider/model mismatch; a fresh empty index is stamped with
+            this token so its save records the format.
 
     Returns:
         A :class:`~markdown_vault_mcp.vector_index.VectorIndex` instance.
@@ -100,7 +108,13 @@ def load_or_self_heal(
     npy_path = embeddings_path.with_suffix(".npy")
     if npy_path.exists():
         try:
-            set_vectors(VectorIndex.load(embeddings_path, embedding_provider))
+            set_vectors(
+                VectorIndex.load(
+                    embeddings_path,
+                    embedding_provider,
+                    expected_embed_text_format=embed_text_format,
+                )
+            )
             logger.info("Loaded vector index from %s", embeddings_path)
         except VectorIndexCompatibilityError as exc:
             logger.warning("%s Rebuilding embeddings.", exc, exc_info=True)
@@ -150,7 +164,9 @@ def load_or_self_heal(
                     "Failed to rebuild vector index after a corrupt sidecar."
                 ) from exc
     else:
-        set_vectors(VectorIndex(embedding_provider))
+        set_vectors(
+            VectorIndex(embedding_provider, embed_text_format=embed_text_format)
+        )
         logger.info("No vector index on disk; created empty VectorIndex")
 
     result = get_vectors()

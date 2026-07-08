@@ -462,7 +462,12 @@ class TestAccessors:
                 "heading",
                 "content",
                 "start_line",
+                "frontmatter_json",
+                "is_first_chunk",
             }
+        # is_first_chunk marks exactly the first row of each document.
+        assert multi_rows[0]["is_first_chunk"] is True
+        assert all(r["is_first_chunk"] is False for r in multi_rows[1:])
 
     def test_vector_chunks_by_path_groups_copies(self) -> None:
         provider = MockEmbeddingProvider()
@@ -480,3 +485,107 @@ class TestAccessors:
         # Returned rows are copies — mutating them must not corrupt the index.
         grouped["a.md"][0]["content"] = "mutated"
         assert index.chunks_by_path()["a.md"][0]["content"] == "one"
+
+
+# ---------------------------------------------------------------------------
+# Curated ranking: preamble-aware convergence
+# ---------------------------------------------------------------------------
+
+
+def _boot_enriched(
+    vault_dir: Path, tmp_path: Path, provider: MockEmbeddingProvider
+) -> Vault:
+    """Boot like :func:`_boot` with searchable frontmatter enrichment on."""
+    vault = Vault(
+        source_dir=vault_dir,
+        index_path=tmp_path / "fts.db",
+        state_path=tmp_path / "s.json",
+        embeddings_path=tmp_path / "vectors",
+        embedding_provider=provider,
+        searchable_frontmatter_fields=["summary"],
+    )
+    vault.index.build_index()
+    vault.index.reindex()
+    vault.index.build_embeddings()
+    return vault
+
+
+class TestPreambleConvergence:
+    def test_offline_summary_only_edit_re_embeds(self, tmp_path: Path) -> None:
+        """Body unchanged, frontmatter summary changed while down → re-embed.
+
+        The chunk (title, heading, content, start_line) signature is
+        untouched by a frontmatter-only edit; only the 5th preamble term
+        catches it.
+        """
+        provider = MockEmbeddingProvider()
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
+        note = vault_dir / "doc.md"
+        note.write_text(
+            "---\nsummary: old summary\n---\n# Doc\n\nstable body\n",
+            encoding="utf-8",
+        )
+        v1 = _boot_enriched(vault_dir, tmp_path, provider)
+        v1.close()
+
+        note.write_text(
+            "---\nsummary: new summary\n---\n# Doc\n\nstable body\n",
+            encoding="utf-8",
+        )
+        calls = _track_embeds(provider)
+        v2 = _boot_enriched(vault_dir, tmp_path, provider)
+        try:
+            embedded = [t for batch in calls for t in batch]
+            assert any("new summary" in t for t in embedded)
+            rows = v2._vectors.chunks_by_path()["doc.md"]
+            assert rows[0]["preamble"] == "new summary"
+        finally:
+            v2.close()
+
+    def test_enriched_boot_converges_to_no_op(self, tmp_path: Path) -> None:
+        """No edits between enriched boots → second boot embeds nothing."""
+        provider = MockEmbeddingProvider()
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
+        (vault_dir / "doc.md").write_text(
+            "---\nsummary: a summary\n---\n# Doc\n\nstable body\n",
+            encoding="utf-8",
+        )
+        v1 = _boot_enriched(vault_dir, tmp_path, provider)
+        v1.close()
+
+        calls = _track_embeds(provider)
+        v2 = _boot_enriched(vault_dir, tmp_path, provider)
+        try:
+            assert calls == []
+        finally:
+            v2.close()
+
+    def test_legacy_rows_without_preamble_do_not_re_embed_under_defaults(
+        self, tmp_path: Path
+    ) -> None:
+        """A pre-upgrade sidecar (no preamble keys, no format token) loads
+        clean under the default config and converges with zero work."""
+        import json as _json
+
+        provider = MockEmbeddingProvider()
+        vault_dir = _make_vault_dir(tmp_path)
+        v1 = _boot(vault_dir, tmp_path, provider)
+        v1.close()
+
+        # Rewrite the sidecar to the pre-upgrade shape: strip the per-row
+        # preamble keys and the index-level embed_text_format token.
+        json_path = tmp_path / "vectors.json"
+        payload = _json.loads(json_path.read_text(encoding="utf-8"))
+        for row in payload["rows"]:
+            row.pop("preamble", None)
+        payload["index_metadata"].pop("embed_text_format", None)
+        json_path.write_text(_json.dumps(payload), encoding="utf-8")
+
+        calls = _track_embeds(provider)
+        v2 = _boot(vault_dir, tmp_path, provider)
+        try:
+            assert calls == []
+        finally:
+            v2.close()

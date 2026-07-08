@@ -322,6 +322,10 @@ class TestGraphDataTools:
     async def test_hubs_returns_graph(self) -> None:
         server = make_server()
         async with Client(server) as client:
+            # Drain the boot BuildIndex like every sibling test: the hubs
+            # backlink path requires a built index, so calling before the
+            # boot build lands races into IndexUnavailableError.
+            await wait_for_mcp_writer_drain(client)
             result = await client.call_tool(_hashed("vault_graph_hubs"), {})
             data = _parse_tool_data(result)
             assert "nodes" in data
