@@ -5,8 +5,8 @@ must address. Run individually with ``uv run pytest tests/test_thread_safety.py`
 
 The carryover design (per ``project_issue_519_attempt_1_abandon.md``) is:
 per-thread ``sqlite3.Connection`` via ``threading.local``, strong-ref
-registry guarded by ``_reg_lock``, ``_closed`` flag with double-checked
-locking, ``BaseException`` cleanup on slow-path open, ``_primary_conn``
+registry guarded by ``reg_lock``, ``closed`` flag with double-checked
+locking, ``BaseException`` cleanup on slow-path open, ``primary_conn``
 strong attribute, shared-cache URI translation for ``:memory:`` with
 startup probe, and pragmas applied BEFORE schema/migrations.
 """
@@ -23,6 +23,7 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
+from markdown_vault_mcp._fts_connection import SqliteConnectionRegistry
 from markdown_vault_mcp.fts_index import FTSIndex
 from markdown_vault_mcp.vault import Vault
 from tests.conftest import wait_for_writer_drain
@@ -154,13 +155,13 @@ def test_pragmas_applied_per_connection(fts: FTSIndex) -> None:
 def test_pragmas_applied_before_schema(
     monkeypatch: pytest.MonkeyPatch, tmp_db: Path
 ) -> None:
-    """`_apply_pragmas` must run BEFORE `_init_schema` so busy_timeout is active
+    """`SqliteConnectionRegistry.apply_pragmas` must run BEFORE `_init_schema` so busy_timeout is active
     during ALTER TABLE migrations.
 
     Capture the call order by patching both methods on the class.
     """
     order: list[str] = []
-    real_apply = FTSIndex._apply_pragmas  # type: ignore[attr-defined]
+    real_apply = SqliteConnectionRegistry.apply_pragmas
     real_init = FTSIndex._init_schema  # type: ignore[attr-defined]
 
     def spy_apply(self, conn):  # type: ignore[no-untyped-def]
@@ -171,7 +172,7 @@ def test_pragmas_applied_before_schema(
         order.append("schema")
         return real_init(self, conn)
 
-    monkeypatch.setattr(FTSIndex, "_apply_pragmas", spy_apply)
+    monkeypatch.setattr(SqliteConnectionRegistry, "apply_pragmas", spy_apply)
     monkeypatch.setattr(FTSIndex, "_init_schema", spy_init)
 
     idx = FTSIndex(db_path=tmp_db)
@@ -313,7 +314,7 @@ def test_registry_uses_strong_refs(fts: FTSIndex) -> None:
     gc.collect()
 
     # Registry still holds the worker conn.
-    assert any(id(c) == worker_id[0] for c in fts._all_conns), (
+    assert any(id(c) == worker_id[0] for c in fts._registry.all_conns), (
         "worker conn must survive thread exit + gc in strong-ref registry"
     )
 
@@ -466,7 +467,7 @@ def test_init_baseexception_cleanup_closes_primary(
         return tracker_cls(real_connect(*args, **kwargs))  # type: ignore[return-value,arg-type,no-any-return]
 
     monkeypatch.setattr(
-        "markdown_vault_mcp.fts_index.sqlite3.connect", tracking_connect
+        "markdown_vault_mcp._fts_connection.sqlite3.connect", tracking_connect
     )
 
     def boom_schema(_self: object, _conn: object) -> None:
@@ -486,7 +487,7 @@ def test_init_baseexception_cleanup_clears_tls_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If __init__ raises AFTER the primary's TLS assignment (e.g. during
-    `_probe_shared_cache`), the cleanup must clear ``self._local.conn`` —
+    `_probe_shared_cache`), the cleanup must clear ``registry.local.conn`` —
     otherwise a caller holding the partially-built instance would fast-path
     a closed connection instead of seeing ProgrammingError.
 
@@ -505,12 +506,13 @@ def test_init_baseexception_cleanup_clears_tls_slot(
         FTSIndex(db_path=":memory:")
 
     assert len(captured) == 1
-    assert getattr(captured[0]._local, "conn", None) is None, (
-        "__init__ cleanup must clear self._local.conn after post-TLS failure"
+    registry = captured[0]._registry
+    assert getattr(registry.local, "conn", None) is None, (
+        "__init__ cleanup must clear the registry's TLS slot after post-TLS failure"
     )
-    # _all_conns must also be cleared by the cleanup.
-    assert captured[0]._all_conns == []
-    assert captured[0]._primary_conn is None
+    # The close registry must also be cleared by the cleanup.
+    assert registry.all_conns == []
+    assert registry.primary_conn is None
 
 
 def test_probe_shared_cache_raises_when_documents_invisible(
@@ -533,7 +535,9 @@ def test_probe_shared_cache_raises_when_documents_invisible(
             return real_connect(":memory:", check_same_thread=False)
         return real_connect(*args, **kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr("markdown_vault_mcp.fts_index.sqlite3.connect", fake_connect)
+    monkeypatch.setattr(
+        "markdown_vault_mcp._fts_connection.sqlite3.connect", fake_connect
+    )
 
     with pytest.raises(RuntimeError, match="shared-cache probe failed"):
         FTSIndex(db_path=":memory:")
@@ -544,7 +548,7 @@ def test_conn_slow_path_baseexception_cleanup(
     fts: FTSIndex,
     close_tracker: tuple[list[object], type],
 ) -> None:
-    """If _apply_pragmas fails on a per-thread open, the new connection
+    """If apply_pragmas fails on a per-thread open, the new connection
     must be closed and the TLS slot left unset so a retry re-opens."""
 
     closed, tracker_cls = close_tracker
@@ -554,13 +558,13 @@ def test_conn_slow_path_baseexception_cleanup(
         return tracker_cls(real_connect(*args, **kwargs))  # type: ignore[return-value,arg-type,no-any-return]
 
     monkeypatch.setattr(
-        "markdown_vault_mcp.fts_index.sqlite3.connect", tracking_connect
+        "markdown_vault_mcp._fts_connection.sqlite3.connect", tracking_connect
     )
 
     def boom_pragmas(_self: object, _conn: object) -> None:
         raise RuntimeError("simulated pragma failure")
 
-    monkeypatch.setattr(FTSIndex, "_apply_pragmas", boom_pragmas)
+    monkeypatch.setattr(SqliteConnectionRegistry, "apply_pragmas", boom_pragmas)
 
     errors: list[BaseException] = []
 
@@ -580,16 +584,16 @@ def test_conn_slow_path_baseexception_cleanup(
 
 
 def test_conn_slow_path_failure_clears_tls_slot(fts: FTSIndex) -> None:
-    """If the slow-path open fails AFTER ``self._local.conn`` was set but
+    """If the slow-path open fails AFTER ``registry.local.conn`` was set but
     BEFORE registration completes (e.g. a BaseException between the two
     writes inside the lock), the cleanup MUST clear the TLS slot so the
     next ``_conn()`` call does not fast-path return a closed connection.
 
-    Regression for the bug where ``self._local.conn = new_conn`` was
-    assigned and a BaseException between that and ``_all_conns.append``
+    Regression for the bug where ``registry.local.conn = new_conn`` was
+    assigned and a BaseException between that and ``registry.all_conns.append``
     left a closed conn in TLS for subsequent silent reuse.
 
-    Injection method: patch ``list.append`` on ``_all_conns`` so the
+    Injection method: patch ``list.append`` on the registry's ``all_conns`` so the
     append raises after the TLS assignment has already happened.
     """
     append_calls = {"n": 0}
@@ -605,7 +609,7 @@ def test_conn_slow_path_failure_clears_tls_slot(fts: FTSIndex) -> None:
 
     # Swap registry with the exploding subclass, preserving the primary
     # connection entry the fixture registered before the patch.
-    fts._all_conns = _ExplodingList(fts._all_conns)
+    fts._registry.all_conns = _ExplodingList(fts._registry.all_conns)
 
     first_error: list[BaseException] = []
     second_result: list[sqlite3.Connection] = []
@@ -653,7 +657,7 @@ def test_close_continues_when_one_connection_raises(fts: FTSIndex) -> None:
     t.join()
     second = second_holder["c"]
     assert primary is not second
-    assert len(fts._all_conns) == 2
+    assert len(fts._registry.all_conns) == 2
 
     # Replace one connection's close with a function that raises OSError.
     # We can't monkey-patch sqlite3.Connection.close (read-only attr), so we
@@ -676,8 +680,8 @@ def test_close_continues_when_one_connection_raises(fts: FTSIndex) -> None:
     good = _GoodCloser(second)
     # Replace registry contents with [bad, good]. Drop the real primary +
     # second so they aren't double-closed by close() then by the fixture.
-    fts._all_conns[:] = [bad, good]  # type: ignore[list-item]
-    fts._primary_conn = None
+    fts._registry.all_conns[:] = [bad, good]  # type: ignore[list-item]
+    fts._registry.primary_conn = None
     primary.close()  # close the original primary out-of-band
 
     # close() must reach `good` despite `bad` raising.
