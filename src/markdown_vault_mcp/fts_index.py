@@ -392,6 +392,17 @@ class FTSIndex:
             searchable_frontmatter_fields or ()
         )
         self._fts_weights: dict[str, float] = dict(fts_weights or {})
+        # SearchConfig validates fts_weights keys, but direct FTSIndex/Vault
+        # construction bypasses it; an unknown column is silently ignored by
+        # _persist_rank_config (get(col, 1.0)). Warn so a typo'd column
+        # ("titel") is visible rather than degrading to default ranking.
+        unknown_weight_cols = set(self._fts_weights) - set(self._FTS_COLUMNS)
+        if unknown_weight_cols:
+            logger.warning(
+                "fts_index: ignoring unknown fts_weights columns=%s (valid: %s)",
+                sorted(unknown_weight_cols),
+                ", ".join(self._FTS_COLUMNS),
+            )
         # Resolve URI (translates ``:memory:`` to a shared-cache URI so that
         # per-thread opens see the same in-memory DB).
         self._connect_uri, self._uses_uri, self._is_memory = _resolve_connect_uri(

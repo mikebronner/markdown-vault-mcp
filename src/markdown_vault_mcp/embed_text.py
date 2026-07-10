@@ -57,7 +57,7 @@ def fields_text(
         ``float``, ``bool``, and ``date``/``time``/``datetime``, the last
         three coerced to ISO strings); lists/dicts/``None`` are skipped —
         joined with newlines. ``""`` when no fields are configured, the
-        frontmatter is empty, or the JSON does not parse.
+        frontmatter is empty, or the JSON does not parse to an object.
     """
     if not fields or not frontmatter_or_json:
         return ""
@@ -87,6 +87,15 @@ def fields_text(
             text = str(value).strip()
             if text:
                 parts.append(text)
+        elif value is not None:
+            # A configured searchable field that holds a list/dict contributes
+            # nothing (e.g. a YAML `tags:` list). Log so the operator can tell
+            # "unsupported type" apart from "field not present".
+            logger.debug(
+                "fields_text: skipping non-scalar searchable field key=%s type=%s",
+                key,
+                type(value).__name__,
+            )
     return "\n".join(parts)
 
 

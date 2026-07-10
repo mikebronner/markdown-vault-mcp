@@ -1226,6 +1226,22 @@ class TestNotesFtsSummaryMigration:
         idx.close()
 
 
+def test_unknown_fts_weights_column_logs_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo'd fts_weights column (bypassing SearchConfig validation) is
+    ignored by the rank config; warn so it isn't a silent ranking degrade."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="markdown_vault_mcp.fts_index"):
+        idx = FTSIndex(db_path=":memory:", fts_weights={"titel": 3.0, "title": 2.0})
+    idx.close()
+    assert any(
+        "unknown fts_weights" in r.getMessage() and "titel" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def test_fts_column_constants_stay_in_lockstep() -> None:
     """The two ``_FTS_COLUMNS`` copies and the live ``notes_fts`` must agree.
 

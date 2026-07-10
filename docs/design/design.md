@@ -253,7 +253,7 @@ Four complementary mechanisms improve result diversity and bound LLM context cos
 | `MARKDOWN_VAULT_MCP_LENGTH_DOWNWEIGHT_ALPHA` | `0.25` | Strength of length downweight. `0` disables. |
 | `MARKDOWN_VAULT_MCP_MAX_CHUNK_WORDS` | `400` | Adaptive chunker threshold. Set to a large value to disable. |
 
-**Pipeline order:** Per-channel length downweight → folder boost → fuse (RRF for hybrid; the folder boost then applies to the fused scores) → cap per path → snippet projection → return `limit` results. See **Field collapsing** below for the post-433 grouping step.
+**Pipeline order:** Per-channel length downweight → fuse (RRF for hybrid) → folder boost → cap per path → snippet projection → return `limit` results. In keyword/semantic modes there is no fuse step, so the folder boost applies directly to the per-channel scores; in hybrid it applies to the fused scores, immediately before per-file grouping. See **Field collapsing** below for the post-433 grouping step.
 
 ### Curated Ranking
 

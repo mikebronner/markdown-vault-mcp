@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
+from typing import TYPE_CHECKING
 
 from markdown_vault_mcp.embed_text import EmbedTextBuilder, fields_text
+
+if TYPE_CHECKING:
+    import pytest
 
 # ---------------------------------------------------------------------------
 # fields_text (module-level, shared with the FTS summary column)
@@ -39,6 +44,21 @@ class TestFieldsText:
         assert fields_text({"summary": "x"}, ()) == ""
         assert fields_text(None, ("summary",)) == ""
         assert fields_text({}, ("summary",)) == ""
+
+    def test_non_scalar_field_is_skipped_with_a_debug_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A configured field holding a list/dict contributes nothing, but the
+        skip is logged so an operator can diagnose it (not a silent no-op)."""
+        with caplog.at_level(logging.DEBUG, logger="markdown_vault_mcp.embed_text"):
+            result = fields_text(
+                {"tags": ["a", "b"], "summary": "kept"}, ("tags", "summary")
+            )
+        assert result == "kept"
+        assert any(
+            "skipping non-scalar" in r.getMessage() and "key=tags" in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_date_time_values_are_iso_coerced_and_stay_searchable(self) -> None:
         """YAML parses date-like scalars to datetime types; they must be kept.
