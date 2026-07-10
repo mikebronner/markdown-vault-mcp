@@ -11,6 +11,7 @@ from markdown_vault_mcp.config import (
     derive_max_chunk_chars,
 )
 from markdown_vault_mcp.config_sections import (
+    ContentConfig,
     EmbeddingsConfig,
     GitConfig,
     IndexingConfig,
@@ -354,13 +355,25 @@ class TestToVaultKwargs:
             indexing=IndexingConfig(exclude_patterns=[".obsidian/**"]),
         )
         kwargs = config.to_vault_kwargs()
+        # Configured patterns pass through verbatim; the conventions-file
+        # exclusion is derived inside Vault.__init__, not here.
         assert kwargs["exclude_patterns"] == (".obsidian/**",)
         assert kwargs["source_dir"] == Path("/tmp/vault")
+        assert kwargs["conventions_file"] == "_conventions.md"
 
-    def test_excludes_git_token(self) -> None:
+    def test_conventions_file_disabled_passes_none(self, tmp_path: Path) -> None:
         config = ProjectConfig(
-            source_dir=Path("/tmp/vault"),
-            git=GitConfig(token="ghp_secret"),
+            source_dir=tmp_path / "vault",
+            content=ContentConfig(conventions_file=None),
+        )
+        kwargs = config.to_vault_kwargs()
+        assert kwargs["conventions_file"] is None
+
+    def test_excludes_git_token(self, tmp_path: Path) -> None:
+        fake_token = "".join(["ghp_", "secret"])
+        config = ProjectConfig(
+            source_dir=tmp_path / "vault",
+            git=GitConfig(token=fake_token),
         )
         kwargs = config.to_vault_kwargs()
         assert "git_token" not in kwargs
@@ -1808,6 +1821,41 @@ class TestContentConfigFromEnv:
             monkeypatch.delenv(f"MARKDOWN_VAULT_MCP_{k}", raising=False)
         cfg = ContentConfig.from_env("MARKDOWN_VAULT_MCP", tmp_path)
         assert cfg == ContentConfig()
+
+    def test_conventions_file_default(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("MARKDOWN_VAULT_MCP_CONVENTIONS_FILE", raising=False)
+        cfg = ContentConfig.from_env("MARKDOWN_VAULT_MCP", tmp_path)
+        assert cfg.conventions_file == "_conventions.md"
+
+    def test_conventions_file_custom(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_CONVENTIONS_FILE", "AGENTS.md")
+        cfg = ContentConfig.from_env("MARKDOWN_VAULT_MCP", tmp_path)
+        assert cfg.conventions_file == "AGENTS.md"
+
+    @pytest.mark.parametrize("raw", ["none", "None", " NONE "])
+    def test_conventions_file_none_sentinel_disables(
+        self, monkeypatch, tmp_path, raw: str
+    ):
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_CONVENTIONS_FILE", raw)
+        cfg = ContentConfig.from_env("MARKDOWN_VAULT_MCP", tmp_path)
+        assert cfg.conventions_file is None
+
+    def test_conventions_file_empty_keeps_default(self, monkeypatch, tmp_path):
+        # The shared env() helper treats empty-as-unset, so an empty value
+        # falls back to the default rather than disabling.
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_CONVENTIONS_FILE", "")
+        cfg = ContentConfig.from_env("MARKDOWN_VAULT_MCP", tmp_path)
+        assert cfg.conventions_file == "_conventions.md"
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["a/b.md", "a\\b.md", "conventions.txt", "notes*.md", "c[v2].md", "a?.md"],
+    )
+    def test_conventions_file_rejects_paths_non_md_and_globs(self, bad: str):
+        # fnmatch metacharacters would invert the derived exclusion: the
+        # real file gets indexed while unrelated matching notes vanish.
+        with pytest.raises(ConfigurationError, match="conventions_file"):
+            ContentConfig(conventions_file=bad)
 
     def test_attachment_extensions_wildcard(self, monkeypatch, tmp_path):
         from markdown_vault_mcp.config_sections import ContentConfig

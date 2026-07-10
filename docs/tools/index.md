@@ -26,6 +26,7 @@ markdown-vault-mcp exposes MCP tools across several categories. Write tools are 
 | [`get_toc`](#get_toc) | Table of Contents | Read | Heading outline for a note or a folder subtree |
 | [`get_recent`](#get_recent) | Recent Notes | Read | Get the most recently modified notes |
 | [`get_context`](#get_context) | Note Context | Read | Get a consolidated context dossier for a note |
+| [`get_conventions`](#get_conventions) | Folder Conventions | Read | Get the authoring conventions that apply to a note or folder |
 | [`get_orphan_notes`](#get_orphan_notes) | Orphan Notes | Read | Find notes with no inbound or outbound links |
 | [`get_most_linked`](#get_most_linked) | Most-Linked Notes | Read | Find the most-linked-to notes ranked by backlink count |
 | [`get_connection_path`](#get_connection_path) | Connection Path | Read | Find the shortest path between two notes via link graph |
@@ -297,6 +298,12 @@ by ~33%.
 
 **Returns:** `{"path": "Journal/note.md", "created": true}`
 
+For `.md` files, the response may also include a `conventions` list: the
+[folder conventions](#get_conventions) that apply to the target folder
+(root-first `{folder, path, content}` entries; omitted when none apply).
+Clients should verify the written note complies and issue a corrective `edit`
+if it does not.
+
 !!! warning
     `write` replaces the entire file. Use `edit` for targeted changes to existing documents.
 
@@ -321,7 +328,7 @@ Make a targeted text replacement in an existing document. Supports three modes:
 
 **Returns:** `{"path": "Journal/note.md", "replacements": 1, "match_type": "exact"}`
 
-`match_type` is `"exact"` when the text matched byte-for-byte, or `"normalized"` when it matched after Unicode/whitespace normalization.
+`match_type` is `"exact"` when the text matched byte-for-byte, or `"normalized"` when it matched after Unicode/whitespace normalization. The response may also include a `conventions` list; see [`write`](#write).
 
 !!! tip "Usage pattern"
     Always call `read` first to get the exact current text and line numbers. For small edits, use `old_text` (exact match). For large block replacements, use `line_start`/`line_end` with the line numbers shown by `read`. Frontmatter can be edited; `old_text` may span the YAML block.
@@ -409,6 +416,8 @@ the saved file by `path` for downstream tools rather than `read()`-ing it
 back into context.
 
 **Returns:** `{"path": "notes/report.md", "created": true, "content_length": 4096, "content_type": "text/markdown"}`
+
+For `.md` destinations, the response may also include a `conventions` list; see [`write`](#write).
 
 !!! note "Dependency"
     Requires `httpx`. Install with `pip install 'markdown-vault-mcp[all]'`.
@@ -623,12 +632,17 @@ Find semantically similar notes by document path. Requires embeddings to be buil
 | `path` | string | required | Relative path to the document |
 | `limit` | int | `10` | Maximum files to return |
 | `chunks_per_file` | int | server default (`2`) | Maximum number of matching sections returned per file. Overrides `MARKDOWN_VAULT_MCP_CHUNKS_PER_FILE` for this call. `0` is rejected. |
+| `folder` | string | `null` | Restrict results to this folder (exact match or sub-folder prefix), such as `3-Resources` |
+| `filters` | object | `null` | Frontmatter equality filters, ANDed, such as `{"type": "resource"}`. List-valued fields match by membership |
 | `wait_for_pending_writes` | bool | `false` | Block until the IndexWriter drains before answering, then report freshness via `_meta.index_stale` (see the *Index freshness on read tools* note at the top of this page). |
 
 **Returns:** List of grouped similar-document dicts ranked by cosine similarity, one entry per file with up to `chunks_per_file` best-matching sections. Each entry contains: `path`, `title`, `folder`, `score` (max section score), `search_type` (`"semantic"`), `frontmatter`, and `sections` (a list of `{heading, content, score}` dicts sorted by score then document order). Index freshness is reported in `_meta.index_stale` (see the freshness note at the top of this page).
 
 !!! note "Grouped result shape"
     Returns one entry per file with up to `chunks_per_file` best-matching sections. Default is 2 sections per file; pass `chunks_per_file=1` for compact dossiers.
+
+!!! note "Filter semantics"
+    `folder` and `filters` are applied *after* the vector search (the vector store carries no structured metadata), against each candidate's full frontmatter. Unlike `search`'s keyword-mode filters, they are not limited to `MARKDOWN_VAULT_MCP_INDEXED_FIELDS`: any frontmatter key works. The candidate pool is automatically widened when filtering so narrow filters do not starve the result list.
 
 ### `get_toc`
 
@@ -676,10 +690,46 @@ Get a consolidated context dossier for a note. Combines backlinks, outlinks, sim
 | `link_limit` | int | `10` | Max backlinks and outlinks to include each |
 | `wait_for_pending_writes` | bool | `false` | Block until the IndexWriter drains before answering, then report freshness via `_meta.index_stale` (see the *Index freshness on read tools* note at the top of this page). |
 
-**Returns:** Object with `path`, `title`, `folder`, `frontmatter`, `modified_at`, `backlinks`, `outlinks`, `similar`, `folder_notes`, and `tags` fields. The `similar` list contains grouped result dicts, one entry per file with up to `chunks_per_file` best-matching sections (default 1 for `get_context` to keep dossiers compact). Index freshness is reported in `_meta.index_stale` (see the freshness note at the top of this page).
+**Returns:** Object with `path`, `title`, `folder`, `frontmatter`, `modified_at`, `backlinks`, `outlinks`, `similar`, `folder_notes`, and `tags` fields. The `similar` list contains grouped result dicts, one entry per file with up to `chunks_per_file` best-matching sections (default 1 for `get_context` to keep dossiers compact). May also include a `conventions` list: the [folder conventions](#get_conventions) that apply to the note's folder. Index freshness is reported in `_meta.index_stale` (see the freshness note at the top of this page).
 
 !!! note "Grouped similar shape"
     Each `similar` entry contains `path`, `title`, `folder`, `score`, `search_type`, `frontmatter`, and `sections` (a list of `{heading, content, score}` dicts). `get_context` defaults to one section per file for compact dossiers; `search` and `get_similar` default to 2.
+
+### `get_conventions`
+
+Get the vault owner's authoring conventions that apply to a note or folder.
+
+Vaults may carry per-folder convention files (default `_conventions.md`,
+configurable via
+[`MARKDOWN_VAULT_MCP_CONVENTIONS_FILE`](../configuration.md)) whose free-form
+markdown describes how notes in that folder should be authored, such as
+*"reference material: keep notes self-contained; do not link out to project
+or journal notes."* Conventions accumulate down the tree: a vault-root file
+applies everywhere and nested files add to it. The server transports the text
+verbatim; it never interprets it.
+
+Convention files are excluded from the search index (they never appear in
+`search`, `list_documents`, or `get_similar` results) but remain readable via
+`read` and editable via `write`/`edit`. This tool reads directly from disk,
+so it works even while the index is still building.
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `path` | string | `""` | Relative note path (resolves to its parent folder) or folder path. `""` returns vault-root conventions plus the folder listing |
+
+**Returns:** Object with:
+
+- `path`: the queried path.
+- `conventions`: applicable entries, root-first, each `{folder, path, content}` (`folder` is `""` for the vault root).
+- `convention_folders`: every folder carrying a convention file. Included only in discovery mode (`path=""`), since it requires a vault-wide folder walk.
+
+!!! tip "Write-time enforcement"
+    The `write`, `edit`, and `fetch` tools echo applicable conventions in
+    their responses, so a client can self-check compliance right after
+    writing. Call `get_conventions` *before* writing to get the rules up
+    front.
 
 ### `get_orphan_notes`
 

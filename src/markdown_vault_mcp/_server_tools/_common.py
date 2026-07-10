@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import TypeVar
+from dataclasses import asdict
+from typing import Any, TypeVar
 
 from fastmcp.tools import ToolResult
 
@@ -17,6 +18,49 @@ logger = logging.getLogger(__name__)
 # ToolResult, so its result must be `return`ed directly from a tool, never
 # stored or processed as `_T` (mypy would not catch the mismatch).
 _T = TypeVar("_T")
+
+
+def conventions_payload(vault: Vault, path: str) -> list[dict[str, str]]:
+    """Return the JSON-able folder-convention chain for *path*.
+
+    Args:
+        vault: The vault whose conventions resolver to consult.
+        path: Vault-relative note or folder path.
+
+    Returns:
+        Convention entries (root-first) as dicts, or ``[]`` when the
+        feature is disabled, no convention files apply, or *path* is
+        invalid (lookup failures never break the calling tool).
+    """
+    try:
+        return [asdict(entry) for entry in vault.conventions.for_path(path)]
+    except ValueError:
+        logger.debug("conventions_lookup_failed path=%s", path, exc_info=True)
+        return []
+
+
+async def attach_conventions(
+    vault: Vault, data: dict[str, Any], path: str
+) -> dict[str, Any]:
+    """Add the folder-convention chain for *path* to a tool result dict.
+
+    The ``conventions`` key is omitted entirely when no conventions apply,
+    keeping the enrichment additive and non-breaking. Shared by the
+    ``write`` / ``edit`` / ``fetch`` / ``get_context`` tools so the result
+    shape stays consistent across all of them.
+
+    Args:
+        vault: The vault whose conventions resolver to consult.
+        data: The tool's result dict (mutated in place).
+        path: Vault-relative note path the tool operated on.
+
+    Returns:
+        The same *data* dict, for call-site convenience.
+    """
+    conventions = await asyncio.to_thread(conventions_payload, vault, path)
+    if conventions:
+        data["conventions"] = conventions
+    return data
 
 
 def _resolve_drain_timeout() -> float:
