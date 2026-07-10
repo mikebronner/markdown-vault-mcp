@@ -187,7 +187,7 @@ All configuration is via environment variables with the `MARKDOWN_VAULT_MCP_` pr
 | `MARKDOWN_VAULT_MCP_REQUIRED_FIELDS` | — | No | Comma-separated frontmatter fields required on every document; documents missing any are excluded from the index |
 | `MARKDOWN_VAULT_MCP_EXCLUDE` | — | No | Comma-separated glob patterns to exclude from scanning (e.g. `.obsidian/**,.trash/**`) |
 | `MARKDOWN_VAULT_MCP_TITLE_FIELD` | `title` | No | Frontmatter field used as the document title (falls back to `title`, the first H1, then the filename). Changing it cold-rebuilds the index once on next startup |
-| `MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS` | — | No | Comma-separated frontmatter fields whose text values become keyword-searchable (and, with `EMBED_CONTEXT`, are prefixed to first-chunk embedding text). Changing it cold-rebuilds the index once on next startup |
+| `MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS` | none | No | Comma-separated frontmatter fields whose text values become keyword-searchable (and, with `EMBED_CONTEXT`, are prefixed to first-chunk embedding text). Changing it cold-rebuilds the index once on next startup |
 | `MARKDOWN_VAULT_MCP_TEMPLATES_FOLDER` | `_templates` | No | Relative folder path where note templates live (used by the `create_from_template` prompt) |
 | `MARKDOWN_VAULT_MCP_PROMPTS_FOLDER` | — | No | Path to a directory of `.md` prompt files that extend or override built-in prompts (see [User-defined prompts](#user-defined-prompts)) |
 | `MARKDOWN_VAULT_MCP_DRAIN_TIMEOUT_S` | `60` | No | Maximum seconds an index-querying read tool waits for the IndexWriter to drain when called with `wait_for_pending_writes=True`. On timeout the tool answers from the current index rather than raising and reports `index_stale=True` in the response's `_meta`. |
@@ -227,7 +227,7 @@ All configuration is via environment variables with the `MARKDOWN_VAULT_MCP_` pr
 | `MARKDOWN_VAULT_MCP_CHUNKS_PER_FILE` | `2` | Maximum chunks returned per document in `search` results. |
 | `MARKDOWN_VAULT_MCP_SNIPPET_WORDS` | `200` | Width of the snippet window (words) in `search` results; `0` returns full chunk content. |
 | `MARKDOWN_VAULT_MCP_LENGTH_DOWNWEIGHT_ALPHA` | `0.25` | Down-weights longer chunks in ranking (`score / (1 + alpha · log(chunk_count))`). |
-| `MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS` | — | Folder-prefix score multipliers (`prefix:weight,...`, weights > 0) applied to all search modes; the deepest matching prefix wins (e.g. `sessions:0.5` demotes `sessions/**`). |
+| `MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS` | none | Folder-prefix score multipliers (`prefix:weight,...`, weights > 0) applied to all search modes; the deepest matching prefix wins (`sessions:0.5` demotes `sessions/**`). |
 | `MARKDOWN_VAULT_MCP_FTS_WEIGHTS` | all `1.0` | Per-column BM25 weights (`column:weight,...`, weights ≥ 0) for keyword ranking. Columns: `path`, `title`, `folder`, `heading`, `content`, `summary`. |
 
 > **Note:** the chunker's character cap (`MARKDOWN_VAULT_MCP_MAX_CHUNK_CHARS`) is derived from the embedding model's context length, so changing the embedding model re-chunks the FTS index — not just the embeddings — and triggers an automatic cold rebuild of the index on the next startup. The defaults stay memory-light (`BAAI/bge-small-en-v1.5` for FastEmbed, `nomic-embed-text` for Ollama); long-context models — `nomic-ai/nomic-embed-text-v1.5` (8192 tokens) for FastEmbed, or `bge-m3:latest` for Ollama — are opt-in and need substantially more RAM/VRAM during indexing.

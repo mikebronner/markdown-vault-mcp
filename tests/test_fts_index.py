@@ -1157,6 +1157,74 @@ class TestNotesFtsSummaryMigration:
         assert len(idx2.search("summary:entanglement")) == 1
         idx2.close()
 
+    def test_failed_repopulation_rolls_back_and_preserves_legacy_table(
+        self, tmp_path: Path
+    ) -> None:
+        """A crash mid-migration must not strand an empty ``notes_fts``.
+
+        The DROP/CREATE/INSERT run inside one explicit transaction, so a
+        failure during the repopulating ``INSERT ... SELECT`` rolls back to
+        the intact legacy 5-column table. The migration then retries cleanly
+        on the next open, rather than early-returning on a present-but-empty
+        6-column table that the warm-restart sentinel would report as
+        populated (silently killing keyword search forever).
+        """
+        db = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(_LEGACY_SCHEMA)
+        conn.execute(
+            "INSERT INTO documents (id, path, title, folder, frontmatter_json,"
+            " content_hash, modified_at, chunk_count)"
+            " VALUES (1, 'a.md', 'Alpha', '', '{}', 'h1', 1000.0, 1)"
+        )
+        conn.execute(
+            "INSERT INTO sections (document_id, heading, heading_level, content,"
+            " start_line) VALUES (1, 'Intro', 1, 'hello world body', 0)"
+        )
+        conn.execute(
+            "INSERT INTO notes_fts (path, title, folder, heading, content)"
+            " VALUES ('a.md', 'Alpha', '', 'Intro', 'hello world body')"
+        )
+        conn.commit()
+        conn.close()
+
+        class _FailRepopulateConnection(sqlite3.Connection):
+            """Raise only on the migration's repopulating ``INSERT ... SELECT``."""
+
+            def execute(self, sql, *args):  # type: ignore[override]
+                upper = sql.upper()
+                if "INSERT INTO NOTES_FTS" in upper and "SELECT" in upper:
+                    raise sqlite3.OperationalError("simulated disk-full mid-migration")
+                return super().execute(sql, *args)
+
+        real_connect = sqlite3.connect
+
+        def _failing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+            kwargs["factory"] = _FailRepopulateConnection
+            return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch("markdown_vault_mcp.fts_index.sqlite3.connect", _failing_connect),
+            pytest.raises(sqlite3.OperationalError, match="simulated disk-full"),
+        ):
+            FTSIndex(db_path=db)
+
+        # Rollback restored the legacy 5-column table and its row intact.
+        verify = sqlite3.connect(db)
+        cols = [r[1] for r in verify.execute("PRAGMA table_info(notes_fts)").fetchall()]
+        assert cols == ["path", "title", "folder", "heading", "content"]
+        assert verify.execute("SELECT count(*) FROM notes_fts").fetchone()[0] == 1
+        verify.close()
+
+        # A healthy retry completes the migration and keeps the row searchable.
+        idx = FTSIndex(db_path=db)
+        cols2 = [
+            r[1] for r in idx._conn().execute("PRAGMA table_info(notes_fts)").fetchall()
+        ]
+        assert cols2 == ["path", "title", "folder", "heading", "content", "summary"]
+        assert len(idx.search("hello")) == 1
+        idx.close()
+
 
 class TestPersistedRankConfig:
     @staticmethod

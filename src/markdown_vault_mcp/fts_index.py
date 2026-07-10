@@ -544,6 +544,18 @@ class FTSIndex:
         ``meta`` table is untouched, so the warm-restart completeness
         sentinel survives the migration.
 
+        The DROP/CREATE/INSERT run inside one explicit transaction rather
+        than :meth:`sqlite3.Connection.executescript`, which commits before
+        it runs and leaves each statement to autocommit individually. A
+        crash (SIGKILL/OOM/power loss) between the CREATE and the INSERT
+        would otherwise leave a present-but-empty ``notes_fts``; the next
+        boot would see the ``summary`` column, early-return here, and the
+        warm-restart short-circuit (meta sentinel + ``documents`` both
+        intact) would skip the rebuild — keyword search silently returning
+        nothing forever. On any failure the transaction rolls back, so the
+        legacy table is preserved and the migration retries cleanly on the
+        next boot.
+
         Args:
             conn: The primary connection (inside :meth:`_init_schema`).
         """
@@ -552,21 +564,31 @@ class FTSIndex:
         }
         if "summary" in cols:
             return
-        conn.executescript(
-            """
-            DROP TABLE notes_fts;
-            CREATE VIRTUAL TABLE notes_fts USING fts5(
-                path, title, folder, heading, content, summary,
-                tokenize='porter unicode61'
-            );
-            INSERT INTO notes_fts(path, title, folder, heading, content, summary)
-            SELECT d.path, d.title, d.folder, COALESCE(s.heading, ''),
-                   s.content, ''
-            FROM sections s
-            JOIN documents d ON d.id = s.document_id;
-            """
-        )
-        conn.commit()
+        try:
+            conn.execute("BEGIN")
+            conn.execute("DROP TABLE notes_fts")
+            conn.execute(
+                "CREATE VIRTUAL TABLE notes_fts USING fts5("
+                "path, title, folder, heading, content, summary, "
+                "tokenize='porter unicode61')"
+            )
+            conn.execute(
+                "INSERT INTO notes_fts"
+                "(path, title, folder, heading, content, summary) "
+                "SELECT d.path, d.title, d.folder, COALESCE(s.heading, ''), "
+                "s.content, '' "
+                "FROM sections s "
+                "JOIN documents d ON d.id = s.document_id"
+            )
+            conn.commit()
+        except sqlite3.Error:
+            conn.rollback()
+            logger.error(
+                "fts_index: notes_fts summary migration failed; "
+                "legacy table preserved for retry",
+                exc_info=True,
+            )
+            raise
         logger.info(
             "fts_index: migrated notes_fts — added summary column and "
             "repopulated from sections"

@@ -562,6 +562,62 @@ class TestPreambleConvergence:
         finally:
             v2.close()
 
+    def test_v2_sidecar_search_path_loads_clean_without_rebuild(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """SearchManager's lazy vector load carries the v2 format token.
+
+        ``Vault`` wires ``embed_text_format`` into two independent
+        consumers — ``IndexManager`` and ``SearchManager`` — each loading the
+        shared sidecar with its own slot. The convergence tests exercise only
+        the IndexManager path; a semantic search is the sole trigger for
+        SearchManager's lazy load. If SearchManager's token were mis-wired to
+        the default ``"v1"``, the first semantic search after every boot would
+        see the ``"v2;fields=summary"`` sidecar as incompatible and route to a
+        full re-embed — a silent per-boot rebuild the IndexManager-only tests
+        miss. ``load_or_self_heal`` logs that mismatch (``Rebuilding
+        embeddings.``) synchronously before queueing the rebuild, so its
+        absence proves the token matched; the doc is also returned.
+        """
+        import logging
+
+        provider = MockEmbeddingProvider()
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
+        (vault_dir / "doc.md").write_text(
+            "---\nsummary: a crisp summary\n---\n# Doc\n\nstable body\n",
+            encoding="utf-8",
+        )
+        v1 = _boot_enriched(vault_dir, tmp_path, provider)
+        v1.close()
+
+        # Construct an enriched Vault and build ONLY the FTS index, leaving
+        # SearchManager's vector slot cold: build_embeddings would pre-populate
+        # it and bypass the on-disk load entirely, so a semantic query is the
+        # sole trigger for SearchManager's independent, lazy sidecar load.
+        v2 = Vault(
+            source_dir=vault_dir,
+            index_path=tmp_path / "fts.db",
+            state_path=tmp_path / "s.json",
+            embeddings_path=tmp_path / "vectors",
+            embedding_provider=provider,
+            searchable_frontmatter_fields=["summary"],
+        )
+        v2.index.build_index()
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="markdown_vault_mcp.managers.search"
+            ):
+                results = v2.reader.search("crisp summary", mode="semantic", limit=50)
+            assert any(r.path == "doc.md" for r in results)
+            # A mis-wired token would raise VectorIndexCompatibilityError and
+            # log this before rebuilding; a matching token loads clean.
+            assert not any(
+                "Rebuilding embeddings" in r.getMessage() for r in caplog.records
+            )
+        finally:
+            v2.close()
+
     def test_legacy_rows_without_preamble_do_not_re_embed_under_defaults(
         self, tmp_path: Path
     ) -> None:
