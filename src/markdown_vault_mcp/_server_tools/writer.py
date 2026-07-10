@@ -19,6 +19,7 @@ from markdown_vault_mcp.vault import Vault
 
 from .._icons import _TOOL_ICONS
 from .._server_deps import get_vault
+from ._common import attach_conventions
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +170,13 @@ def register(mcp: FastMCP) -> None:
 
         Returns:
             Dict with path (str) and created (bool — true if new file,
-            false if overwrite).
+            false if overwrite). For .md files, may include 'conventions':
+            the user's authoring conventions for the target folder
+            (root-first list of {folder, path, content}). When present,
+            verify the note you just wrote complies — e.g. self-containment
+            or linking-direction rules — and issue a follow-up 'edit' if it
+            does not. To check conventions *before* writing, call
+            'get_conventions(path)'.
 
         Supports split (write several new notes from one source) and merge
         (extend an existing note with content from another) when composed with
@@ -212,7 +219,7 @@ def register(mcp: FastMCP) -> None:
             frontmatter=frontmatter,
             if_match=if_match,
         )
-        return asdict(result)
+        return await attach_conventions(vault, asdict(result), path)
 
     @mcp.tool(
         tags={"write"},
@@ -271,6 +278,10 @@ def register(mcp: FastMCP) -> None:
             - **path** (str): path of the edited document.
             - **replacements** (int): always 1.
             - **match_type** (str): ``'exact'`` or ``'normalized'``.
+            - **conventions** (list, optional): the user's authoring
+              conventions for the note's folder (root-first list of
+              {folder, path, content}). When present, verify the edited
+              note complies and issue a follow-up 'edit' if it does not.
 
         Raises:
             ValueError: If parameter combination is invalid, or line
@@ -291,7 +302,7 @@ def register(mcp: FastMCP) -> None:
                 line_start=line_start,
                 line_end=line_end,
             )
-            return asdict(result)
+            return await attach_conventions(vault, asdict(result), path)
         except EditConflictError as exc:
             parts = [str(exc)]
             if exc.closest_match_line is not None:
@@ -526,6 +537,10 @@ def register(mcp: FastMCP) -> None:
             - created (bool): true if new file, false if overwrite
             - content_length (int): bytes downloaded
             - content_type (str or null): Content-Type from the response
+            - conventions (list, optional; .md only): the user's authoring
+              conventions for the target folder (root-first list of
+              {folder, path, content}). When present, verify the saved note
+              complies and issue a follow-up 'edit' if it does not.
 
         Primary building block for URL-to-note capture flows: call ``fetch`` to
         retrieve the source, summarize via the LLM, and ``write`` the result
@@ -664,8 +679,11 @@ def register(mcp: FastMCP) -> None:
                 if_match=if_match,
             )
 
-        return {
+        data = {
             **asdict(result),
             "content_length": content_length,
             "content_type": content_type,
         }
+        if is_markdown:
+            data = await attach_conventions(vault, data, path)
+        return data

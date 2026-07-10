@@ -11,6 +11,7 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
+from markdown_vault_mcp.conventions import ConventionsResolver
 from markdown_vault_mcp.facets import (
     GraphFacet,
     IndexFacet,
@@ -176,6 +177,12 @@ class Vault:
             (subtree expansion is truncated to this many notes; default 50).
         summarize_max_input_chars: Aggregate cap on note characters sent to the
             summarization backend per call (default 200000).
+        conventions_file: Well-known per-folder conventions filename resolved
+            by :attr:`conventions` (default ``"_conventions.md"``); ``None``
+            disables folder conventions. When set, the filename is
+            automatically appended to *exclude_patterns* (in both fnmatch
+            forms) so convention files stay out of the index while remaining
+            disk-readable. Must not contain fnmatch metacharacters.
     """
 
     def __init__(
@@ -207,6 +214,7 @@ class Vault:
         summarizer: Summarizer | None = None,
         summarize_max_notes: int = 50,
         summarize_max_input_chars: int = 200_000,
+        conventions_file: str | None = "_conventions.md",
     ) -> None:
         self._source_dir = source_dir
         self._index_path = index_path
@@ -244,6 +252,26 @@ class Vault:
         self._on_write = on_write
         self._git_strategy = git_strategy
         self._git_pull_interval_s = git_pull_interval_s
+        # The resolver prunes its folder walk with the *configured* patterns
+        # only — the derived patterns below would otherwise exclude the
+        # convention files themselves.
+        self._conventions = ConventionsResolver(
+            source_dir, conventions_file, exclude_patterns=exclude_patterns
+        )
+        if conventions_file:
+            if any(ch in conventions_file for ch in "*?[]"):
+                raise ValueError(
+                    "conventions_file must not contain fnmatch metacharacters "
+                    f"(*, ?, [, ]), got {conventions_file!r}"
+                )
+            # Convention files are index-excluded but stay disk-readable.
+            # Both fnmatch forms are needed: `**/name` alone does not match
+            # a root-level file.
+            exclude_patterns = [
+                *(exclude_patterns or []),
+                conventions_file,
+                f"**/{conventions_file}",
+            ]
         self._exclude_patterns = exclude_patterns
         self._attachment_extensions = attachment_extensions
         self._max_attachment_size_mb = max_attachment_size_mb
@@ -444,6 +472,21 @@ class Vault:
                 "install the SDK with: pip install 'markdown-vault-mcp[summarize]'"
             )
         return self._summarize_facet
+
+    @property
+    def conventions(self) -> ConventionsResolver:
+        """Folder-conventions resolver (disk-read, index-independent)."""
+        return self._conventions
+
+    @property
+    def exclude_patterns(self) -> list[str] | None:
+        """The effective exclusion patterns, including derived ones.
+
+        Contains the configured patterns plus the conventions-file patterns
+        derived in ``__init__`` — the list the scanner, reconcile, and
+        incremental index paths actually enforce.
+        """
+        return self._exclude_patterns
 
     @property
     def source_dir(self) -> Path:

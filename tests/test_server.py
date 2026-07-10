@@ -244,6 +244,7 @@ class TestToolManifest:
             "get_broken_links",
             "get_connection_path",
             "get_context",
+            "get_conventions",
             "get_diff",
             "get_history",
             "get_index_status",
@@ -1987,6 +1988,25 @@ class TestSimilarTool:
                 {"path": "simple.md", "limit": 5, "chunks_per_file": 1},
             )
         assert _meta_stale(result) is False
+        data = _parse_tool_data(result)
+        assert isinstance(data, list)
+
+    @pytest.mark.usefixtures("_mcp_env")
+    async def test_get_similar_tool_accepts_folder_and_filters(self) -> None:
+        """The `get_similar` MCP tool surfaces the folder/filters kwargs."""
+        server = make_server()
+        async with Client(server) as client:
+            await wait_for_mcp_writer_drain(client)
+            # Without embeddings this returns []; the assertion is that the
+            # call_tool schema accepts the new kwargs without raising.
+            result = await client.call_tool(
+                "get_similar",
+                {
+                    "path": "simple.md",
+                    "folder": "subfolder",
+                    "filters": {"tags": "x"},
+                },
+            )
         data = _parse_tool_data(result)
         assert isinstance(data, list)
 

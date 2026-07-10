@@ -13,7 +13,7 @@ from markdown_vault_mcp.vault import Vault
 from .._icons import _TOOL_ICONS
 from .._server_deps import get_vault
 from .._server_queryable import needs_queryable
-from ._common import _maybe_wait_for_drain, _staleness_result
+from ._common import _maybe_wait_for_drain, _staleness_result, attach_conventions
 
 
 def register(mcp: FastMCP) -> None:
@@ -482,6 +482,8 @@ def register(mcp: FastMCP) -> None:
         path: str,
         limit: int = 10,
         chunks_per_file: int | None = None,
+        folder: str | None = None,
+        filters: dict[str, str] | None = None,
         wait_for_pending_writes: bool = False,
         vault: Vault = Depends(get_vault),
     ) -> list[dict[str, Any]]:
@@ -500,6 +502,15 @@ def register(mcp: FastMCP) -> None:
             limit: Maximum number of similar notes to return (default 10).
             chunks_per_file: Maximum sections returned per file (default 2).
                 Set to 1 for one best section per file.  Must be >= 1.
+            folder: Restrict results to this folder (exact match or
+                sub-folder prefix), e.g. "3-Resources". Useful to scope
+                link candidates to one part of the vault.
+            filters: Frontmatter equality filters, ANDed — e.g.
+                {"type": "resource"}. Matched post-hoc against each
+                candidate's full frontmatter, so any frontmatter key works
+                (unlike keyword 'search' filters, which are limited to
+                indexed_frontmatter_fields). List-valued fields match if
+                the value is among them.
             wait_for_pending_writes: When True, wait until your recent
                 write/edit/delete/rename operations have been applied to the
                 index before answering, so the results reflect those changes.
@@ -538,7 +549,9 @@ def register(mcp: FastMCP) -> None:
 
         Useful for finding link candidates that aren't yet wikilinked — the
         vault's organic graph is almost always denser than its explicit one.
-        See the ``propose-links`` prompt for a full vault-wide sweep.
+        See the ``propose-links`` prompt for a full vault-wide sweep. Respect
+        folder conventions (see 'get_conventions') when turning similarity
+        into links — some folders are self-contained by design.
 
         Raises:
             ValueError: If no document exists at the given path.
@@ -552,6 +565,8 @@ def register(mcp: FastMCP) -> None:
             path,
             limit=limit,
             chunks_per_file=chunks_per_file,
+            folder=folder,
+            filters=filters,
         )
         return _staleness_result(
             vault,
@@ -786,6 +801,11 @@ def register(mcp: FastMCP) -> None:
               folder (up to 20). Plain strings, not dicts.
             - tags (dict[str, list[str]]): Indexed frontmatter field →
               distinct values for this note.
+            - conventions (list, optional): the user's authoring conventions
+              for the note's folder (root-first list of {folder, path,
+              content}). Present only when convention files apply. Honor
+              them when writing to or proposing links involving this note —
+              some folders are self-contained by design.
 
             Index freshness is reported out-of-band in the response's
             ``_meta.index_stale`` field — True when the IndexWriter had
@@ -795,7 +815,9 @@ def register(mcp: FastMCP) -> None:
 
         The ``similar`` field in the response surfaces notes that may warrant
         explicit links to the context note but don't yet — a common input to
-        manual or automated link proposal.
+        manual or automated link proposal. Respect the ``conventions`` field
+        (and 'get_conventions') when proposing links — some folders are
+        self-contained by design.
 
         Raises:
             ValueError: If no document exists at the given path.
@@ -810,6 +832,69 @@ def register(mcp: FastMCP) -> None:
             similar_limit=similar_limit,
             link_limit=link_limit,
         )
+        data = await attach_conventions(vault, asdict(result), path)
         return _staleness_result(
-            vault, asdict(result), drained_on_request=drained, gen_before=gen_before
+            vault, data, drained_on_request=drained, gen_before=gen_before
         )
+
+    @mcp.tool(
+        icons=_TOOL_ICONS["get_conventions"],
+        annotations={
+            "title": "Folder Conventions",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+        },
+    )
+    async def get_conventions(
+        path: str = "",
+        vault: Vault = Depends(get_vault),
+    ) -> dict[str, Any]:
+        """Get the user's authoring conventions that apply to a note or folder.
+
+        Vaults may carry per-folder convention files (by default
+        '_conventions.md') describing how notes in that folder should be
+        authored — for example "reference material: keep notes
+        self-contained; do not link out to project or journal notes".
+        Conventions accumulate down the tree: a vault-root file applies
+        everywhere and nested files add to it, so entries are returned
+        root-first with the most specific guidance last.
+
+        Call this before creating, restructuring, or linking notes so the
+        result follows the vault owner's rules. The write/edit tools also
+        echo applicable conventions in their responses for a post-write
+        compliance check. Reads directly from disk — works even while the
+        search index is still building.
+
+        Args:
+            path: Relative note path (e.g. "3-Resources/topic.md") or folder
+                path (e.g. "3-Resources"). A note path resolves to its
+                parent folder. Pass "" (default) for discovery mode:
+                vault-root conventions plus the full list of folders
+                carrying convention files.
+
+        Returns:
+            Dict with:
+
+            - path (str): The path that was queried.
+            - conventions (list): Applicable convention entries, root-first.
+              Each has folder (str, "" for vault root), path (str, the
+              convention file's own path), and content (str, its markdown
+              body).
+            - convention_folders (list[str], discovery mode only): all
+              folders carrying a convention file ("" = vault root),
+              included only when path is "" — it requires a vault-wide
+              folder walk, so targeted lookups skip it.
+
+        Raises:
+            ValueError: If the path escapes the vault root.
+        """
+
+        def _lookup() -> dict[str, Any]:
+            entries = [asdict(e) for e in vault.conventions.for_path(path)]
+            data: dict[str, Any] = {"path": path, "conventions": entries}
+            if not path:
+                data["convention_folders"] = vault.conventions.list_folders()
+            return data
+
+        return await asyncio.to_thread(_lookup)

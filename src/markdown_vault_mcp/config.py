@@ -162,6 +162,7 @@ class ProjectConfig:
             "indexed_frontmatter_fields": self.indexing.indexed_frontmatter_fields,
             "required_frontmatter": self.indexing.required_frontmatter,
             "exclude_patterns": self.indexing.exclude_patterns,
+            "conventions_file": self.content.conventions_file,
             "attachment_extensions": self.content.attachment_extensions,
             "max_attachment_size_mb": self.content.max_attachment_size_mb,
             "max_note_read_bytes": self.content.max_note_read_bytes,
@@ -369,6 +370,9 @@ class ProjectConfig:
           template markdown files are stored; default ``_templates``.
         - ``MARKDOWN_VAULT_MCP_PROMPTS_FOLDER``: relative folder path where
           user-defined prompt markdown files are stored; default ``None`` (disabled).
+        - ``MARKDOWN_VAULT_MCP_CONVENTIONS_FILE``: well-known per-folder
+          conventions filename surfaced to clients; default ``_conventions.md``;
+          set to ``none`` to disable folder conventions.
 
         **Server identity:**
 

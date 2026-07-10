@@ -289,10 +289,25 @@ focused result) still benefits from biasing toward short focused docs.
 Replaces the per-path cap from PR #433 (`_apply_chunks_per_doc_cap`),
 which thinned duplicates but did not group them.
 
+`get_similar` accepts the same `folder` / `filters` scoping as semantic
+`search`, applied post-hoc via the shared `_post_filter_semantic_rows`
+helper (the vector store carries no structured metadata). The post-filter
+matches against full frontmatter, so — unlike keyword-mode `search`
+filters — it is not limited to `indexed_frontmatter_fields`; the candidate
+pool is widened (×4, floor 200) when filtering is active so narrow scopes
+do not starve the result list.
+
 **Non-goal:** No frontmatter-based ranking. The MCP must not require, recommend, or
 special-case any frontmatter convention on vault content (no `kind`, no `noindex`, no
 `boost`). Vault organisation is the user's choice; the server treats all `.md` files
 structurally identically.
+
+**Carve-out — folder conventions:** the server may *transport* user-authored,
+free-form convention text stored in well-known in-vault files (default
+`_conventions.md`) to clients — see the "Folder Conventions" section. It never
+parses, ranks by, or special-cases the *content* of that text and imposes no
+taxonomy (PARA, `kind`, or otherwise); the non-goal above — no server-side
+interpretation of vault organisation — is unchanged.
 
 **Migration note:** A reindex is required for the adaptive chunker change to take effect
 (the new chunk boundaries and `documents.chunk_count` column differ from older indexes).
@@ -918,6 +933,67 @@ The etag used for comparison is the same value returned in the `etag` field of
 note = vault.reader.read("doc.md")
 vault.writer.write("doc.md", new_content, if_match=note.etag)
 ```
+
+### Folder Conventions
+
+Not every folder in a vault should be treated the same by an LLM client: a
+reference/resources folder typically wants self-contained notes, while a
+projects folder may link out freely. The server itself stays
+convention-agnostic (see the field-collapsing non-goal and its carve-out):
+it *transports* user-authored convention text without interpreting it.
+
+**Storage.** Conventions live in-vault as per-folder files with a well-known
+name (`ContentConfig.conventions_file`, env
+`MARKDOWN_VAULT_MCP_CONVENTIONS_FILE`, default `_conventions.md`; the sentinel
+`none` disables the feature). Semantics are CLAUDE.md-style accumulation: a
+root-level file applies vault-wide and nested files *add to* (never replace)
+their ancestors. Content is free-form markdown; a YAML frontmatter block, if
+present, is stripped before transport (fallback to raw text on parse errors).
+Each entry is truncated to a fixed cap (4000 chars) so a pathological file
+cannot flood tool results.
+
+**Resolution.** `conventions.py::ConventionsResolver` is pure disk I/O with
+zero index coupling: `for_path(path)` walks the ancestor chain root-first
+(one `is_file()` probe per level, no caching), and `list_folders()` walks the
+tree skipping dot-directories. A note path resolves to its parent folder; the
+same `is_relative_to` traversal guard as `validate_path` applies. Disk-read
+resolution means conventions work before the index is built (relevant in
+managed-git mode, where the clone happens inside the server lifespan).
+
+**Index exclusion.** Convention files are excluded from the index but stay
+readable via `read` (which reads from disk). `Vault.__init__` itself derives
+both fnmatch forms (`_conventions.md` and `**/_conventions.md` — the `**/`
+form alone does not match a root-level file) and merges them into its
+effective `exclude_patterns`, so direct library construction behaves
+identically to the served path; the filename is validated against fnmatch
+metacharacters (which would invert the exclusion). Excluded paths are
+enforced at the index choke points every dirty path flows through —
+`IndexManager.process_dirty_paths` (FTS) and `flush_dirty_embeddings`
+(vectors) treat an excluded path as a purge — so any producer (write tools,
+future watchers) is covered, and an MCP `write` to a convention file takes
+effect on disk immediately without ever entering the index. The reconcile
+purge migrates vaults that already had such files indexed. `config://vault`
+reports the vault's *effective* exclude patterns (including the derived
+ones).
+
+**Delivery channels** (write-time first):
+
+1. `write` / `edit` / `fetch` (markdown branch) results carry a
+   `conventions` key — the applicable chain, root-first — omitted when empty.
+   The docstrings instruct the client to verify compliance post-write and
+   issue a corrective `edit`.
+2. The `get_conventions(path)` tool (read-only, no `@needs_queryable`) returns
+   the chain for a path; `path=""` is discovery mode and additionally returns
+   `convention_folders` (targeted lookups skip the vault-wide folder walk).
+3. `get_context` results carry the same `conventions` key (MCP layer only;
+   `NoteContext` is unchanged).
+4. When the feature is enabled, the default server instructions gain one
+   sentence pointing at `get_conventions` and the write-result key. The
+   sentence is emitted unconditionally-when-configured (not gated on files
+   existing) because instructions are composed before the managed-git clone
+   runs; an operator-set `MARKDOWN_VAULT_MCP_INSTRUCTIONS` replaces the
+   default string entirely, including this sentence.
+5. `config://vault` reports `conventions_file` and `convention_folders`.
 
 ### Security: Path Traversal Protection
 

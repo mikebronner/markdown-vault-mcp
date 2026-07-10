@@ -1422,11 +1422,11 @@ class DocumentManager:
             #    rewritten sources. A single mark_paths_dirty batch makes the
             #    writer run resolve_vault_wikilinks() once.
             if self._mark_paths_dirty is not None:
-                dirty: list[str] = []
-                dirty.extend(md_map.keys())  # old paths -> purged
-                dirty.extend(md_map.values())  # new paths -> reparsed
-                dirty.extend(dirty_paths)  # rewritten sources
-                self._mark_paths_dirty(dirty)
+                move_dirty: list[str] = []
+                move_dirty.extend(md_map.keys())  # old paths -> purged
+                move_dirty.extend(md_map.values())  # new paths -> reparsed
+                move_dirty.extend(dirty_paths)  # rewritten sources
+                self._mark_paths_dirty(move_dirty)
 
             # 7. Callbacks: rename for every moved note + allowlisted attachment,
             #    edit for every rewritten source. A source inside the moved

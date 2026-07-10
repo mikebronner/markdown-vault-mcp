@@ -543,6 +543,29 @@ class TestValidation:
         assert mgr._is_path_excluded("drafts/foo.md") is True
         assert mgr._is_path_excluded("alpha.md") is False
 
+    def test_write_to_excluded_path_still_marks_dirty(self, doc_vault: Path) -> None:
+        """Excluded paths ARE dirty-marked; the index layer purges them.
+
+        Exclusion is enforced at the IndexManager choke points
+        (process_dirty_paths / flush_dirty_embeddings), not here — an
+        unconditional mark keeps the purge-on-delete safety net for stale
+        excluded entries. See tests/test_managers_index.py for the
+        choke-point behavior.
+        """
+        fts = FTSIndex(db_path=":memory:")
+        marked: list[str] = []
+        mgr = DocumentManager(
+            fts=fts,
+            source_dir=doc_vault,
+            write_lock=threading.RLock(),
+            chunk_strategy=HeadingChunker(),
+            read_only=False,
+            exclude_patterns=["_conventions.md", "**/_conventions.md"],
+            mark_paths_dirty=lambda paths: marked.extend(paths),
+        )
+        mgr.write("sub/_conventions.md", "Folder rules.")
+        assert marked == ["sub/_conventions.md"]
+
 
 # ---------------------------------------------------------------------------
 # Callback wiring tests
