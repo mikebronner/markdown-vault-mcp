@@ -181,12 +181,14 @@ class Vault:
             titles (default ``"title"``; falls back to ``title`` → first H1
             → filename stem).
         searchable_frontmatter_fields: Frontmatter keys whose scalar values
-            are keyword-searchable via the FTS ``summary`` column and — when
-            enrichment is active — prefixed to first-chunk embedding text.
+            are keyword-searchable via the FTS ``summary`` column and —
+            because configuring this activates format v2 — prefixed to
+            first-chunk embedding text (triggering a one-time re-embed).
             ``None`` disables both.
-        embed_context: When ``True``, embedding input text is enriched with
-            the document title, chunk heading, and searchable-field
-            preamble (default ``False`` — raw chunk content).
+        embed_context: When ``True``, forces format v2 (document title +
+            chunk heading enrichment) even with no
+            ``searchable_frontmatter_fields``; any searchable field also
+            activates v2 (default ``False`` — raw chunk content).
         folder_weights: Folder-prefix score multipliers applied to search
             results just before file grouping (``None`` disables).
         fts_weights: Per-column BM25 weights persisted into the FTS5 rank

@@ -40,6 +40,38 @@ class TestFieldsText:
         assert fields_text(None, ("summary",)) == ""
         assert fields_text({}, ("summary",)) == ""
 
+    def test_date_time_values_are_iso_coerced_and_stay_searchable(self) -> None:
+        """YAML parses date-like scalars to datetime types; they must be kept.
+
+        Dropping them (they are not str/int/float/bool) would make a
+        configured ``SEARCHABLE_FIELDS=date`` silently index nothing.
+        """
+        import datetime
+
+        fm = {
+            "date": datetime.date(2024, 1, 15),
+            "created": datetime.datetime(2024, 1, 15, 15, 30, 0),
+            "at": datetime.time(9, 5),
+        }
+        assert (
+            fields_text(fm, ("date", "created", "at"))
+            == "2024-01-15\n2024-01-15T15:30:00\n09:05:00"
+        )
+
+    def test_live_dict_and_frontmatter_json_paths_agree_on_dates(self) -> None:
+        """The build path (live dict) and convergence path (frontmatter_json)
+        must produce identical text for date fields, or every date-bearing note
+        re-embeds on the first boot. _json_default ISO-stringifies dates for the
+        stored JSON; fields_text must match that on the live dict."""
+        import datetime
+
+        from markdown_vault_mcp.fts_index import _json_default
+
+        fm = {"date": datetime.date(2024, 1, 15), "name": "Alpha"}
+        live = fields_text(fm, ("date", "name"))
+        via_json = fields_text(json.dumps(fm, default=_json_default), ("date", "name"))
+        assert live == via_json == "2024-01-15\nAlpha"
+
 
 # ---------------------------------------------------------------------------
 # format_token canonicalisation

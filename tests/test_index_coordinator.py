@@ -817,6 +817,64 @@ def test_absent_provenance_keys_keep_warm_restart_under_defaults(
         coord2.close(timeout=5)
 
 
+def test_legacy_five_column_db_migrates_and_warm_restarts_via_coordinator(
+    tmp_path: Path,
+) -> None:
+    """A genuine pre-feature on-disk DB opened through the coordinator.
+
+    The upgrade correctness relies on two mechanisms firing together — the
+    summary-column migration AND the warm-restart short-circuit — which the
+    bare-FTSIndex migration tests exercise in isolation. Here a real 5-column
+    ``notes_fts`` with no curated-ranking provenance keys must migrate to
+    6-column on open and still stay on the warm O(1) path under defaults, so an
+    upgrade does not trigger a silent full rescan.
+    """
+    db = tmp_path / "index.db"
+    coord = make_coordinator(tmp_path, db=db)
+    try:
+        coord.build_index()
+        # Downgrade the on-disk index to the genuine pre-feature shape: a
+        # 5-column notes_fts and no title_field/searchable_fields meta keys.
+        conn = coord._fts._conn()
+        with conn:
+            conn.execute(
+                "DELETE FROM meta WHERE key IN ('title_field', 'searchable_fields')"
+            )
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE notes_fts")
+        conn.execute(
+            "CREATE VIRTUAL TABLE notes_fts USING fts5("
+            "path, title, folder, heading, content, tokenize='porter unicode61')"
+        )
+        conn.execute(
+            "INSERT INTO notes_fts(path, title, folder, heading, content) "
+            "SELECT d.path, d.title, d.folder, COALESCE(s.heading, ''), s.content "
+            "FROM sections s JOIN documents d ON d.id = s.document_id"
+        )
+        conn.commit()
+    finally:
+        coord.close(timeout=5)
+
+    coord2 = make_coordinator(tmp_path, db=db)
+    try:
+        # The migration ran on open: notes_fts is 6-column again.
+        cols = [
+            r[1]
+            for r in coord2._fts._conn()
+            .execute("PRAGMA table_info(notes_fts)")
+            .fetchall()
+        ]
+        assert cols == ["path", "title", "folder", "heading", "content", "summary"]
+        # ...and the warm-restart short-circuit still holds — no silent rescan.
+        assert coord2._chunking_meta_matches() is True
+        stats = coord2.build_index()
+        assert stats.chunks_indexed == 0
+        # Migrated rows remain searchable.
+        assert len(coord2._fts.search("body")) >= 1
+    finally:
+        coord2.close(timeout=5)
+
+
 def test_default_curated_knobs_keep_warm_restart(tmp_path: Path) -> None:
     """Same defaults across restarts stay on the warm O(1) path."""
     db = tmp_path / "index.db"

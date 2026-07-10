@@ -348,7 +348,9 @@ class ProjectConfig:
           document title; default ``title``.
         - ``MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS``: comma-separated
           frontmatter fields whose scalar values are keyword-searchable via
-          the FTS ``summary`` column; default none.
+          the FTS ``summary`` column. Setting it also activates
+          context-enriched embeddings (format v2), so it triggers a one-time
+          full re-embed even when ``EMBED_CONTEXT`` is unset; default none.
 
         **Search ranking:**
 
@@ -426,8 +428,9 @@ class ProjectConfig:
         - ``MARKDOWN_VAULT_MCP_FASTEMBED_CACHE_DIR``: FastEmbed model cache
           directory; default ``None``.
         - ``MARKDOWN_VAULT_MCP_EMBED_CONTEXT``: enrich embedding input with
-          the document title, chunk heading, and searchable-field preamble;
-          default ``false``.
+          the document title and chunk heading (and, when
+          ``SEARCHABLE_FIELDS`` is set, their first-chunk preamble). Forces
+          format v2 even with no searchable fields; default ``false``.
 
         **Transfer links:**
 

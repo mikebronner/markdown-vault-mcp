@@ -25,6 +25,7 @@ flip is detected at load time and routes to a full re-embed.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 from dataclasses import dataclass, field
@@ -53,8 +54,9 @@ def fields_text(
 
     Returns:
         The values of the listed fields — scalars only (``str``, ``int``,
-        ``float``, ``bool``); lists/dicts/``None`` are skipped — joined
-        with newlines. ``""`` when no fields are configured, the
+        ``float``, ``bool``, and ``date``/``time``/``datetime``, the last
+        three coerced to ISO strings); lists/dicts/``None`` are skipped —
+        joined with newlines. ``""`` when no fields are configured, the
         frontmatter is empty, or the JSON does not parse.
     """
     if not fields or not frontmatter_or_json:
@@ -74,6 +76,13 @@ def fields_text(
     parts: list[str] = []
     for key in fields:
         value = frontmatter.get(key)
+        # YAML parses date-like scalars to datetime types; coerce them to ISO
+        # strings (as fts_index._json_default does for the documents table) so
+        # the value stays searchable AND the live-dict build path matches the
+        # frontmatter_json convergence path — otherwise every date-bearing note
+        # would re-embed on the first boot.
+        if isinstance(value, (datetime.date, datetime.time)):
+            value = value.isoformat()
         if isinstance(value, (str, int, float, bool)):
             text = str(value).strip()
             if text:
@@ -86,8 +95,10 @@ class EmbedTextBuilder:
     """Builds the text submitted to the embedding provider for one chunk.
 
     Args:
-        embed_context: When ``True``, chunk content is enriched with the
-            document title and chunk heading (format v2).
+        embed_context: When ``True``, forces format v2 (document title and
+            chunk heading enrichment) even when ``searchable_fields`` is
+            empty. Any non-empty ``searchable_fields`` also activates v2, so
+            this flag is only load-bearing on its own.
         searchable_fields: Frontmatter keys whose scalar values form the
             first-chunk preamble (also switches to format v2 when
             non-empty).

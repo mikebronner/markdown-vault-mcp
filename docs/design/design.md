@@ -268,6 +268,11 @@ defaults are exact behavioural no-ops):
 2. **Searchable frontmatter** (`MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS`).
    Scalar values of the listed fields populate the FTS `summary` column
    (chunk-0 row only), making summaries/descriptions keyword-searchable.
+   Date/time-typed values are ISO-coerced (matching `_json_default`) so they
+   stay searchable and identical across the build and convergence paths.
+   Configuring this field **also** activates context-enriched embeddings
+   (format v2, knob 5) even when `EMBED_CONTEXT` is unset, so it triggers a
+   one-time full re-embed on the next startup.
 3. **Weighted BM25** (`MARKDOWN_VAULT_MCP_FTS_WEIGHTS`). Per-column weights
    are persisted into the FTS5 rank configuration
    (`INSERT INTO notes_fts(notes_fts, rank) VALUES('rank', 'bm25(...)')`)
@@ -279,10 +284,12 @@ defaults are exact behavioural no-ops):
    three search modes, immediately before per-file grouping (post-RRF and
    multiplicative in hybrid). Query-time only; `get_similar`/`get_context`
    are deliberately unaffected.
-5. **Context-enriched embeddings** (`MARKDOWN_VAULT_MCP_EMBED_CONTEXT`). A
+5. **Context-enriched embeddings** (`MARKDOWN_VAULT_MCP_EMBED_CONTEXT`, or
+   any `SEARCHABLE_FIELDS`). Format v2 is active when either knob is set. A
    single shared `EmbedTextBuilder` (constructed once in `Vault.__init__`)
    prefixes embedding input with the note title, chunk heading, and — first
-   chunk only — the searchable-field preamble. Every embedding site (hot
+   chunk only — the searchable-field preamble. `EMBED_CONTEXT` forces v2 even
+   with no searchable fields (title + heading only). Every embedding site (hot
    reindex, cold build, boot convergence, deferred flush) uses the builder,
    so convergence cannot "heal" enriched vectors back to plain; the chunk's
    preamble participates in the convergence signature so offline
