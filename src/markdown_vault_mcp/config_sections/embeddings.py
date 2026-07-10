@@ -18,6 +18,7 @@ class EmbeddingsConfig:
     openai_embedding_model: str = "text-embedding-3-small"
     fastembed_model: str = "BAAI/bge-small-en-v1.5"
     fastembed_cache_dir: str | None = None
+    embed_context: bool = False
 
     def __post_init__(self) -> None:
         """Normalize ollama_host and openai_base_url: non-empty, no trailing slash."""
@@ -49,6 +50,7 @@ class EmbeddingsConfig:
         # __post_init__ normalizes (strip trailing slash / empty→default).
         ollama_host = os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
         raw_cpu = env(prefix, "OLLAMA_CPU_ONLY")
+        raw_embed_context = env(prefix, "EMBED_CONTEXT")
         openai_base_url = (
             env(prefix, "OPENAI_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or ""
         ).strip() or "https://api.openai.com/v1"
@@ -67,4 +69,9 @@ class EmbeddingsConfig:
             openai_embedding_model=openai_model,
             fastembed_model=env(prefix, "FASTEMBED_MODEL") or "BAAI/bge-small-en-v1.5",
             fastembed_cache_dir=env(prefix, "FASTEMBED_CACHE_DIR") or None,
+            embed_context=(
+                parse_bool(raw_embed_context)
+                if raw_embed_context is not None
+                else False
+            ),
         )

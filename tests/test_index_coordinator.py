@@ -29,13 +29,19 @@ def make_coordinator(
     embed_model_name: str | None = None,
     max_chunk_chars_override: int | None = None,
     db: Path | None = None,
+    title_field: str = "title",
+    searchable_fields: tuple[str, ...] = (),
 ) -> IndexWriteCoordinator:
     """Build a wired coordinator over a tmp vault (mirrors Vault wiring)."""
+    from markdown_vault_mcp.embed_text import EmbedTextBuilder
+
     if not (tmp_path / "a.md").exists():
         (tmp_path / "a.md").write_text("# A\n\nbody\n", encoding="utf-8")
     if db is None:
         db = tmp_path / "index.db"
-    fts = FTSIndex(db_path=db)
+    fts = FTSIndex(
+        db_path=db, searchable_frontmatter_fields=list(searchable_fields) or None
+    )
     tracker = ChangeTracker(tmp_path / ".state.json")
     holder: dict[str, VectorIndex | None] = {"v": None}
     index_mgr = IndexManager(
@@ -52,6 +58,8 @@ def make_coordinator(
         set_vectors=lambda v: holder.__setitem__("v", v),
         embed_model_name=embed_model_name,
         max_chunk_chars_override=max_chunk_chars_override,
+        title_field=title_field,
+        embed_text_builder=EmbedTextBuilder(searchable_fields=searchable_fields),
     )
     return IndexWriteCoordinator(
         fts=fts,
@@ -60,6 +68,8 @@ def make_coordinator(
         file_write_lock=threading.RLock(),
         embed_model_name=embed_model_name,
         max_chunk_chars_override=max_chunk_chars_override,
+        title_field=title_field,
+        searchable_fields=",".join(searchable_fields),
     )
 
 
@@ -737,3 +747,146 @@ def test_build_index_drain_cancellation_not_recorded_as_failed(tmp_path: Path) -
         assert ei.value.reason == "never_built"
     finally:
         coord.close(timeout=5)
+
+
+def test_title_field_change_rejects_warm_restart(tmp_path: Path) -> None:
+    """A different title field forces a full rebuild (titles change)."""
+    db = tmp_path / "index.db"
+    coord = make_coordinator(tmp_path, db=db)
+    try:
+        coord.build_index()
+        meta = coord._fts.get_chunking_meta()
+        assert meta.title_field == "title"
+        assert meta.searchable_fields == ""
+    finally:
+        coord.close(timeout=5)
+
+    coord2 = make_coordinator(tmp_path, db=db, title_field="name")
+    try:
+        assert coord2._chunking_meta_matches() is False
+        stats = coord2.build_index()
+        assert stats.chunks_indexed > 0  # full build ran, not warm O(1)
+        assert coord2._fts.get_chunking_meta().title_field == "name"
+    finally:
+        coord2.close(timeout=5)
+
+
+def test_searchable_fields_change_rejects_warm_restart(tmp_path: Path) -> None:
+    """Configuring searchable fields forces a rebuild (summary column)."""
+    db = tmp_path / "index.db"
+    coord = make_coordinator(tmp_path, db=db)
+    try:
+        coord.build_index()
+    finally:
+        coord.close(timeout=5)
+
+    coord2 = make_coordinator(tmp_path, db=db, searchable_fields=("summary", "type"))
+    try:
+        assert coord2._chunking_meta_matches() is False
+        stats = coord2.build_index()
+        assert stats.chunks_indexed > 0
+        assert coord2._fts.get_chunking_meta().searchable_fields == "summary,type"
+    finally:
+        coord2.close(timeout=5)
+
+
+def test_absent_provenance_keys_keep_warm_restart_under_defaults(
+    tmp_path: Path,
+) -> None:
+    """A pre-upgrade index (no title/searchable meta keys) warm-restarts
+    under the default configuration — absent keys read back as defaults."""
+    db = tmp_path / "index.db"
+    coord = make_coordinator(tmp_path, db=db)
+    try:
+        coord.build_index()
+        # Simulate a pre-upgrade index: the new provenance keys are absent.
+        conn = coord._fts._conn()
+        with conn:
+            conn.execute(
+                "DELETE FROM meta WHERE key IN ('title_field', 'searchable_fields')"
+            )
+    finally:
+        coord.close(timeout=5)
+
+    coord2 = make_coordinator(tmp_path, db=db)
+    try:
+        assert coord2._chunking_meta_matches() is True
+        stats = coord2.build_index()
+        assert stats.chunks_indexed == 0  # warm O(1) short-circuit held
+    finally:
+        coord2.close(timeout=5)
+
+
+def test_legacy_five_column_db_migrates_and_warm_restarts_via_coordinator(
+    tmp_path: Path,
+) -> None:
+    """A genuine pre-feature on-disk DB opened through the coordinator.
+
+    The upgrade correctness relies on two mechanisms firing together — the
+    summary-column migration AND the warm-restart short-circuit — which the
+    bare-FTSIndex migration tests exercise in isolation. Here a real 5-column
+    ``notes_fts`` with no curated-ranking provenance keys must migrate to
+    6-column on open and still stay on the warm O(1) path under defaults, so an
+    upgrade does not trigger a silent full rescan.
+    """
+    db = tmp_path / "index.db"
+    coord = make_coordinator(tmp_path, db=db)
+    try:
+        coord.build_index()
+        # Downgrade the on-disk index to the genuine pre-feature shape: a
+        # 5-column notes_fts and no title_field/searchable_fields meta keys.
+        conn = coord._fts._conn()
+        with conn:
+            conn.execute(
+                "DELETE FROM meta WHERE key IN ('title_field', 'searchable_fields')"
+            )
+        conn.execute("BEGIN")
+        conn.execute("DROP TABLE notes_fts")
+        conn.execute(
+            "CREATE VIRTUAL TABLE notes_fts USING fts5("
+            "path, title, folder, heading, content, tokenize='porter unicode61')"
+        )
+        conn.execute(
+            "INSERT INTO notes_fts(path, title, folder, heading, content) "
+            "SELECT d.path, d.title, d.folder, COALESCE(s.heading, ''), s.content "
+            "FROM sections s JOIN documents d ON d.id = s.document_id"
+        )
+        conn.commit()
+    finally:
+        coord.close(timeout=5)
+
+    coord2 = make_coordinator(tmp_path, db=db)
+    try:
+        # The migration ran on open: notes_fts is 6-column again.
+        cols = [
+            r[1]
+            for r in coord2._fts._conn()
+            .execute("PRAGMA table_info(notes_fts)")
+            .fetchall()
+        ]
+        assert cols == ["path", "title", "folder", "heading", "content", "summary"]
+        # ...and the warm-restart short-circuit still holds — no silent rescan.
+        assert coord2._chunking_meta_matches() is True
+        stats = coord2.build_index()
+        assert stats.chunks_indexed == 0
+        # Migrated rows remain searchable.
+        assert len(coord2._fts.search("body")) >= 1
+    finally:
+        coord2.close(timeout=5)
+
+
+def test_default_curated_knobs_keep_warm_restart(tmp_path: Path) -> None:
+    """Same defaults across restarts stay on the warm O(1) path."""
+    db = tmp_path / "index.db"
+    coord = make_coordinator(tmp_path, db=db)
+    try:
+        coord.build_index()
+    finally:
+        coord.close(timeout=5)
+
+    coord2 = make_coordinator(tmp_path, db=db)
+    try:
+        assert coord2._chunking_meta_matches() is True
+        assert coord2.build_index().chunks_indexed == 0
+    finally:
+        coord2.close(timeout=5)

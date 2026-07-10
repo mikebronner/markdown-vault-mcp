@@ -14,6 +14,7 @@ _SEQUENCE_FIELDS = (
     "indexed_frontmatter_fields",
     "required_frontmatter",
     "exclude_patterns",
+    "searchable_frontmatter",
 )
 
 
@@ -27,6 +28,8 @@ class IndexingConfig:
     indexed_frontmatter_fields: Sequence[str] | None = None
     required_frontmatter: Sequence[str] | None = None
     exclude_patterns: Sequence[str] | None = None
+    title_field: str = "title"
+    searchable_frontmatter: Sequence[str] | None = None
 
     def __post_init__(self) -> None:
         """Freeze the sequence fields into tuples for deep immutability (#639).
@@ -37,9 +40,12 @@ class IndexingConfig:
         itself a ``Sequence[str]`` and would otherwise be silently split into
         individual characters.
 
+        ``title_field`` is stripped and must be non-empty.
+
         Raises:
             ConfigurationError: If a sequence field is set to a ``str`` or
-                ``bytes`` instead of a sequence of strings.
+                ``bytes`` instead of a sequence of strings, or if
+                ``title_field`` is empty/whitespace.
         """
         for name in _SEQUENCE_FIELDS:
             value = getattr(self, name)
@@ -52,6 +58,10 @@ class IndexingConfig:
                 )
             if not isinstance(value, tuple):
                 object.__setattr__(self, name, tuple(value))
+        title = (self.title_field or "").strip()
+        if not title:
+            raise ConfigurationError("title_field must be a non-empty string")
+        object.__setattr__(self, "title_field", title)
 
     @classmethod
     def from_env(cls, prefix: str) -> IndexingConfig:
@@ -80,4 +90,7 @@ class IndexingConfig:
             required_frontmatter=parse_list(env(prefix, "REQUIRED_FIELDS") or "")
             or None,
             exclude_patterns=parse_list(env(prefix, "EXCLUDE") or "") or None,
+            title_field=(env(prefix, "TITLE_FIELD") or "").strip() or "title",
+            searchable_frontmatter=parse_list(env(prefix, "SEARCHABLE_FIELDS") or "")
+            or None,
         )

@@ -57,6 +57,8 @@ class IndexWriteCoordinator:
         file_write_lock: threading.RLock,
         embed_model_name: str | None = None,
         max_chunk_chars_override: int | None = None,
+        title_field: str = "title",
+        searchable_fields: str = "",
     ) -> None:
         self._fts = fts
         self._index_path = index_path
@@ -68,6 +70,13 @@ class IndexWriteCoordinator:
         # the model context is read transiently differently.
         self._embed_model_name = embed_model_name
         self._max_chunk_chars_override = max_chunk_chars_override
+        # Curated-ranking provenance: a flipped title field or searchable
+        # frontmatter field set changes FTS row contents (titles / the
+        # summary column), so it must reject the warm-restart short-circuit
+        # the same way a model change does. ``searchable_fields`` is the
+        # comma-joined canonical form ("" when none configured).
+        self._title_field = title_field
+        self._searchable_fields = searchable_fields
         self._readiness = ReadinessState()
         # Deprecated background-build thread bookkeeping (guarded by the
         # injected file-write lock, matching the former Vault locking).
@@ -196,19 +205,24 @@ class IndexWriteCoordinator:
     # ------------------------------------------------------------------
 
     def _chunking_meta_matches(self) -> bool:
-        """True when the stored embedding provenance matches the current config.
+        """True when the stored build provenance matches the current config.
 
-        Compares the two STABLE inputs to the shared chunker's char cap — the
-        model name and the explicit ``MAX_CHUNK_CHARS`` override — not the
-        runtime-derived cap. A genuine model change or override change rejects
-        the warm-restart short-circuit (cold rebuild); a derived cap that
-        merely differs because the model context was read transiently
-        differently (e.g. an Ollama instance briefly unreachable) changes
-        neither input, so it does NOT force a rebuild (avoid flapping)."""
+        Compares the STABLE inputs to the FTS build's contents — the model
+        name and the explicit ``MAX_CHUNK_CHARS`` override (the shared
+        chunker's char-cap inputs, #649), plus the title field and the
+        searchable frontmatter fields (which shape FTS titles and the
+        ``summary`` column) — never the runtime-derived cap. A genuine
+        option change rejects the warm-restart short-circuit (cold rebuild);
+        a derived cap that merely differs because the model context was read
+        transiently differently (e.g. an Ollama instance briefly
+        unreachable) changes no input, so it does NOT force a rebuild
+        (avoid flapping)."""
         stored = self._fts.get_chunking_meta()
         return (
             stored.model == self._embed_model_name
             and stored.max_chunk_chars_override == self._max_chunk_chars_override
+            and stored.title_field == self._title_field
+            and stored.searchable_fields == self._searchable_fields
         )
 
     def build_index(self, *, force: bool = False) -> IndexStats:

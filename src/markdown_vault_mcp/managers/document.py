@@ -106,6 +106,9 @@ class DocumentManager:
             ``ProcessDirtyPaths`` job.  ``None`` (default) leaves the
             DocumentManager FTS-side-effect-free, which is the contract
             used by the isolation tests.
+        title_field: Frontmatter key consulted first when resolving document
+            titles.  Must match the value the index managers use, or
+            ``read()`` titles would diverge from search titles.
     """
 
     def __init__(
@@ -121,6 +124,7 @@ class DocumentManager:
         max_note_read_bytes: int = 262144,
         on_write_callback: Callable[[Path, str, WriteOperation], None] | None = None,
         mark_paths_dirty: Callable[[Iterable[str]], None] | None = None,
+        title_field: str = "title",
     ) -> None:
         self._fts = fts
         self._source_dir = source_dir
@@ -132,6 +136,7 @@ class DocumentManager:
         self._max_note_read_bytes = max_note_read_bytes
         self._on_write_callback = on_write_callback or (lambda *_a: None)
         self._mark_paths_dirty = mark_paths_dirty
+        self._title_field = title_field
 
     # ------------------------------------------------------------------
     # Validation helpers
@@ -334,7 +339,12 @@ class DocumentManager:
         # is read separately via _read_text_utf8, which applies it, so the two
         # reads are intentionally not collapsed — see #745.)
         try:
-            note = parse_note(abs_path, self._source_dir, self._chunk_strategy)
+            note = parse_note(
+                abs_path,
+                self._source_dir,
+                self._chunk_strategy,
+                title_field=self._title_field,
+            )
             raw_content = _read_text_utf8(abs_path)
         except (UnicodeDecodeError, OSError, yaml.YAMLError) as exc:
             logger.warning("read(%s): could not parse file — %s", path, exc)
@@ -1088,7 +1098,12 @@ class DocumentManager:
                 new_abs.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(old_abs), str(new_abs))
 
-                note = parse_note(new_abs, self._source_dir, self._chunk_strategy)
+                note = parse_note(
+                    new_abs,
+                    self._source_dir,
+                    self._chunk_strategy,
+                    title_field=self._title_field,
+                )
 
                 callback_content = _read_text_utf8(new_abs)
 

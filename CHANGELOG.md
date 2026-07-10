@@ -36,3 +36,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 External consumers that previously imported `IndexNotReadyError`,
 called `is_index_ready()`/`wait_for_index_ready()`, or set the old
 env var must rename their references. No deprecation shims ship.
+
+### Added
+
+- Curated-ranking configuration knobs (all defaults are exact behavioural
+  no-ops):
+  - `MARKDOWN_VAULT_MCP_TITLE_FIELD` — frontmatter field used as the
+    document title (falls back to `title` → first H1 → filename stem).
+  - `MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS` — frontmatter fields whose
+    scalar values are indexed into a new FTS `summary` column (chunk-0 row
+    per document), making them keyword-searchable including `summary:term`
+    column filters. Legacy five-column FTS tables are migrated in place
+    with no filesystem rescan.
+  - `MARKDOWN_VAULT_MCP_FTS_WEIGHTS` — per-column BM25 weights persisted
+    into the FTS5 rank configuration (`path`, `title`, `folder`,
+    `heading`, `content`, `summary`; unset/all-`1.0` keeps the default).
+  - `MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS` — folder-prefix score multipliers
+    applied to all three search modes just before per-file grouping
+    (deepest matching prefix wins; query-time only).
+  - `MARKDOWN_VAULT_MCP_EMBED_CONTEXT` — enriches embedding input with the
+    note title, chunk heading, and first-chunk searchable-field preamble
+    via a single shared builder used by every embedding site; the format
+    token is persisted in the vector sidecar and a mismatch re-embeds the
+    vault once on next startup.
+- Changing `TITLE_FIELD` or `SEARCHABLE_FIELDS` is recorded in the FTS
+  chunking provenance and triggers a one-time automatic cold rebuild on
+  the next startup; pre-upgrade indexes with default config warm-restart
+  untouched.

@@ -53,16 +53,24 @@ class VectorIndex:
     Args:
         provider: Initialised :class:`~markdown_vault_mcp.providers.EmbeddingProvider`
             used to embed query strings at search time.
+        embed_text_format: Canonical embedding-text format token (see
+            :meth:`~markdown_vault_mcp.embed_text.EmbedTextBuilder.format_token`)
+            persisted in the sidecar so a later load can detect a format
+            flip. Defaults to ``"v1"`` (raw chunk content).
 
     Raises:
         ImportError: If ``numpy`` is not installed.
     """
 
-    def __init__(self, provider: EmbeddingProvider) -> None:
+    def __init__(
+        self, provider: EmbeddingProvider, *, embed_text_format: str = "v1"
+    ) -> None:
         """Initialise an empty VectorIndex.
 
         Args:
             provider: Embedding provider used for query embedding.
+            embed_text_format: Embedding-text format token persisted by
+                :meth:`save`.
 
         Raises:
             ImportError: If ``numpy`` is not installed.
@@ -73,6 +81,7 @@ class VectorIndex:
                 "Install it with: pip install 'markdown-vault-mcp[embeddings]'"
             )
         self._provider = provider
+        self._embed_text_format = embed_text_format
         # Shape: (0, dim) — will grow with each add() call.
         self._embeddings: np.ndarray = np.empty((0, 0), dtype=np.float32)
         self._metadata: list[dict[str, Any]] = []
@@ -82,13 +91,25 @@ class VectorIndex:
     # ------------------------------------------------------------------
 
     @classmethod
-    def load(cls, path: Path, provider: EmbeddingProvider) -> VectorIndex:
+    def load(
+        cls,
+        path: Path,
+        provider: EmbeddingProvider,
+        *,
+        expected_embed_text_format: str | None = None,
+    ) -> VectorIndex:
         """Load a VectorIndex from sidecar files.
 
         Args:
             path: Base path; files ``{path}.npy`` and ``{path}.json``
                 must exist.
             provider: Embedding provider to attach to the loaded index.
+            expected_embed_text_format: When provided, the persisted
+                ``embed_text_format`` token (a sidecar without one reads as
+                ``"v1"``) must match, or
+                :class:`VectorIndexCompatibilityError` is raised so the
+                caller's self-heal path re-embeds with the new format.
+                ``None`` skips the check.
 
         Returns:
             A :class:`VectorIndex` populated with the stored embeddings
@@ -97,6 +118,8 @@ class VectorIndex:
         Raises:
             ImportError: If ``numpy`` is not installed.
             FileNotFoundError: If either sidecar file is missing.
+            VectorIndexCompatibilityError: If the persisted provider/model or
+                embedding-text format does not match the current one.
             VectorIndexCorruptError: If the embeddings and metadata sidecars
                 disagree on row count (an incomplete atomic save).
         """
@@ -116,6 +139,7 @@ class VectorIndex:
         metadata: list[dict[str, Any]]
         expected_provider = provider.provider_name
         expected_model = provider.model_name
+        persisted_format = "v1"
         if isinstance(payload, list):
             metadata = payload
             logger.warning(
@@ -127,6 +151,9 @@ class VectorIndex:
             index_meta = payload.get("index_metadata", {})
             persisted_provider = index_meta.get("provider")
             persisted_model = index_meta.get("model")
+            # A sidecar written before embedding-text enrichment carries no
+            # format key; it holds raw-content vectors, i.e. format v1.
+            persisted_format = index_meta.get("embed_text_format") or "v1"
             if (
                 persisted_provider != expected_provider
                 or persisted_model != expected_model
@@ -139,6 +166,16 @@ class VectorIndex:
                     f"current model={expected_model!r}."
                 )
 
+        if (
+            expected_embed_text_format is not None
+            and persisted_format != expected_embed_text_format
+        ):
+            raise VectorIndexCompatibilityError(
+                "Embedding-text format mismatch for persisted index at "
+                f"{path}: stored format={persisted_format!r}, "
+                f"current format={expected_embed_text_format!r}."
+            )
+
         # Gate the parity invariant before constructing the index, so a
         # mismatched pair never yields even a transient inconsistent object.
         if embeddings.shape[0] != len(metadata):
@@ -148,7 +185,7 @@ class VectorIndex:
                 f"{len(metadata)} metadata rows (incomplete atomic save)."
             )
 
-        index = cls(provider)
+        index = cls(provider, embed_text_format=persisted_format)
         index._embeddings = embeddings
         index._metadata = metadata
 
@@ -199,9 +236,11 @@ class VectorIndex:
         Args:
             texts: Texts to embed.  Length must equal ``len(metadata)``.
             metadata: Per-row dicts (keys: ``path``, ``title``, ``folder``,
-                ``heading``, ``content``, ``start_line``).  Each dict is
-                stored verbatim.  ``start_line`` is used by callers to
-                resolve ties when sorting sections of the same document.
+                ``heading``, ``content``, ``start_line``, and ``preamble``
+                — the first-chunk searchable-field text, ``""`` otherwise).
+                Each dict is stored verbatim.  ``start_line`` is used by
+                callers to resolve ties when sorting sections of the same
+                document; ``preamble`` feeds the boot-convergence signature.
 
         Returns:
             Number of rows added.
@@ -242,9 +281,11 @@ class VectorIndex:
             raw_vectors: Pre-computed embeddings as a list of float lists
                 (shape ``[n, dim]``).  Length must equal ``len(metadata)``.
             metadata: Per-row dicts (keys: ``path``, ``title``, ``folder``,
-                ``heading``, ``content``, ``start_line``).  Each dict is
-                stored verbatim.  ``start_line`` is used by callers to
-                resolve ties when sorting sections of the same document.
+                ``heading``, ``content``, ``start_line``, and ``preamble``
+                — the first-chunk searchable-field text, ``""`` otherwise).
+                Each dict is stored verbatim.  ``start_line`` is used by
+                callers to resolve ties when sorting sections of the same
+                document; ``preamble`` feeds the boot-convergence signature.
 
         Returns:
             Number of rows added.
@@ -469,6 +510,7 @@ class VectorIndex:
                 "dimension": (
                     int(self._embeddings.shape[1]) if self._embeddings.ndim == 2 else 0
                 ),
+                "embed_text_format": self._embed_text_format,
             },
         }
 

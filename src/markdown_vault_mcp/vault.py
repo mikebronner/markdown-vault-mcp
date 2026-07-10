@@ -12,6 +12,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from markdown_vault_mcp.conventions import ConventionsResolver
+from markdown_vault_mcp.embed_text import EmbedTextBuilder
 from markdown_vault_mcp.facets import (
     GraphFacet,
     IndexFacet,
@@ -177,6 +178,22 @@ class Vault:
             (subtree expansion is truncated to this many notes; default 50).
         summarize_max_input_chars: Aggregate cap on note characters sent to the
             summarization backend per call (default 200000).
+        title_field: Frontmatter key consulted first when resolving document
+            titles (default ``"title"``; falls back to ``title`` → first H1
+            → filename stem).
+        searchable_frontmatter_fields: Frontmatter keys whose scalar values
+            are keyword-searchable via the FTS ``summary`` column and —
+            because configuring this activates format v2 — prefixed to
+            first-chunk embedding text (triggering a one-time re-embed).
+            ``None`` disables both.
+        embed_context: When ``True``, forces format v2 (document title +
+            chunk heading enrichment) even with no
+            ``searchable_frontmatter_fields``; any searchable field also
+            activates v2 (default ``False`` — raw chunk content).
+        folder_weights: Folder-prefix score multipliers applied to search
+            results just before file grouping (``None`` disables).
+        fts_weights: Per-column BM25 weights persisted into the FTS5 rank
+            configuration (``None`` or all-``1.0`` keeps the default).
         conventions_file: Well-known per-folder conventions filename resolved
             by :attr:`conventions` (default ``"_conventions.md"``); ``None``
             disables folder conventions. When set, the filename is
@@ -214,6 +231,11 @@ class Vault:
         summarizer: Summarizer | None = None,
         summarize_max_notes: int = 50,
         summarize_max_input_chars: int = 200_000,
+        title_field: str = "title",
+        searchable_frontmatter_fields: list[str] | None = None,
+        embed_context: bool = False,
+        folder_weights: dict[str, float] | None = None,
+        fts_weights: dict[str, float] | None = None,
         conventions_file: str | None = "_conventions.md",
     ) -> None:
         self._source_dir = source_dir
@@ -248,6 +270,17 @@ class Vault:
         # None when no provider is configured.
         self._embed_model_name: str | None = (
             embedding_provider.model_name if embedding_provider is not None else None
+        )
+        # Curated-ranking knobs. ONE shared EmbedTextBuilder is constructed
+        # here and threaded to every embedding site so hot, cold, converge,
+        # and flush paths all produce identical embedding input.
+        self._title_field = title_field
+        self._searchable_frontmatter_fields: list[str] = (
+            searchable_frontmatter_fields or []
+        )
+        self._embed_builder = EmbedTextBuilder(
+            embed_context=embed_context,
+            searchable_fields=tuple(self._searchable_frontmatter_fields),
         )
         self._on_write = on_write
         self._git_strategy = git_strategy
@@ -293,6 +326,8 @@ class Vault:
         self._fts = FTSIndex(
             db_path=db_path,
             indexed_frontmatter_fields=self._indexed_frontmatter_fields or None,
+            searchable_frontmatter_fields=self._searchable_frontmatter_fields or None,
+            fts_weights=fts_weights,
         )
         self._tracker = ChangeTracker(self._state_path)
 
@@ -342,6 +377,8 @@ class Vault:
             set_vectors=lambda v: setattr(self._search_mgr, "vectors", v),
             embed_model_name=self._embed_model_name,
             max_chunk_chars_override=self._max_chunk_chars_override,
+            title_field=self._title_field,
+            embed_text_builder=self._embed_builder,
         )
         # Index-write orchestration: owns the single-owner IndexWriter
         # thread + the build-readiness state machine (#576).  Constructed
@@ -354,6 +391,8 @@ class Vault:
             file_write_lock=self._file_write_lock,
             embed_model_name=self._embed_model_name,
             max_chunk_chars_override=self._max_chunk_chars_override,
+            title_field=self._title_field,
+            searchable_fields=",".join(self._searchable_frontmatter_fields),
         )
         # 3. SearchManager (receives IndexManager callbacks via constructor)
         self._search_mgr = SearchManager(
@@ -373,6 +412,8 @@ class Vault:
             chunks_per_file=chunks_per_file,
             snippet_words=snippet_words,
             length_downweight_alpha=length_downweight_alpha,
+            folder_weights=folder_weights,
+            embed_text_format=self._embed_builder.format_token(),
         )
         # Deferred write callback (issue #175): the git-commit on_write
         # callback runs on a background worker so write methods return after
@@ -401,6 +442,7 @@ class Vault:
             max_note_read_bytes=self._max_note_read_bytes,
             on_write_callback=self._write_callback.fire,
             mark_paths_dirty=self._coordinator.mark_paths_dirty,
+            title_field=self._title_field,
         )
 
         # Facets (#604): thin views over the shared managers/coordinator, exposed via the reader/writer/graph/index accessors.

@@ -2088,3 +2088,159 @@ def test_chunk_overlap_words_threaded_into_vault_kwargs(
     monkeypatch.setenv("MARKDOWN_VAULT_MCP_CHUNK_OVERLAP_WORDS", "25")
     kwargs = ProjectConfig.from_env().to_vault_kwargs()
     assert kwargs["chunk_overlap_words"] == 25
+
+
+# ---------------------------------------------------------------------------
+# Curated-ranking config (title field, searchable fields, weights, enrichment)
+# ---------------------------------------------------------------------------
+
+
+class TestCuratedRankingEnvParsing:
+    """The five curated-ranking env vars parse into their config sections."""
+
+    def test_all_five_vars_parse(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(tmp_path))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_TITLE_FIELD", " name ")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS", "summary,type")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_EMBED_CONTEXT", "true")
+        monkeypatch.setenv(
+            "MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS", "sessions:0.5, curated/:2"
+        )
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_FTS_WEIGHTS", "title:5,summary:3")
+
+        cfg = ProjectConfig.from_env()
+        assert cfg.indexing.title_field == "name"
+        assert cfg.indexing.searchable_frontmatter == ("summary", "type")
+        assert cfg.embeddings.embed_context is True
+        # Weight maps are frozen as sorted (key, weight) tuples (#639);
+        # a trailing '/' on a folder prefix is stripped.
+        assert cfg.search.folder_weights == (("curated", 2.0), ("sessions", 0.5))
+        assert cfg.search.fts_weights == (("summary", 3.0), ("title", 5.0))
+
+    def test_defaults_are_no_ops(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(tmp_path))
+        for var in (
+            "MARKDOWN_VAULT_MCP_TITLE_FIELD",
+            "MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS",
+            "MARKDOWN_VAULT_MCP_EMBED_CONTEXT",
+            "MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS",
+            "MARKDOWN_VAULT_MCP_FTS_WEIGHTS",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        cfg = ProjectConfig.from_env()
+        assert cfg.indexing.title_field == "title"
+        assert cfg.indexing.searchable_frontmatter is None
+        assert cfg.embeddings.embed_context is False
+        assert cfg.search.folder_weights is None
+        assert cfg.search.fts_weights is None
+
+        kwargs = cfg.to_vault_kwargs()
+        assert kwargs["title_field"] == "title"
+        assert kwargs["searchable_frontmatter_fields"] is None
+        assert kwargs["embed_context"] is False
+        assert kwargs["folder_weights"] is None
+        assert kwargs["fts_weights"] is None
+
+    def test_to_vault_kwargs_threads_the_five_knobs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(tmp_path))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_TITLE_FIELD", "name")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SEARCHABLE_FIELDS", "summary")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_EMBED_CONTEXT", "1")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS", "sessions:0.5")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_FTS_WEIGHTS", "summary:3")
+
+        kwargs = ProjectConfig.from_env().to_vault_kwargs()
+        assert kwargs["title_field"] == "name"
+        assert kwargs["searchable_frontmatter_fields"] == ("summary",)
+        assert kwargs["embed_context"] is True
+        # Vault takes plain dicts.
+        assert kwargs["folder_weights"] == {"sessions": 0.5}
+        assert kwargs["fts_weights"] == {"summary": 3.0}
+
+    def test_malformed_weight_entry_raises_naming_the_var(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(tmp_path))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS", "sessions")
+        with pytest.raises(
+            ConfigurationError, match="MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS"
+        ):
+            ProjectConfig.from_env()
+
+    def test_non_numeric_weight_raises_naming_the_var(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(tmp_path))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_FTS_WEIGHTS", "title:heavy")
+        with pytest.raises(ConfigurationError, match="MARKDOWN_VAULT_MCP_FTS_WEIGHTS"):
+            ProjectConfig.from_env()
+
+    def test_empty_weight_key_raises_naming_the_var(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(tmp_path))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS", ":0.5")
+        with pytest.raises(
+            ConfigurationError, match="MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS"
+        ):
+            ProjectConfig.from_env()
+
+    def test_trailing_comma_and_blank_entries_are_ignored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(tmp_path))
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_FOLDER_WEIGHTS", "sessions:0.5, ,")
+        cfg = ProjectConfig.from_env()
+        assert cfg.search.folder_weights == (("sessions", 0.5),)
+
+
+class TestCuratedRankingValidation:
+    """Semantic validation lives in __post_init__ (#638)."""
+
+    def test_fts_weights_reject_unknown_column(self) -> None:
+        with pytest.raises(ConfigurationError, match="not an FTS column"):
+            SearchConfig(fts_weights={"body": 1.0})
+
+    def test_fts_weights_reject_negative(self) -> None:
+        with pytest.raises(ConfigurationError, match="must be >= 0"):
+            SearchConfig(fts_weights={"title": -1.0})
+
+    def test_fts_weights_accept_zero(self) -> None:
+        cfg = SearchConfig(fts_weights={"content": 0.0})
+        assert cfg.fts_weights == (("content", 0.0),)
+
+    def test_folder_weights_reject_zero_and_negative(self) -> None:
+        with pytest.raises(ConfigurationError, match="must be > 0"):
+            SearchConfig(folder_weights={"sessions": 0.0})
+        with pytest.raises(ConfigurationError, match="must be > 0"):
+            SearchConfig(folder_weights={"sessions": -0.5})
+
+    def test_folder_weights_strip_trailing_slash_and_freeze(self) -> None:
+        cfg = SearchConfig(folder_weights={"sessions/": 0.5, "b": 2.0})
+        assert cfg.folder_weights == (("b", 2.0), ("sessions", 0.5))
+
+    def test_empty_key_after_normalisation_rejected(self) -> None:
+        with pytest.raises(ConfigurationError, match="non-empty"):
+            SearchConfig(folder_weights={"/": 0.5})
+
+    def test_title_field_must_be_non_empty(self) -> None:
+        with pytest.raises(ConfigurationError, match="title_field"):
+            IndexingConfig(title_field="   ")
+
+    def test_title_field_is_stripped(self) -> None:
+        assert IndexingConfig(title_field=" name ").title_field == "name"
+
+    def test_searchable_frontmatter_rejects_bare_string(self) -> None:
+        with pytest.raises(ConfigurationError, match="searchable_frontmatter"):
+            IndexingConfig(searchable_frontmatter="summary")
+
+    def test_searchable_frontmatter_frozen_to_tuple(self) -> None:
+        cfg = IndexingConfig(searchable_frontmatter=["summary", "type"])
+        assert cfg.searchable_frontmatter == ("summary", "type")

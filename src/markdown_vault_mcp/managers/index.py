@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
+from markdown_vault_mcp.embed_text import EmbedTextBuilder
 from markdown_vault_mcp.exceptions import EmbeddingsNotConfiguredError
 from markdown_vault_mcp.fts_index import _derive_folder, should_optimize
 from markdown_vault_mcp.hashing import compute_file_hash
@@ -72,6 +73,14 @@ class IndexManager:
             force at build time, or ``None`` when the cap was derived from the
             model context. Recorded into FTS meta alongside the model as a
             stable warm-restart key (#649).
+        title_field: Frontmatter key consulted first when resolving document
+            titles; threaded to every ``parse_note``/``scan_directory`` call
+            and recorded into FTS meta as a warm-restart key.
+        embed_text_builder: Shared
+            :class:`~markdown_vault_mcp.embed_text.EmbedTextBuilder` used at
+            every embedding site so hot, cold, converge, and flush paths all
+            produce identical embedding input. ``None`` constructs the
+            default (v1 no-op) builder.
     """
 
     def __init__(
@@ -90,6 +99,8 @@ class IndexManager:
         set_vectors: Callable[[VectorIndex | None], None],
         embed_model_name: str | None = None,
         max_chunk_chars_override: int | None = None,
+        title_field: str = "title",
+        embed_text_builder: EmbedTextBuilder | None = None,
     ) -> None:
         self._fts = fts
         self._tracker = tracker
@@ -108,6 +119,8 @@ class IndexManager:
         # invalidates FTS chunk boundaries.
         self._embed_model_name = embed_model_name
         self._max_chunk_chars_override = max_chunk_chars_override
+        self._title_field = title_field
+        self._embed_builder = embed_text_builder or EmbedTextBuilder()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -152,6 +165,63 @@ class IndexManager:
             candidates.append((abs_path, rel_str))
         return candidates
 
+    def _embed_inputs(
+        self,
+        *,
+        path: str,
+        title: str,
+        folder: str,
+        frontmatter: dict[str, Any],
+        chunks: list[Any],
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Build the (texts, metadata) pair for one document's chunks.
+
+        Every embedding site (hot reindex, cold build, deferred flush) goes
+        through this helper so the shared
+        :class:`~markdown_vault_mcp.embed_text.EmbedTextBuilder` is applied
+        uniformly — a site that embedded raw content while another embedded
+        enriched text would make the boot convergence pass "heal" enriched
+        vectors back to plain. ``meta['content']`` stays the raw chunk
+        content (snippets/RRF display it); the fields preamble is stored
+        under the ``preamble`` key (``""`` for non-first chunks).
+
+        Args:
+            path: Vault-relative document path.
+            title: Resolved document title.
+            folder: Pre-derived folder string.
+            frontmatter: Parsed frontmatter dict.
+            chunks: The document's chunks, in document order.
+
+        Returns:
+            ``(texts, metadata)`` lists of equal length, one entry per chunk.
+        """
+        fields_text = self._embed_builder.fields_text(frontmatter)
+        texts: list[str] = []
+        meta: list[dict[str, Any]] = []
+        for i, chunk in enumerate(chunks):
+            is_first = i == 0
+            texts.append(
+                self._embed_builder.build(
+                    title=title,
+                    heading=chunk.heading,
+                    content=chunk.content,
+                    fields_text=fields_text,
+                    is_first_chunk=is_first,
+                )
+            )
+            meta.append(
+                {
+                    "path": path,
+                    "title": title,
+                    "folder": folder,
+                    "heading": chunk.heading,
+                    "content": chunk.content,
+                    "start_line": chunk.start_line,
+                    "preamble": fields_text if is_first else "",
+                }
+            )
+        return texts, meta
+
     def _require_vectors(self) -> None:
         """Raise :class:`EmbeddingsNotConfiguredError` if embeddings are unconfigured."""
         if self._embedding_provider is None or self._embeddings_path is None:
@@ -189,6 +259,7 @@ class IndexManager:
             set_vectors=self._set_vectors,
             rebuild=lambda: self.build_embeddings(force=True),
             logger=logger,
+            embed_text_format=self._embed_builder.format_token(),
         )
 
     # ------------------------------------------------------------------
@@ -231,6 +302,7 @@ class IndexManager:
                 chunk_strategy=self._chunk_strategy,
                 exclude_patterns=self._exclude_patterns,
                 on_skip=_collect_skip,
+                title_field=self._title_field,
             )
         )
 
@@ -362,6 +434,8 @@ class IndexManager:
         self._fts.set_chunking_meta(
             model=self._embed_model_name,
             max_chunk_chars_override=self._max_chunk_chars_override,
+            title_field=self._title_field,
+            searchable_fields=",".join(self._embed_builder.searchable_fields),
         )
         return IndexStats(
             documents_indexed=len(notes) - errored,
@@ -437,7 +511,12 @@ class IndexManager:
             abs_path = self._source_dir / path
 
             try:
-                note = parse_note(abs_path, self._source_dir, self._chunk_strategy)
+                note = parse_note(
+                    abs_path,
+                    self._source_dir,
+                    self._chunk_strategy,
+                    title_field=self._title_field,
+                )
             except OSError as exc:
                 # Possibly transient — do not record; retry on the next scan.
                 logger.warning("reindex: skipping %s — %s", path, exc)
@@ -549,18 +628,13 @@ class IndexManager:
 
             if vectors is not None and self._embeddings_path is not None:
                 vectors.delete_by_path(note.path)
-                texts = [c.content for c in note.chunks]
-                meta = [
-                    {
-                        "path": note.path,
-                        "title": note.title,
-                        "folder": _derive_folder(note.path),
-                        "heading": c.heading,
-                        "content": c.content,
-                        "start_line": c.start_line,
-                    }
-                    for c in note.chunks
-                ]
+                texts, meta = self._embed_inputs(
+                    path=note.path,
+                    title=note.title,
+                    folder=_derive_folder(note.path),
+                    frontmatter=note.frontmatter,
+                    chunks=note.chunks,
+                )
                 if texts:
                     vectors.add(texts, meta)
 
@@ -659,7 +733,10 @@ class IndexManager:
         from markdown_vault_mcp.vector_index import VectorIndex
 
         if force:
-            vi = VectorIndex(self._embedding_provider)
+            vi = VectorIndex(
+                self._embedding_provider,
+                embed_text_format=self._embed_builder.format_token(),
+            )
             self._set_vectors(vi)
         else:
             self._load_vectors()
@@ -682,22 +759,24 @@ class IndexManager:
             folder = row["folder"]
             abs_path = self._source_dir / path
             try:
-                note = parse_note(abs_path, self._source_dir, self._chunk_strategy)
+                note = parse_note(
+                    abs_path,
+                    self._source_dir,
+                    self._chunk_strategy,
+                    title_field=self._title_field,
+                )
             except (UnicodeDecodeError, OSError) as exc:
                 logger.warning("build_embeddings: skipping %s — %s", path, exc)
                 continue
-            for chunk in note.chunks:
-                texts.append(chunk.content)
-                meta.append(
-                    {
-                        "path": path,
-                        "title": title,
-                        "folder": folder,
-                        "heading": chunk.heading,
-                        "content": chunk.content,
-                        "start_line": chunk.start_line,
-                    }
-                )
+            note_texts, note_meta = self._embed_inputs(
+                path=path,
+                title=title,
+                folder=folder,
+                frontmatter=note.frontmatter,
+                chunks=note.chunks,
+            )
+            texts.extend(note_texts)
+            meta.extend(note_meta)
             if i % 100 == 0 or i == num_notes:
                 logger.info(
                     "build_embeddings: parsed %d/%d notes (%d chunks so far)",
@@ -813,23 +892,36 @@ class IndexManager:
 
         def _signature(
             rows: list[dict[str, Any]],
-        ) -> Counter[tuple[Any, Any, Any, Any]]:
+        ) -> Counter[tuple[Any, Any, Any, Any, Any]]:
             # start_line participates so that line-shift-only edits (content
             # identical, positions moved) still refresh vector metadata; the
             # cost is re-embedding that one doc's chunks, and embeddings are
-            # deterministic for identical content.
+            # deterministic for identical content. The preamble participates
+            # so an offline summary-only edit (content identical, searchable
+            # frontmatter changed) still re-embeds; ``or ""`` normalisation
+            # keeps legacy vector rows without the key equal to fresh rows
+            # under default (v1) config.
             return Counter(
                 (
                     r.get("title"),
                     r.get("heading"),
                     r.get("content"),
                     r.get("start_line"),
+                    r.get("preamble") or "",
                 )
                 for r in rows
             )
 
+        # Compute each FTS row's preamble from the document frontmatter
+        # (first chunk only) so the signature diff detects offline
+        # summary-only edits; the vector side stores it per row.
         fts_by_path: dict[str, list[dict[str, Any]]] = {}
         for row in self._fts.list_chunks():
+            row["preamble"] = (
+                self._embed_builder.fields_text(row.get("frontmatter_json"))
+                if row.get("is_first_chunk")
+                else ""
+            )
             fts_by_path.setdefault(row["path"], []).append(row)
         vec_by_path = vectors.chunks_by_path()
 
@@ -854,7 +946,31 @@ class IndexManager:
         # untouched and every other document still converges.
         for path in missing_paths + refresh_paths:
             rows = fts_by_path[path]
-            texts = [r["content"] for r in rows]
+            texts = [
+                self._embed_builder.build(
+                    title=r["title"],
+                    heading=r["heading"],
+                    content=r["content"],
+                    fields_text=r["preamble"],
+                    is_first_chunk=bool(r.get("is_first_chunk")),
+                )
+                for r in rows
+            ]
+            # Vector metadata keeps the canonical row shape (plus preamble);
+            # the list_chunks-only keys (frontmatter_json, is_first_chunk)
+            # must not leak into the sidecar.
+            metas = [
+                {
+                    "path": r["path"],
+                    "title": r["title"],
+                    "folder": r["folder"],
+                    "heading": r["heading"],
+                    "content": r["content"],
+                    "start_line": r["start_line"],
+                    "preamble": r["preamble"],
+                }
+                for r in rows
+            ]
             raw: list[list[float]] = []
             try:
                 for start in range(0, len(texts), _EMBEDDING_BATCH_SIZE):
@@ -877,7 +993,7 @@ class IndexManager:
                 )
                 continue
             removed += vectors.delete_by_path(path)
-            added += vectors.add_vectors(raw, rows)
+            added += vectors.add_vectors(raw, metas)
 
         for path in stale_paths:
             removed += vectors.delete_by_path(path)
@@ -1020,7 +1136,10 @@ class IndexManager:
                         continue
                     if abs_path.is_file() and path.endswith(".md"):
                         note = parse_note(
-                            abs_path, self._source_dir, self._chunk_strategy
+                            abs_path,
+                            self._source_dir,
+                            self._chunk_strategy,
+                            title_field=self._title_field,
                         )
                         if self._required_frontmatter and not all(
                             k in (note.frontmatter or {})
@@ -1114,19 +1233,19 @@ class IndexManager:
                 pre_embedded.append((path, None, None, False))
             elif abs_path.is_file() and path.endswith(".md"):
                 try:
-                    note = parse_note(abs_path, self._source_dir, self._chunk_strategy)
-                    texts = [c.content for c in note.chunks]
-                    meta = [
-                        {
-                            "path": note.path,
-                            "title": note.title,
-                            "folder": _derive_folder(note.path),
-                            "heading": c.heading,
-                            "content": c.content,
-                            "start_line": c.start_line,
-                        }
-                        for c in note.chunks
-                    ]
+                    note = parse_note(
+                        abs_path,
+                        self._source_dir,
+                        self._chunk_strategy,
+                        title_field=self._title_field,
+                    )
+                    texts, meta = self._embed_inputs(
+                        path=note.path,
+                        title=note.title,
+                        folder=_derive_folder(note.path),
+                        frontmatter=note.frontmatter,
+                        chunks=note.chunks,
+                    )
                     if texts:
                         raw_vecs = self._embedding_provider.embed(texts)
                         pre_embedded.append((path, raw_vecs, meta, False))

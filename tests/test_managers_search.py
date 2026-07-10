@@ -1250,3 +1250,114 @@ class TestGetContextSurfacesInternalFailure:
             result = search_mgr.get_context("alpha.md")
         assert result.similar == []
         assert not any("get_similar failed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Folder ranking boost (end-to-end, all three modes)
+# ---------------------------------------------------------------------------
+
+
+class _UnitQueryProvider:
+    """Embeds every text (query or chunk) to the same unit vector.
+
+    Every stored chunk then scores an identical, positive cosine against any
+    query, so the folder boost alone decides the ordering.
+    """
+
+    provider_name = "unit"
+    model_name = "unit-model"
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [[1.0, 0.0] for _ in texts]
+
+
+@pytest.fixture()
+def boost_vault(tmp_path: Path) -> Path:
+    """Two documents with identical bodies in different folders."""
+    body = "# Note\n\nshared magnetberry content for ranking.\n"
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "curated").mkdir()
+    (tmp_path / "sessions" / "log.md").write_text(body, encoding="utf-8")
+    (tmp_path / "curated" / "note.md").write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def _boost_mgr(boost_vault: Path, **mgr_kwargs) -> SearchManager:
+    """SearchManager over the boost vault with a controlled vector store."""
+    from markdown_vault_mcp.vector_index import VectorIndex
+
+    fts = FTSIndex(db_path=":memory:")
+    notes = list(scan_directory(boost_vault))
+    for note in notes:
+        fts.upsert_note(note)
+
+    provider = _UnitQueryProvider()
+    vectors = VectorIndex(provider)
+    for note in notes:
+        folder = note.path.rsplit("/", 1)[0] if "/" in note.path else ""
+        vectors.add(
+            [c.content for c in note.chunks],
+            [
+                {
+                    "path": note.path,
+                    "title": note.title,
+                    "folder": folder,
+                    "heading": c.heading,
+                    "content": c.content,
+                    "start_line": c.start_line,
+                }
+                for c in note.chunks
+            ],
+        )
+    embeddings_path = boost_vault / "embeddings"
+    vectors.save(embeddings_path)
+    mgr = SearchManager(
+        fts=fts,
+        source_dir=boost_vault,
+        embeddings_path=embeddings_path,
+        embedding_provider=provider,
+        **mgr_kwargs,
+    )
+    mgr.vectors = vectors
+    return mgr
+
+
+class TestFolderWeightsEndToEnd:
+    """folder_weights={'sessions': 0.5} demotes the session doc in all modes."""
+
+    def test_keyword_mode_demotes_and_scales_score(self, boost_vault: Path) -> None:
+        mgr = _boost_mgr(boost_vault, folder_weights={"sessions": 0.5})
+        results = mgr.search("magnetberry", mode="keyword")
+        assert [r.path for r in results] == ["curated/note.md", "sessions/log.md"]
+        # Identical bodies score identically pre-boost, so the demoted
+        # GroupedResult.score is exactly half the curated one.
+        assert results[1].score == pytest.approx(results[0].score * 0.5)
+        assert results[0].score > 0
+
+    def test_semantic_mode_demotes(self, boost_vault: Path) -> None:
+        mgr = _boost_mgr(boost_vault, folder_weights={"sessions": 0.5})
+        results = mgr.search("magnetberry", mode="semantic")
+        assert [r.path for r in results] == ["curated/note.md", "sessions/log.md"]
+        assert results[1].score == pytest.approx(results[0].score * 0.5)
+
+    def test_hybrid_mode_demotes(self, boost_vault: Path) -> None:
+        mgr = _boost_mgr(boost_vault, folder_weights={"sessions": 0.5})
+        results = mgr.search("magnetberry", mode="hybrid")
+        assert results[0].path == "curated/note.md"
+        assert results[-1].path == "sessions/log.md"
+        assert results[-1].score < results[0].score
+
+    def test_no_weights_is_unaffected(self, boost_vault: Path) -> None:
+        mgr = _boost_mgr(boost_vault)
+        for mode in ("keyword", "semantic", "hybrid"):
+            results = mgr.search("magnetberry", mode=mode)
+            assert {r.path for r in results} == {
+                "curated/note.md",
+                "sessions/log.md",
+            }
+
+    def test_promoting_weight_lifts_folder(self, boost_vault: Path) -> None:
+        mgr = _boost_mgr(boost_vault, folder_weights={"sessions": 3.0})
+        results = mgr.search("magnetberry", mode="keyword")
+        assert results[0].path == "sessions/log.md"
+        assert results[0].score == pytest.approx(results[1].score * 3.0)
