@@ -622,6 +622,85 @@ class TestUserPromptOverride:
         summarize_entries = [p for p in prompts if p.name == "summarize"]
         assert len(summarize_entries) == 1
 
+    @pytest.mark.usefixtures("_clear_vars")
+    async def test_override_does_not_log_component_already_exists(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Overriding a built-in prunes it first, so FastMCP logs no duplicate warning.
+
+        register_domain_prompts removes the shadowed built-in before registering
+        the user prompt; without that, FastMCP's default ``on_duplicate="warn"``
+        would emit "Component already exists: prompt:summarize@" on every startup
+        for a fully-supported override.
+
+        The warning rides FastMCP's own ``fastmcp`` logger, which sets
+        ``propagate=False`` — so pytest's root-attached ``caplog`` never sees it.
+        Capture that logger directly, and neutralize ``configure_logging_from_env``
+        (make_server calls it, and it re-installs the ``fastmcp`` logger's handlers
+        + propagate) so the capture handler survives.
+        """
+        import logging
+
+        monkeypatch.setattr(
+            "markdown_vault_mcp.server.configure_logging_from_env",
+            lambda *_a, **_k: None,
+        )
+        records: list[str] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record.getMessage())
+
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "summarize.md").write_text("OVERRIDE", encoding="utf-8")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_PROMPTS_FOLDER", str(prompts_dir))
+
+        fastmcp_logger = logging.getLogger("fastmcp")
+        handler = _Capture()
+        prev_level = fastmcp_logger.level
+        fastmcp_logger.setLevel(logging.WARNING)
+        fastmcp_logger.addHandler(handler)
+        try:
+            make_server()
+        finally:
+            fastmcp_logger.removeHandler(handler)
+            fastmcp_logger.setLevel(prev_level)
+        assert not any("already exists" in m for m in records)
+
+    @pytest.mark.usefixtures("_clear_vars")
+    async def test_override_of_unregistered_builtin_does_not_crash(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A user prompt shadowing a built-in that failed to register must not crash.
+
+        register_domain_prompts prunes the shadowed built-in before re-registering;
+        if that built-in was never registered (missing static file, or a #799
+        backstop-caught error), remove_prompt raises KeyError. The prune is guarded
+        so server construction still succeeds — the user prompt registers fresh.
+        """
+        from markdown_vault_mcp import _server_prompts
+
+        # "summarize" never registers (loader returns None), yet the operator
+        # ships a summarize.md — the prune would KeyError without the guard.
+        original = _server_prompts._load_builtin_prompt
+        monkeypatch.setattr(
+            _server_prompts,
+            "_load_builtin_prompt",
+            lambda name: None if name == "summarize" else original(name),
+        )
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "summarize.md").write_text("USER SUMMARIZE", encoding="utf-8")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_PROMPTS_FOLDER", str(prompts_dir))
+
+        server = make_server()  # must not raise
+        async with Client(server) as client:
+            names = {p.name for p in await client.list_prompts()}
+        assert "summarize" in names  # the user prompt registered
+
 
 class TestUserPromptWriteTag:
     """User prompts tagged 'write' are hidden in read-only mode."""
@@ -734,12 +813,14 @@ class TestProposeLinks:
 
 
 class TestRegisterPromptsPerPromptGuard:
-    """register_prompts skips a malformed prompt and keeps registering siblings.
+    """A malformed prompt is skipped and its siblings still register.
 
     The per-prompt helpers can raise *outside* their narrow ``except ValueError``
     handlers — a def-dict missing a key (``KeyError``) or a ``mcp.prompt(...)``
-    rejection. The loop backstop in ``register_prompts`` catches these so one bad
-    prompt does not abort registration of the rest (#799).
+    rejection. A loop backstop catches these so one bad prompt does not abort
+    registration of the rest (#799). Built-in failures go through the backstop in
+    :func:`register_prompts`; user-prompt failures through the one in
+    :func:`register_domain_prompts`.
     """
 
     async def test_user_prompt_registration_failure_skips_and_warns(
@@ -752,7 +833,7 @@ class TestRegisterPromptsPerPromptGuard:
         from fastmcp import FastMCP
 
         from markdown_vault_mcp import _server_prompts
-        from markdown_vault_mcp._server_prompts import register_prompts
+        from markdown_vault_mcp._server_prompts import register_domain_prompts
 
         monkeypatch.setattr(
             _server_prompts,
@@ -772,7 +853,9 @@ class TestRegisterPromptsPerPromptGuard:
         with caplog.at_level(
             logging.WARNING, logger="markdown_vault_mcp._server_prompts"
         ):
-            register_prompts(mcp, templates_folder=None, prompts_folder="/whatever")
+            register_domain_prompts(
+                mcp, templates_folder=None, prompts_folder="/whatever"
+            )
 
         assert "User prompt 'bad' failed to register" in caplog.text
         async with Client(mcp) as client:
@@ -806,7 +889,7 @@ class TestRegisterPromptsPerPromptGuard:
         with caplog.at_level(
             logging.ERROR, logger="markdown_vault_mcp._server_prompts"
         ):
-            register_prompts(mcp, templates_folder=None, prompts_folder=None)
+            register_prompts(mcp)
 
         assert "Built-in prompt 'summarize' failed to register" in caplog.text
         assert "packaging defect" in caplog.text
@@ -827,7 +910,7 @@ class TestRegisterPromptsPerPromptGuard:
         from fastmcp import FastMCP
 
         from markdown_vault_mcp import _server_prompts
-        from markdown_vault_mcp._server_prompts import register_prompts
+        from markdown_vault_mcp._server_prompts import register_domain_prompts
 
         monkeypatch.setattr(
             _server_prompts,
@@ -856,7 +939,9 @@ class TestRegisterPromptsPerPromptGuard:
         with caplog.at_level(
             logging.WARNING, logger="markdown_vault_mcp._server_prompts"
         ):
-            register_prompts(mcp, templates_folder=None, prompts_folder="/whatever")
+            register_domain_prompts(
+                mcp, templates_folder=None, prompts_folder="/whatever"
+            )
 
         assert "cannot form a valid signature" in caplog.text
         assert "failed to register" not in caplog.text
@@ -876,7 +961,7 @@ class TestRegisterPromptsPerPromptGuard:
         from fastmcp import FastMCP
 
         from markdown_vault_mcp import _server_prompts
-        from markdown_vault_mcp._server_prompts import register_prompts
+        from markdown_vault_mcp._server_prompts import register_domain_prompts
 
         original_build = _server_prompts._build_prompt_fn
 
@@ -918,7 +1003,9 @@ class TestRegisterPromptsPerPromptGuard:
         with caplog.at_level(
             logging.WARNING, logger="markdown_vault_mcp._server_prompts"
         ):
-            register_prompts(mcp, templates_folder=None, prompts_folder="/whatever")
+            register_domain_prompts(
+                mcp, templates_folder=None, prompts_folder="/whatever"
+            )
 
         assert "User prompt 'bad' failed to register" in caplog.text
         async with Client(mcp) as client:
@@ -972,7 +1059,7 @@ class TestRegisterPromptsPerPromptGuard:
         with caplog.at_level(
             logging.ERROR, logger="markdown_vault_mcp._server_prompts"
         ):
-            register_prompts(mcp, templates_folder=None, prompts_folder=None)
+            register_prompts(mcp)
 
         assert "Built-in prompt 'summarize' failed to register" in caplog.text
         assert "packaging defect" in caplog.text

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import pytest
-from fastmcp import Client
+from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.shared.exceptions import McpError
 
@@ -211,6 +211,128 @@ class TestDisableAppsUi:
         # Non-apps-ui tools must remain available.
         assert "search" in names
         assert "read" in names
+
+
+class TestServerIcon:
+    """Guard the post-construction server-icon attachment in DOMAIN-WIRING.
+
+    ``make_server`` writes the low-level ``mcp._mcp_server.icons`` field because
+    FastMCP's public ``icons`` property is read-only and the template-skeleton
+    constructor carries no icons. This test fails loudly if a FastMCP upgrade
+    renames that field, rather than silently dropping the icon.
+    """
+
+    @pytest.mark.usefixtures("_mcp_env")
+    def test_server_icon_attached(self) -> None:
+        from markdown_vault_mcp._icons import _SERVER_ICON
+
+        server = make_server()
+        assert server.icons  # non-empty
+        assert server.icons == _SERVER_ICON
+
+
+class TestConfigDrivenPrompts:
+    """make_server(config=X) resolves prompt folders from X, not the environment.
+
+    Regression guard for the server.py de-fork: config-dependent prompts are
+    registered in DOMAIN-WIRING from the passed config's ``ContentConfig`` (via
+    ``register_domain_prompts``), never a second environment read — so a
+    programmatically-built config whose ``prompts_folder`` differs from the
+    environment is honored (#901 review).
+    """
+
+    @pytest.mark.usefixtures("_mcp_env")
+    async def test_user_prompt_resolved_from_provided_config_not_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from markdown_vault_mcp.config import ProjectConfig
+        from markdown_vault_mcp.config_sections.content import ContentConfig
+
+        # env deliberately carries NO prompts folder ...
+        monkeypatch.delenv("MARKDOWN_VAULT_MCP_PROMPTS_FOLDER", raising=False)
+        # ... while the provided config points at one holding a user prompt. If
+        # register_domain_prompts read the env instead of this config, "greet"
+        # would be absent.
+        prompts_dir = tmp_path / "cfg_prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "greet.md").write_text("Hello from config", encoding="utf-8")
+        config = ProjectConfig(
+            source_dir=tmp_path,
+            content=ContentConfig(prompts_folder=str(prompts_dir)),
+        )
+
+        server = make_server(config=config)
+        async with Client(server) as client:
+            names = {p.name for p in await client.list_prompts()}
+        assert "greet" in names
+
+    @pytest.mark.usefixtures("_mcp_env")
+    def test_instructions_resolved_from_provided_config_not_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from markdown_vault_mcp.config import ProjectConfig
+
+        # env carries NO instructions override ...
+        monkeypatch.delenv("MARKDOWN_VAULT_MCP_INSTRUCTIONS", raising=False)
+        # ... while the provided config sets one. It must win over both the
+        # generic env-baseline and the domain default (DOMAIN-WIRING is gated on
+        # config.instructions, not the env var).
+        config = ProjectConfig(source_dir=tmp_path, instructions="Custom vault brief.")
+
+        server = make_server(config=config)
+        assert server.instructions == "Custom vault brief."
+
+    @pytest.mark.usefixtures("_mcp_env")
+    async def test_server_name_resolved_from_provided_config_not_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from markdown_vault_mcp.config import ProjectConfig
+
+        # env carries NO SERVER_NAME override ...
+        monkeypatch.delenv("MARKDOWN_VAULT_MCP_SERVER_NAME", raising=False)
+        # ... while the provided config sets one. The live instance name honors
+        # it (would be the env default "markdown-vault-mcp" if env drove it).
+        config = ProjectConfig(source_dir=tmp_path, server_name="custom-vault")
+
+        server = make_server(config=config)
+        assert server.name == "custom-vault"
+        # get_server_info is intentionally left on its single skeleton
+        # registration (keeping the DOMAIN-UPSTREAM block the one source of truth
+        # for upstream wiring), so it reports the SERVER_NAME env identity — here
+        # the default, since the env var is unset — not the programmatic override.
+        async with Client(server) as client:
+            result = await client.call_tool("get_server_info", {})
+        assert result.data["server_name"] == "markdown-vault-mcp"
+
+
+class TestGithubWebhookWiring:
+    """Cover the GitHub-webhook custom-route gate in make_server's DOMAIN-WIRING."""
+
+    @staticmethod
+    def _route_paths(server: FastMCP) -> set[str]:
+        return {r.path for r in server._additional_http_routes}
+
+    @pytest.mark.usefixtures("_mcp_env")
+    def test_webhook_route_registered_when_secret_and_http(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_GITHUB_WEBHOOK_SECRET", "s3cret")
+        server = make_server(transport="http")
+        assert "/github-webhook" in self._route_paths(server)
+
+    @pytest.mark.usefixtures("_mcp_env")
+    def test_webhook_route_absent_on_stdio(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A secret is set, but stdio has no HTTP server to receive POSTs.
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_GITHUB_WEBHOOK_SECRET", "s3cret")
+        server = make_server(transport="stdio")
+        assert "/github-webhook" not in self._route_paths(server)
+
+    @pytest.mark.usefixtures("_mcp_env")
+    def test_webhook_route_absent_without_secret(self) -> None:
+        server = make_server(transport="http")
+        assert "/github-webhook" not in self._route_paths(server)
 
 
 class TestToolManifest:

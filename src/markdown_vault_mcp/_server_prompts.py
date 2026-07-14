@@ -29,6 +29,15 @@ _BUILTIN_PROMPTS_DIR = importlib.resources.files("markdown_vault_mcp").joinpath(
     "static/prompts"
 )
 
+_BUILTIN_PROMPT_NAMES = (
+    "summarize",
+    "research",
+    "discuss",
+    "related",
+    "compare",
+    "propose-links",
+)
+
 logger = logging.getLogger(__name__)
 
 # Argument names must be plain, non-keyword Python identifiers: they become
@@ -338,52 +347,25 @@ def _register_one_builtin_prompt(mcp: FastMCP, name: str, defn: dict[str, Any]) 
     logger.debug("Registered built-in prompt: %s", name)
 
 
-def register_prompts(
-    mcp: FastMCP,
-    templates_folder: str | None,
-    prompts_folder: str | None = None,
-) -> None:
-    """Register all built-in MCP prompts on *mcp*, with user-defined overrides.
+def register_prompts(mcp: FastMCP) -> None:
+    """Register the config-independent built-in prompts on *mcp*.
 
-    User-defined prompts from *prompts_folder* take priority.  Any built-in
-    whose name matches a user-defined prompt is skipped.  User-defined prompts
-    are registered after the built-ins.
+    Registers the static built-in prompts shipped under ``static/prompts/*.md``
+    (each has frontmatter — description, arguments, tags, icons — and a body
+    that uses ``$var`` / ``${var}`` :class:`string.Template` substitution).
+
+    This is the template-mandated no-arg ``register_prompts(mcp)`` call site.
+    The config-dependent prompts — ``create_from_template`` (needs the templates
+    folder) and user-defined prompts (need the prompts folder) — are registered
+    separately by :func:`register_domain_prompts`, called from ``make_server``'s
+    ``DOMAIN-WIRING`` block where the resolved config is in scope. A user prompt
+    whose name matches one of these built-ins silently overrides it (see
+    :func:`register_domain_prompts`).
 
     Args:
         mcp: The :class:`~fastmcp.FastMCP` instance to register prompts on.
-        templates_folder: The configured templates folder path, or ``None``
-            when templates are not configured.  Passed in from
-            :func:`~markdown_vault_mcp.server.make_server` so that
-            ``create_from_template`` can close over this value without
-            re-reading environment variables.
-        prompts_folder: Path to a directory of user-defined ``.md`` prompt
-            files.  ``None`` disables user-defined prompt loading.
     """
-    # --- Pass 1: collect user-defined prompt names (for override semantics) ---
-    user_prompt_defs = _load_user_prompt_defs(prompts_folder)
-    if user_prompt_defs:
-        logger.info(
-            "User-defined prompts found in %r: %s",
-            prompts_folder,
-            sorted(user_prompt_defs),
-        )
-
-    # --- Pass 2: register built-ins from static/prompts/*.md ---
-    #
-    # Each .md file has frontmatter (description, arguments, tags, icons) and
-    # a body that uses $var / ${var} (string.Template) substitution.
-    # ``create_from_template`` has path-traversal safety logic and stays inline.
-
-    for md_name in [
-        "summarize",
-        "research",
-        "discuss",
-        "related",
-        "compare",
-        "propose-links",
-    ]:
-        if md_name in user_prompt_defs:
-            continue
+    for md_name in _BUILTIN_PROMPT_NAMES:
         defn = _load_builtin_prompt(md_name)
         if defn is not None:
             # Per-prompt backstop: a malformed built-in (missing def-dict key, or
@@ -400,56 +382,121 @@ def register_prompts(
                     exc_info=True,
                 )
 
-    if "create_from_template" not in user_prompt_defs:
 
-        @mcp.prompt(tags={"write"}, icons=_TOOL_ICONS["write"])
-        def create_from_template(template_name: str | None = None) -> str:
-            """Create a new note from a vault template. Pass template_name (e.g. "meeting-notes" or "meeting-notes.md") to skip discovery, or omit to browse available templates first."""
-            template_hint = "None" if template_name is None else repr(template_name)
-            template_name_clean = (
-                (template_name or "").strip().replace("\\", "/").lstrip("/")
-            )
-            if template_name_clean:
-                resolved: list[str] = []
-                for part in PurePosixPath(template_name_clean).parts:
-                    if part in ("", "."):
-                        continue
-                    elif part == "..":
-                        if resolved:
-                            resolved.pop()
-                    else:
-                        resolved.append(part)
-                template_name_clean = str(PurePosixPath(*resolved)) if resolved else ""
-            template_path = (
-                str(PurePosixPath(templates_folder) / template_name_clean)
-                if template_name_clean and templates_folder is not None
-                else ""
-            )
-            return (
-                "## Role\n"
-                "You are a note assistant that creates new notes from vault templates.\n\n"
-                "## Context\n"
-                f"- Templates folder: `{templates_folder}`\n"
-                f"- Requested template_name: {template_hint}\n"
-                "- Templates are normal markdown files. Do not use server-side variable substitution.\n\n"
-                "## Task\n"
-                "Guide the user through this workflow: discover template -> read template -> gather values -> write the new note.\n\n"
-                "## Format\n"
-                "Follow these exact steps in order:\n"
-                "1. If `template_name` is missing, call `list_documents(folder=<templates folder>)`, "
-                "show available templates, and ask the user to pick one.\n"
-                "2. Resolve template path and call `read(path=<template path>)`.\n"
-                f"   If a name is already provided, start with `read(path='{template_path or '<templates_folder>/<template_name>'}')`.\n"
-                "3. Present the template structure and ask the user for missing values.\n"
-                "4. Propose a target note path. Prefer frontmatter convention if present; otherwise ask the user.\n"
-                "5. Call `write(path=..., content=..., frontmatter=...)` with the filled note.\n\n"
-                "## Constraints\n"
-                "- Use only vault tools (`list_documents`, `read`, `write`) for this flow.\n"
-                "- Never overwrite an existing file without explicit user confirmation.\n"
-                "- If the selected template does not exist, return a clear error and ask for another template.\n"
-                "- Keep paths relative to the vault root.\n"
-                "- Repeat: discover -> read -> fill -> write.\n"
-            )
+def _register_create_from_template(mcp: FastMCP, templates_folder: str | None) -> None:
+    """Register the built-in ``create_from_template`` prompt on *mcp*.
+
+    The prompt body closes over *templates_folder* so the guidance references
+    the configured templates directory. Path components in ``template_name`` are
+    normalized inline (``..`` segments are popped) so the displayed example path
+    cannot escape the templates folder.
+    """
+
+    @mcp.prompt(tags={"write"}, icons=_TOOL_ICONS["write"])
+    def create_from_template(template_name: str | None = None) -> str:
+        """Create a new note from a vault template. Pass template_name (e.g. "meeting-notes" or "meeting-notes.md") to skip discovery, or omit to browse available templates first."""
+        template_hint = "None" if template_name is None else repr(template_name)
+        template_name_clean = (
+            (template_name or "").strip().replace("\\", "/").lstrip("/")
+        )
+        if template_name_clean:
+            resolved: list[str] = []
+            for part in PurePosixPath(template_name_clean).parts:
+                if part in ("", "."):
+                    continue
+                elif part == "..":
+                    if resolved:
+                        resolved.pop()
+                else:
+                    resolved.append(part)
+            template_name_clean = str(PurePosixPath(*resolved)) if resolved else ""
+        template_path = (
+            str(PurePosixPath(templates_folder) / template_name_clean)
+            if template_name_clean and templates_folder is not None
+            else ""
+        )
+        return (
+            "## Role\n"
+            "You are a note assistant that creates new notes from vault templates.\n\n"
+            "## Context\n"
+            f"- Templates folder: `{templates_folder}`\n"
+            f"- Requested template_name: {template_hint}\n"
+            "- Templates are normal markdown files. Do not use server-side variable substitution.\n\n"
+            "## Task\n"
+            "Guide the user through this workflow: discover template -> read template -> gather values -> write the new note.\n\n"
+            "## Format\n"
+            "Follow these exact steps in order:\n"
+            "1. If `template_name` is missing, call `list_documents(folder=<templates folder>)`, "
+            "show available templates, and ask the user to pick one.\n"
+            "2. Resolve template path and call `read(path=<template path>)`.\n"
+            f"   If a name is already provided, start with `read(path='{template_path or '<templates_folder>/<template_name>'}')`.\n"
+            "3. Present the template structure and ask the user for missing values.\n"
+            "4. Propose a target note path. Prefer frontmatter convention if present; otherwise ask the user.\n"
+            "5. Call `write(path=..., content=..., frontmatter=...)` with the filled note.\n\n"
+            "## Constraints\n"
+            "- Use only vault tools (`list_documents`, `read`, `write`) for this flow.\n"
+            "- Never overwrite an existing file without explicit user confirmation.\n"
+            "- If the selected template does not exist, return a clear error and ask for another template.\n"
+            "- Keep paths relative to the vault root.\n"
+            "- Repeat: discover -> read -> fill -> write.\n"
+        )
+
+
+def register_domain_prompts(
+    mcp: FastMCP,
+    templates_folder: str | None,
+    prompts_folder: str | None,
+) -> None:
+    """Register the config-dependent prompts on *mcp*.
+
+    Registers ``create_from_template`` (which closes over *templates_folder*)
+    and any user-defined prompts from *prompts_folder*. Both folder values come
+    from the caller's already-resolved config (``make_server`` passes
+    ``config.content.templates_folder`` / ``config.content.prompts_folder``), so
+    no environment re-read happens here and a caller-supplied config is honored
+    exactly (#609). Called from ``make_server``'s ``DOMAIN-WIRING`` block, after
+    :func:`register_prompts` has registered the config-independent built-ins.
+
+    User-defined prompts take priority: a user prompt whose name matches a
+    built-in registered earlier by :func:`register_prompts` shadows it — the
+    shadowed built-in is removed before the user prompt is registered, so the
+    built-in text never appears and no "component already exists" warning is
+    logged. ``create_from_template`` is guarded the same way (skipped when a
+    user prompt of that name exists).
+
+    Args:
+        mcp: The :class:`~fastmcp.FastMCP` instance to register prompts on.
+        templates_folder: The configured templates folder path, or ``None``
+            when templates are not configured.
+        prompts_folder: Path to a directory of user-defined ``.md`` prompt
+            files.  ``None`` disables user-defined prompt loading.
+    """
+    user_prompt_defs = _load_user_prompt_defs(prompts_folder)
+    if user_prompt_defs:
+        logger.info(
+            "User-defined prompts found in %r: %s",
+            prompts_folder,
+            sorted(user_prompt_defs),
+        )
+
+    if "create_from_template" not in user_prompt_defs:
+        _register_create_from_template(mcp, templates_folder)
+
+    # Drop any built-in that a user prompt shadows before re-registering under
+    # that name, so the override replaces cleanly instead of colliding (which
+    # would log a spurious "component already exists" WARNING). register_prompts
+    # registered all built-ins up front; here — where the user names are known —
+    # is the first point we can prune the shadowed ones. A built-in that failed
+    # to register (missing static file, or a #799 backstop-caught error) is
+    # simply absent: tolerate the KeyError so one bad built-in + a same-named
+    # user prompt does not abort server construction (the user prompt then
+    # registers fresh, with nothing to collide against).
+    for name in user_prompt_defs:
+        if name in _BUILTIN_PROMPT_NAMES:
+            try:
+                mcp.local_provider.remove_prompt(name)
+            except KeyError:
+                logger.debug("no built-in %r to prune before user override", name)
 
     # --- Pass 3: register user-defined prompts ---
     for name, defn in user_prompt_defs.items():
