@@ -531,9 +531,48 @@ class TestSummarizeFacet:
         result = vault.summarizer.summarize(["sub"])
         assert len(result.sources) == 1
         assert result.truncated is True
-        # The omission is quantified, not just flagged (#922).
+        # The omission is quantified, not just flagged (#922), the effective
+        # limit is reported, and the result carries recovery guidance (#925).
         assert result.notes_included == 1
         assert result.notes_omitted == 1
+        assert result.notes_limit == 1
+        assert result.hint is not None
+        assert "1 of 2 matched notes" in result.hint
+        assert "subfolders" in result.hint
+
+    def test_per_call_max_notes_narrows_coverage(
+        self, make_vault: VaultFactory
+    ) -> None:
+        vault = make_vault(summarizer=FakeSummarizer())
+        result = vault.summarizer.summarize(["sub"], max_notes=1)
+        assert result.notes_included == 1
+        assert result.notes_omitted == 1
+        assert result.notes_limit == 1
+        assert result.hint is not None
+
+    def test_per_call_max_notes_clamped_to_server_cap(
+        self, make_vault: VaultFactory
+    ) -> None:
+        # The server cap is the operator's per-call ceiling; a caller cannot
+        # exceed it (#925).
+        vault = make_vault(summarizer=FakeSummarizer(), summarize_max_notes=1)
+        result = vault.summarizer.summarize(["sub"], max_notes=99)
+        assert result.notes_limit == 1
+        assert result.notes_included == 1
+        assert result.notes_omitted == 1
+
+    def test_per_call_max_notes_below_one_rejected(
+        self, make_vault: VaultFactory
+    ) -> None:
+        vault = make_vault(summarizer=FakeSummarizer())
+        with pytest.raises(ValueError, match="max_notes must be >= 1"):
+            vault.summarizer.summarize(["sub"], max_notes=0)
+
+    def test_full_coverage_has_no_hint(self, make_vault: VaultFactory) -> None:
+        vault = make_vault(summarizer=FakeSummarizer())
+        result = vault.summarizer.summarize(["sub"])
+        assert result.notes_omitted == 0
+        assert result.hint is None
 
     def test_max_input_chars_truncation(self, make_vault: VaultFactory) -> None:
         vault = make_vault(
@@ -827,6 +866,55 @@ async def test_summarize_hidden_without_key(
     assert "summarize" not in names
 
 
+async def test_summarize_description_carries_live_note_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The configured limit is substituted into the tool description so a
+    # calling model can plan folder splits before its first call (#925).
+    (tmp_path / "simple.md").write_text("# Simple\n\nhi", encoding="utf-8")
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("MARKDOWN_VAULT_MCP_SUMMARIZE_MAX_NOTES", "7")
+    server = make_server()
+    async with Client(server) as client:
+        tools = {t.name: t for t in await client.list_tools()}
+    description = tools["summarize"].description or ""
+    assert "note limit of 7 notes" in description
+    assert "{max_notes}" not in description
+    # The Args: docstring entry lands in the parameter schema, a separate
+    # field from the tool description — it must be substituted too.
+    param_desc = tools["summarize"].inputSchema["properties"]["max_notes"][
+        "description"
+    ]
+    assert "cap of 7" in param_desc
+    assert "{max_notes}" not in param_desc
+
+
+def test_apply_summarize_limits_tolerates_missing_description() -> None:
+    # A summarize tool registered without a docstring has description=None;
+    # the substitution must skip it rather than crash on None.replace().
+    from fastmcp import FastMCP
+
+    from markdown_vault_mcp._server_tools.summarize import apply_summarize_limits
+
+    mcp = FastMCP(name="test")
+
+    @mcp.tool(name="summarize")
+    def summarize(paths: list[str]) -> str:
+        return ",".join(paths)
+
+    apply_summarize_limits(mcp, max_notes=5)
+
+
+def test_instructions_carry_live_note_limit() -> None:
+    from markdown_vault_mcp._instructions import build_default_instructions
+
+    with_limit = build_default_instructions(read_only=True, summarize_note_limit=7)
+    assert "at most 7 notes per call" in with_limit
+    without = build_default_instructions(read_only=True)
+    assert "notes per call" not in without
+
+
 async def test_summarize_visible_with_base_url_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -870,9 +958,14 @@ async def test_summarize_visible_and_callable_with_key(
         assert ann.destructiveHint is False
 
         await wait_for_mcp_writer_drain(client)
-        result = await client.call_tool("summarize", {"paths": ["simple.md"]})
+        result = await client.call_tool(
+            "summarize", {"paths": ["simple.md"], "max_notes": 5}
+        )
     data = result.data
     assert data["summary"] == "SERVER SUMMARY"
     assert data["sources"] == [{"path": "simple.md", "title": "Simple"}]
+    # The per-call limit is accepted end to end and reported back (#925).
+    assert data["notes_limit"] == 5
+    assert data["hint"] is None
     # The note content reached the (fake) model.
     assert "cats" in fake.calls[0][1]
