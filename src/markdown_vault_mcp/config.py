@@ -239,6 +239,21 @@ class ProjectConfig:
             "wizard": {"group": "Content"},
         },
     )
+    okf_mode: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "OKF (Open Knowledge Format) read semantics. With auto "
+                "(the default), read annotations switch on when the vault "
+                "declares an OKF version in its root index.md. Use off to "
+                "disable OKF semantics entirely, or on to force them for an "
+                "undeclared vault. Annotations are read-only; write "
+                "behavior is never affected."
+            ),
+            "tags": ("content",),
+            "wizard": {"group": "Content"},
+        },
+    )
     attachment_extensions: Sequence[str] | None = field(
         default=None,
         metadata={
@@ -852,6 +867,7 @@ class ProjectConfig:
             templates_folder=self.templates_folder,
             prompts_folder=resolve_prompts_folder(self.prompts_folder, self.source_dir),
             conventions_file=self.conventions_file,
+            okf_mode=self.okf_mode,
         )
 
     @property
@@ -956,6 +972,7 @@ class ProjectConfig:
             conventions_file=resolve_conventions_file(
                 env(_ENV_PREFIX, "CONVENTIONS_FILE")
             ),
+            okf_mode=(env(_ENV_PREFIX, "OKF_MODE", "auto") or "auto").strip().lower(),
             attachment_extensions=resolve_attachment_extensions(
                 env(_ENV_PREFIX, "ATTACHMENT_EXTENSIONS")
             ),
