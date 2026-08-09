@@ -11,11 +11,8 @@ on:
 
 jobs:
   wait-for-ci:
-    # Skip PRs from forks: GitHub does not expose repository secrets
-    # (including CLAUDE_CODE_OAUTH_TOKEN) to workflows running in fork-PR
-    # context, regardless of maintainer approval. Running anyway produces
-    # a hard-failing check on every external contribution.
-    if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+    # Skip PRs from forks and skip automated Renovate PRs
+    if: ${{ github.event.pull_request.head.repo.full_name == github.repository && !startsWith(github.head_ref, 'renovate/') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
