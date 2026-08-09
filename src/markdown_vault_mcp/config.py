@@ -253,6 +253,21 @@ class ProjectConfig:
             "wizard": {"group": "Content"},
         },
     )
+    okf_write: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "OKF (Open Knowledge Format) enforced write layer. When true on "
+                "an OKF-active vault, the server stamps generated provenance on "
+                "each write and clears any verified attestation when a note's "
+                "content changes. It also exposes the okf_verify tool. Requires "
+                "OKF_MODE to be auto or on (a true value with OKF_MODE=off is a "
+                "config error). Off by default."
+            ),
+            "tags": ("content",),
+            "wizard": {"group": "Content"},
+        },
+    )
     attachment_extensions: Sequence[str] | None = field(
         default=None,
         metadata={
@@ -843,6 +858,7 @@ class ProjectConfig:
             prompts_folder=resolve_prompts_folder(self.prompts_folder, self.source_dir),
             conventions_file=self.conventions_file,
             okf_mode=self.okf_mode,
+            okf_write=self.okf_write,
         )
 
     # CONFIG-FIELDS-END
@@ -942,6 +958,7 @@ class ProjectConfig:
                 env(_ENV_PREFIX, "CONVENTIONS_FILE")
             ),
             okf_mode=(env(_ENV_PREFIX, "OKF_MODE", "auto") or "auto").strip().lower(),
+            okf_write=to_bool(env(_ENV_PREFIX, "OKF_WRITE"), default=False),
             attachment_extensions=resolve_attachment_extensions(
                 env(_ENV_PREFIX, "ATTACHMENT_EXTENSIONS")
             ),

@@ -6,6 +6,7 @@ import ipaddress
 import logging
 import socket
 from dataclasses import asdict
+from datetime import date
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
@@ -13,11 +14,22 @@ from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 from fastmcp.exceptions import ToolError
 
-from markdown_vault_mcp.exceptions import EditConflictError
+from markdown_vault_mcp.exceptions import (
+    ConcurrentModificationError,
+    EditConflictError,
+)
+from markdown_vault_mcp.okf import _HUMAN_ACTOR_PREFIX, append_okf_verification
 from markdown_vault_mcp.utils.text import decode_utf8
 from markdown_vault_mcp.vault import Vault
 
 from .._icons import _TOOL_ICONS
+from .._okf_write import (
+    OkfWriteIntent,
+    okf_write_intent,
+    okf_write_suppressed,
+    resolve_human_subject,
+    resolve_write_actor,
+)
 from ..domain import get_vault
 from ._common import attach_conventions
 
@@ -212,13 +224,17 @@ def register(mcp: FastMCP) -> None:
                 vault.writer.write_attachment, path, raw_bytes, if_match=if_match
             )
             return asdict(result)
-        result = await asyncio.to_thread(
-            vault.writer.write,
-            path,
-            content,
-            frontmatter=frontmatter,
-            if_match=if_match,
-        )
+        # Bind the OKF provenance actor for the enforced-write layer (#964).
+        # A no-op unless OKF_WRITE is on; the intent rides the contextvar into
+        # the to_thread worker where the enricher runs.
+        with okf_write_intent(OkfWriteIntent(actor=resolve_write_actor())):
+            result = await asyncio.to_thread(
+                vault.writer.write,
+                path,
+                content,
+                frontmatter=frontmatter,
+                if_match=if_match,
+            )
         return await attach_conventions(vault, asdict(result), path)
 
     @mcp.tool(
@@ -293,15 +309,16 @@ def register(mcp: FastMCP) -> None:
                 (ConcurrentModificationError).
         """
         try:
-            result = await asyncio.to_thread(
-                vault.writer.edit,
-                path,
-                old_text=old_text,
-                new_text=new_text,
-                if_match=if_match,
-                line_start=line_start,
-                line_end=line_end,
-            )
+            with okf_write_intent(OkfWriteIntent(actor=resolve_write_actor())):
+                result = await asyncio.to_thread(
+                    vault.writer.edit,
+                    path,
+                    old_text=old_text,
+                    new_text=new_text,
+                    if_match=if_match,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
             return await attach_conventions(vault, asdict(result), path)
         except EditConflictError as exc:
             parts = [str(exc)]
@@ -664,14 +681,21 @@ def register(mcp: FastMCP) -> None:
                     f"Response body is not valid UTF-8 (content-type: {ct}). "
                     "Only UTF-8 encoded responses can be saved as .md notes."
                 ) from exc
-            result = await asyncio.to_thread(
-                vault.writer.write,
-                path,
-                text,
-                frontmatter=frontmatter,
-                if_match=if_match,
-            )
+            # Bind the OKF provenance actor (#964): fetch writes .md notes
+            # through the same DocumentManager.write path as the write/edit
+            # tools, so the enricher fires on an OKF-active vault. Attribute the
+            # save to the authenticated caller, not the default tool actor.
+            with okf_write_intent(OkfWriteIntent(actor=resolve_write_actor())):
+                result = await asyncio.to_thread(
+                    vault.writer.write,
+                    path,
+                    text,
+                    frontmatter=frontmatter,
+                    if_match=if_match,
+                )
         else:
+            # Attachments never carry OKF frontmatter and go through
+            # write_attachment, which the enricher does not touch — no intent.
             result = await asyncio.to_thread(
                 vault.writer.write_attachment,
                 path,
@@ -722,7 +746,12 @@ def register(mcp: FastMCP) -> None:
             Dict with files_changed, links_converted, links_skipped, and
             notes_scanned.
         """
-        result = await asyncio.to_thread(vault.writer.okf_convert_links, folder=folder)
+        # Mechanical migration: suppress the enforced-write enricher so a link
+        # rewrite does not re-stamp provenance or clear human verification (#964).
+        with okf_write_suppressed():
+            result = await asyncio.to_thread(
+                vault.writer.okf_convert_links, folder=folder
+            )
         return asdict(result)
 
     @mcp.tool(
@@ -755,7 +784,10 @@ def register(mcp: FastMCP) -> None:
         Returns:
             Dict with path, entries (count), and frontmatter_preserved (bool).
         """
-        result = await asyncio.to_thread(vault.writer.okf_generate_index, folder=folder)
+        with okf_write_suppressed():
+            result = await asyncio.to_thread(
+                vault.writer.okf_generate_index, folder=folder
+            )
         return asdict(result)
 
     @mcp.tool(
@@ -791,7 +823,83 @@ def register(mcp: FastMCP) -> None:
             Dict with path, commits (count), and dates (distinct-day count).
         """
         try:
-            result = await asyncio.to_thread(vault.writer.okf_seed_log, folder=folder)
+            with okf_write_suppressed():
+                result = await asyncio.to_thread(
+                    vault.writer.okf_seed_log, folder=folder
+                )
         except FileExistsError as exc:
             raise ToolError(str(exc)) from exc
         return asdict(result)
+
+    @mcp.tool(
+        tags={"okf", "write", "okf-enforce"},
+        icons=_TOOL_ICONS["okf_verify"],
+        annotations={
+            "title": "OKF: Verify Note",
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": False,
+        },
+    )
+    async def okf_verify(
+        path: str,
+        vault: Vault = Depends(get_vault),
+    ) -> dict[str, Any]:
+        """Attest a note as human-reviewed by appending an OKF verification.
+
+        Part of the OKF (Open Knowledge Format) enforced-write layer, available
+        only when `MARKDOWN_VAULT_MCP_OKF_WRITE` is enabled. Appends a
+        `{by: human:<subject>, at: <date>}` entry to the note's `verified`
+        frontmatter list from the authenticated identity, promoting the note's
+        trust tier to `human-reviewed`. Verification is an attributable act, so
+        it refuses (a tool error) when the server runs with no authentication.
+
+        Args:
+            path: Vault-relative path of the note to verify.
+
+        Returns:
+            A dict with:
+            - `path`: the verified note.
+            - `verifier`: the `human:<subject>` actor recorded.
+            - `verified_count`: the number of verification entries after the
+              append.
+
+        Raises:
+            ToolError: If the server has no authenticated identity, the note
+                does not exist, or the note changed since it was read (a
+                concurrent write — retry the verification).
+        """
+        subject = resolve_human_subject()
+        if subject is None:
+            raise ToolError(
+                "okf_verify requires an authenticated identity; the server is "
+                "running with no auth, so a verification cannot be attributed."
+            )
+        note = await asyncio.to_thread(vault.reader.read, path)
+        if note is None:
+            raise ToolError(f"Note not found: {path}")
+        prior = note.frontmatter.get("verified")
+        verified_count = (len(prior) if isinstance(prior, list) else 0) + 1
+        new_text = append_okf_verification(
+            note.content, subject=subject, today=date.today()
+        )
+        # Verification attests to a specific set of bytes, so the read-modify-
+        # write must be atomic: pass the read's etag as if_match so a concurrent
+        # write/edit/delete in the window fails the attestation instead of
+        # silently clobbering it or resurrecting a deleted note (#964). Suppress
+        # the enricher so it does not clear the verification just added.
+        try:
+            with okf_write_suppressed():
+                await asyncio.to_thread(
+                    vault.writer.write, path, new_text, if_match=note.etag
+                )
+        except ConcurrentModificationError as exc:
+            raise ToolError(
+                f"Note {path!r} changed since it was read; verification "
+                "aborted to avoid attesting stale content. Re-read and retry."
+            ) from exc
+        return {
+            "path": path,
+            "verifier": f"{_HUMAN_ACTOR_PREFIX}{subject}",
+            "verified_count": verified_count,
+        }
