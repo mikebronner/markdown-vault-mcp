@@ -54,8 +54,8 @@ jobs:
           fi
 
   claude-review:
-    needs: wait-for-ci
-    if: ${{ needs.wait-for-ci.outputs.ci_passed == 'true' }}
+    # DIAGNOSTIC (temporary): CI gate dropped so the review runs regardless of
+    # a flaky CI result on the test branch. Restore needs/if after.
     runs-on: ubuntu-latest
     permissions:
       contents: read          # Reviewer reads code; it must never commit
