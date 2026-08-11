@@ -89,18 +89,25 @@ jobs:
         # tells it not to re-run the full gate.
         run: uv sync --all-extras --all-groups
 
+      # DIAGNOSTIC: pin the last pre-background-default release (2.1.197,
+      # verified synchronous in claude-code#73453) so the skill's review agents
+      # run in-turn instead of being orphaned (#1499). With Skill+Task both
+      # granted, this is the combination expected to complete the full skill.
+      - name: Install pinned Claude Code (2.1.197, pre-background-subagents)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.197
+          BIN="$HOME/.local/bin/claude"
+          test -x "$BIN"
+          "$BIN" --version
+          echo "CLAUDE_BIN=$BIN" >> "$GITHUB_ENV"
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
-        env:
-          # DIAGNOSTIC lever: try to force subagents foreground/synchronous on
-          # the current CLI (claude-code#81439) so the skill's review agents
-          # finish in-turn instead of being orphaned by the query()-loop break
-          # (#1499). Unverified — the run tells us if the action passes it through
-          # and the CLI honours it.
-          CLAUDE_CODE_FORK_SUBAGENT: "0"
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_claude_code_executable: ${{ env.CLAUDE_BIN }}
           # DIAGNOSTIC (temporary): the real /code-review plugin on the current
           # CLI (no pin), with EVERY permission it needs (Skill+Task below) and
           # show_full_output — to capture a clean baseline failure that proves
