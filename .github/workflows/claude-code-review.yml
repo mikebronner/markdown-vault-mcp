@@ -103,6 +103,11 @@ jobs:
           track_progress: true
           display_report: true
           include_fix_links: false
+          # EXPERIMENT (revert after): print the full SDK stream so the run names
+          # every tool call and permission denial. Needed to see why the
+          # /code-review fan-out stalls at "compile results" now that Task is
+          # granted (6 residual denials, tool identities otherwise hidden).
+          show_full_output: true
           # Read CI results through the built-in GitHub CI MCP server.
           additional_permissions: |
             actions: read
