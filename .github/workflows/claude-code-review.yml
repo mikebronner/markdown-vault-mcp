@@ -54,8 +54,8 @@ jobs:
           fi
 
   claude-review:
-    # DIAGNOSTIC (temporary): CI gate dropped so the review runs regardless of
-    # a flaky CI result on the test branch. Restore needs/if after.
+    needs: wait-for-ci
+    if: ${{ needs.wait-for-ci.outputs.ci_passed == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read          # Reviewer reads code; it must never commit
@@ -89,10 +89,13 @@ jobs:
         # tells it not to re-run the full gate.
         run: uv sync --all-extras --all-groups
 
-      # DIAGNOSTIC: pin the last pre-background-default release (2.1.197,
-      # verified synchronous in claude-code#73453) so the skill's review agents
-      # run in-turn instead of being orphaned (#1499). With Skill+Task both
-      # granted, this is the combination expected to complete the full skill.
+      # The /code-review plugin fans out into parallel review agents. On Claude
+      # Code >= 2.1.198 those dispatch as background tasks that claude-code-action
+      # drops before they finish (runClaudeWithSdk breaks query() on the first
+      # result — claude-code-action#1499), so the review completes green and posts
+      # nothing. Pin the last synchronous-subagent release (2.1.197, verified with
+      # action@v1 in claude-code#73453) so the fan-out completes in-turn. Remove
+      # this step + path_to_claude_code_executable once #1499 is fixed upstream.
       - name: Install pinned Claude Code (2.1.197, pre-background-subagents)
         run: |
           set -euo pipefail
@@ -107,16 +110,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Use the pinned 2.1.197 CLI installed above (skips the action's own).
           path_to_claude_code_executable: ${{ env.CLAUDE_BIN }}
-          # DIAGNOSTIC (temporary): the real /code-review plugin on the current
-          # CLI (no pin), with EVERY permission it needs (Skill+Task below) and
-          # show_full_output — to capture a clean baseline failure that proves
-          # the async-subagent orphan (claude-code-action#1499) is the sole
-          # remaining cause once no permission denial confounds it.
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          show_full_output: true
           # Surface progress so a silent failure is visible.
           track_progress: true
           display_report: true
@@ -124,10 +122,10 @@ jobs:
           # Read CI results through the built-in GitHub CI MCP server.
           additional_permissions: |
             actions: read
-          # DIAGNOSTIC: grant everything the plugin needs — Skill (launch the
-          # skill) AND Task (dispatch its review subagents) — plus the
-          # gh/inline/uv tools, so nothing is denied and any failure is purely
-          # the async-orphan.
+          # Grant the plugin what it needs: Skill (launch the /code-review
+          # skill) and Task (dispatch its review subagents — synchronous under
+          # the pinned 2.1.197), plus the gh/inline/uv tools. contents: read
+          # keeps the reviewer from committing — it only reads and comments.
           claude_args: |
             --allowedTools "Skill,Task,mcp__github__get_*,mcp__github__list_*,mcp__github__search_*,mcp__github_ci__*,mcp__github_inline_comment__*,Bash(gh api *),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(uv run pytest:*),Bash(uv run mypy:*),Bash(uv run ruff:*)"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
