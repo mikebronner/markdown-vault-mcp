@@ -89,11 +89,29 @@ jobs:
         # tells it not to re-run the full gate.
         run: uv sync --all-extras --all-groups
 
+      # Workaround for claude-code-action#1499 + claude-code#73453: Claude Code
+      # >= 2.1.198 dispatches subagents as background tasks by default, and the
+      # action's runClaudeWithSdk breaks the query() loop on the first result —
+      # so a fan-out /code-review orphans its review agents and posts nothing
+      # (silent success). Pin the last synchronous-subagent release (2.1.197,
+      # reported working with action@v1 in #73453) and point the action at it
+      # via path_to_claude_code_executable (which skips its own 2.1.226 install).
+      - name: Install pinned Claude Code (2.1.197, pre-background-subagents)
+        run: |
+          set -euo pipefail
+          curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.197
+          BIN="$HOME/.local/bin/claude"
+          test -x "$BIN"
+          "$BIN" --version
+          echo "CLAUDE_BIN=$BIN" >> "$GITHUB_ENV"
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # EXPERIMENT: use the pinned 2.1.197 CLI installed above.
+          path_to_claude_code_executable: ${{ env.CLAUDE_BIN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           # `--comment` tells the plugin to actually post (without it, the plugin
