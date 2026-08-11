@@ -89,59 +89,45 @@ jobs:
         # tells it not to re-run the full gate.
         run: uv sync --all-extras --all-groups
 
-      # Workaround for claude-code-action#1499 + claude-code#73453: Claude Code
-      # >= 2.1.198 dispatches subagents as background tasks by default, and the
-      # action's runClaudeWithSdk breaks the query() loop on the first result —
-      # so a fan-out /code-review orphans its review agents and posts nothing
-      # (silent success). Pin the last synchronous-subagent release (2.1.197,
-      # reported working with action@v1 in #73453) and point the action at it
-      # via path_to_claude_code_executable (which skips its own 2.1.226 install).
-      - name: Install pinned Claude Code (2.1.197, pre-background-subagents)
-        run: |
-          set -euo pipefail
-          curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.197
-          BIN="$HOME/.local/bin/claude"
-          test -x "$BIN"
-          "$BIN" --version
-          echo "CLAUDE_BIN=$BIN" >> "$GITHUB_ENV"
-
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # EXPERIMENT: use the pinned 2.1.197 CLI installed above.
-          path_to_claude_code_executable: ${{ env.CLAUDE_BIN }}
-          plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
-          plugins: 'code-review@claude-code-plugins'
-          # `--comment` tells the plugin to actually post (without it, the plugin
-          # runs the full review and stops silently — burning ~$3/PR for no output).
-          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # Single-agent review — NOT the /code-review plugin. The plugin fans
+          # out into parallel review agents dispatched as background tasks that
+          # the headless action drops before they finish, so reviews complete
+          # green and post nothing (claude-code-action#1499 / #1087 / #1523,
+          # claude-code#85275 — all silent). A single-agent prompt does the
+          # review inline and posts reliably. Revert to the plugin once those
+          # are fixed upstream.
+          prompt: |
+            Review pull request ${{ github.repository }}#${{ github.event.pull_request.number }} DIRECTLY in this session.
+            Do NOT launch subagents, the Task/Agent tool, or the /code-review skill — a single-agent review is required (background subagents are silently dropped in this headless CI, so a fan-out review posts nothing).
+
+            1. Get the diff with `gh pr diff` (base branch is origin/main); read changed files with Read/Grep for context as needed.
+            2. Flag ONLY high-signal issues in the changed code:
+               - will fail to compile/parse (syntax/type errors, missing imports, unresolved references);
+               - will definitely produce wrong results regardless of input (clear logic errors);
+               - a security problem introduced by the diff;
+               - a clear, quotable violation of a CLAUDE.md rule (consider only CLAUDE.md files at or above the changed file's path).
+               Do NOT flag: style/quality opinions, speculative or input-dependent concerns, pre-existing issues, linter-catchable nits, or anything you cannot verify from the diff plus a quick read. False positives erode trust — when unsure, drop it.
+            3. Post each issue as an inline comment via `mcp__github_inline_comment__create_inline_comment` (confirmed: true) on the exact line(s); include a ```suggestion block only for a small self-contained fix that fully resolves the issue. One comment per issue, no duplicates.
+            4. Update your tracking comment with a short summary: list each issue, or if none, state "No issues found. Checked for bugs and CLAUDE.md compliance."
           # Surface progress so a silent failure is visible.
           track_progress: true
           display_report: true
           include_fix_links: false
-          # EXPERIMENT (revert after): print the full SDK stream so the run names
-          # every tool call and permission denial. Needed to see why the
-          # /code-review fan-out stalls at "compile results" now that Task is
-          # granted (6 residual denials, tool identities otherwise hidden).
-          show_full_output: true
           # Read CI results through the built-in GitHub CI MCP server.
           additional_permissions: |
             actions: read
           # Grant the built-in GitHub read/search MCP tools, the CI tools, the
           # inline-comment tool (what lets the reviewer post inline — not in the
           # default allow-set), `gh api` for read-only API access, gh pr/run read
-          # commands, scoped `uv run` for targeted investigation (REVIEW.md sets
-          # norms), and Task. contents: read above keeps the reviewer from
-          # committing — it only reads and comments.
-          #
-          # Task is required: the /code-review plugin fans out into review
-          # subagents via the Task tool. Tag mode's fixed allow-set omits it, so
-          # under acceptEdits + headless (no prompt handler) each dispatch is
-          # silently denied and the review stalls with no findings. Subagents
-          # inherit this same set under contents: read — delegation, not new
-          # capability.
+          # commands, and scoped `uv run` for targeted investigation. contents:
+          # read above keeps the reviewer from committing — it only reads and
+          # comments. No Task/Agent here: this reviewer is deliberately
+          # single-agent (see the prompt note above).
           claude_args: |
-            --allowedTools "Task,mcp__github__get_*,mcp__github__list_*,mcp__github__search_*,mcp__github_ci__*,mcp__github_inline_comment__*,Bash(gh api *),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(uv run pytest:*),Bash(uv run mypy:*),Bash(uv run ruff:*)"
+            --allowedTools "mcp__github__get_*,mcp__github__list_*,mcp__github__search_*,mcp__github_ci__*,mcp__github_inline_comment__*,Bash(gh api *),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh run view:*),Bash(gh run list:*),Bash(uv run pytest:*),Bash(uv run mypy:*),Bash(uv run ruff:*)"
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
