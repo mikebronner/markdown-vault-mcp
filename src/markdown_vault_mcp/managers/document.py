@@ -1,6 +1,6 @@
 """Document CRUD, attachment, and path-validation manager.
 
-Handles all read/write/edit/delete/rename operations, attachment I/O,
+Handles all read/write/edit/append/delete/rename operations, attachment I/O,
 path validation, and backlink updates — all with dependency injection
 and no back-reference to :class:`Vault`.
 """
@@ -750,16 +750,105 @@ class DocumentManager:
             else:
                 file_content = content
 
-            if self._okf_write_enrich is not None:
-                file_content = self._okf_write_enrich(file_content, "write")
-
-            self._atomic_write(abs_path, file_content)
-
-            if self._mark_paths_dirty is not None:
-                self._mark_paths_dirty([path])
-
+            self._finalize_content_write(abs_path, path, file_content, "write")
             result = WriteResult(path=path, created=created)
-            self._on_write_callback(abs_path, file_content, "write")
+
+        return result
+
+    def _finalize_content_write(
+        self,
+        abs_path: Path,
+        path: str,
+        content: str,
+        operation: WriteOperation,
+    ) -> None:
+        """Run the shared tail of every content write.
+
+        Enriches *content* through the OKF enforced-write hook (when wired),
+        writes it atomically, marks the path dirty for the index writer, and
+        fires the write callback.  Must be called with ``_file_write_lock``
+        held.
+
+        Args:
+            abs_path: Absolute path of the target file.
+            path: Vault-relative path of the target file.
+            content: Full file content to persist.
+            operation: The write operation reported to the enricher and the
+                write callback.
+        """
+        if self._okf_write_enrich is not None:
+            content = self._okf_write_enrich(content, operation)
+        self._atomic_write(abs_path, content)
+        if self._mark_paths_dirty is not None:
+            self._mark_paths_dirty([path])
+        self._on_write_callback(abs_path, content, operation)
+
+    def append(
+        self,
+        path: str,
+        content: str,
+        if_match: str | None = None,
+        *,
+        create_if_missing: bool = False,
+    ) -> WriteResult:
+        """Append *content* to the end of a document (#980).
+
+        Unlike :meth:`edit`, no prior read is required: the existing file
+        content is never part of the request.  When the file does not end
+        with a newline, one is inserted before *content* so the appended
+        text starts on its own line; otherwise *content* is written
+        directly after the existing content.  Like every content write,
+        the file is persisted in the vault's normalized form (UTF-8, no
+        BOM, ``\\n`` line endings), so a CRLF file is normalized on its
+        first append.
+
+        Args:
+            path: Relative document path.
+            content: Text to append.  Must be non-empty.
+            if_match: Optional etag from a previous :meth:`read` call.
+                When provided, the append is only performed if the current
+                file hash matches this value.  Pass ``None`` (default) to
+                append unconditionally.
+            create_if_missing: When ``True``, a missing document is created
+                with *content* as its body instead of raising
+                :exc:`~markdown_vault_mcp.exceptions.DocumentNotFoundError`.
+
+        Returns:
+            :class:`~markdown_vault_mcp.types.WriteResult` — ``created`` is
+            ``True`` only when *create_if_missing* created a new file.
+
+        Raises:
+            ReadOnlyError: If the vault is read-only.
+            DocumentNotFoundError: If the file does not exist and
+                *create_if_missing* is ``False``.
+            ConcurrentModificationError: If *if_match* is provided and does
+                not match the current file hash (or the file is missing).
+            ValueError: If *content* is empty or *path* escapes the source
+                directory.
+        """
+        self._check_writable()
+        if not content:
+            raise ValueError("content must not be empty")
+
+        with self._file_write_lock:
+            abs_path = self._validate_path(path)
+            existed = abs_path.is_file()
+            if not existed and not create_if_missing:
+                raise DocumentNotFoundError(f"Document not found: {path}")
+            self._check_if_match(abs_path, path, if_match)
+
+            if existed:
+                file_content = _read_text_utf8(abs_path)
+                needs_newline = bool(file_content) and not file_content.endswith("\n")
+                new_content = file_content + ("\n" if needs_newline else "") + content
+            else:
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                new_content = content
+
+            # An append is a content edit for the enforced-write layer and
+            # the git commit callback alike.
+            self._finalize_content_write(abs_path, path, new_content, "edit")
+            result = WriteResult(path=path, created=not existed)
 
         return result
 
@@ -905,15 +994,7 @@ class DocumentManager:
                     file_content, old_text, new_text, path
                 )
 
-            if self._okf_write_enrich is not None:
-                new_content = self._okf_write_enrich(new_content, "edit")
-
-            self._atomic_write(abs_path, new_content)
-
-            if self._mark_paths_dirty is not None:
-                self._mark_paths_dirty([path])
-
-            self._on_write_callback(abs_path, new_content, "edit")
+            self._finalize_content_write(abs_path, path, new_content, "edit")
 
         return EditResult(path=path, replacements=1, match_type=match_type)
 
