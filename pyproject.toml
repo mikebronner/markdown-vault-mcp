@@ -119,6 +119,12 @@ exclude = ["src/markdown_vault_mcp/static/app.src.html"]
 target-version = "py311"
 line-length = 88
 src = ["src", "tests"]
+# Keep ruff >=0.16's markdown code-fence formatter away from all markdown:
+# tests/fixtures/*.md is byte-exact test data (one file is deliberately
+# invalid UTF-8, which aborts the formatter), docs carry hand-aligned
+# comment columns and non-Python fences it mangles, and CI only format-
+# checks src/ and tests/ anyway.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [
