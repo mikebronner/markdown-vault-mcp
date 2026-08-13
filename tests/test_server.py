@@ -374,7 +374,6 @@ class TestToolManifest:
             "get_outlinks",
             "get_recent",
             "get_similar",
-            "get_summary",
             "get_toc",
             "git_sync",
             "list_documents",
@@ -391,7 +390,6 @@ class TestToolManifest:
             "rename",
             "search",
             "stats",
-            "summarize",
             "write",
         ]
 
@@ -503,6 +501,17 @@ class TestToolAnnotations:
         register_transfer_routes(
             mcp, config.server, config.transfer, sink=sink, validate=sink.validate
         )
+        # summarize + the generic jobs poller register from make_server's
+        # DOMAIN-WIRING block (they need the config-built Jobs mechanics,
+        # #1033), not register_tools; wire them here the same way so the
+        # full-registry sweep keeps asserting their metadata.
+        from fastmcp_pvl_core import build_jobs, register_job_tools
+
+        from markdown_vault_mcp._server_tools import summarize as summarize_tools
+
+        jobs = build_jobs(config.server, config.jobs)
+        summarize_tools.register(mcp, jobs)
+        register_job_tools(mcp, jobs)
 
         tools = await mcp._list_tools()
         missing = sorted(

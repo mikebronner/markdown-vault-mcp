@@ -44,7 +44,6 @@ src/markdown_vault_mcp/
   tracker.py           -- hash-based change detection
   vault.py             -- thin composition root: lifecycle, wiring, facet accessors (index-write → indexing/coordinator.py)
   write_callback.py    -- WriteCallbackDispatcher: deferred git-commit callback worker (#599)
-  summary_jobs.py      -- SummaryJobStore: in-memory background-summarize job store backing the get_summary poll tool (#937)
   _write_tools.py      -- WRITE_TOOL_NAMES + write_tools_phrase: single source for the user-facing write-tool enumeration (#1009)
   config.py            -- template-owned skeleton: flat metadata-carrying ProjectConfig fields + section-view properties + from_env, all inside CONFIG-* sentinels (#900, #952)
   config_sections/
