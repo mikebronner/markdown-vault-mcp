@@ -98,8 +98,8 @@ def register(mcp: FastMCP, jobs: Jobs) -> None:
 
         Only available when a summarization backend is configured (an
         OPENAI_API_KEY or an OpenAI-compatible base URL). Note content is
-        sent to the external model provider; do not summarize notes whose
-        content must not leave your environment.
+        sent to the operator-configured backend; do not summarize notes
+        whose content must not be shared with it.
 
         Args:
             paths: One or more note paths (e.g. "notes/topic.md") and/or folder

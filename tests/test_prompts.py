@@ -812,6 +812,166 @@ class TestProposeLinks:
         assert "conventions" in text.lower()
 
 
+class TestSummarizeSubtree:
+    """The summarize-subtree prompt: client-side map-reduce recipe (#1035).
+
+    Registered config-dependently (the ``create_from_template`` pattern): its
+    ``${route_note}`` slot resolves at registration time to a
+    prefer-the-tool note when a summarize backend is configured, and is
+    removed when none is.
+    """
+
+    @pytest.mark.usefixtures("_clear_vars")
+    async def test_registered_read_only_with_arguments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Untagged (read) prompt: visible in read-only mode; paths required,
+        focus optional."""
+        for var in (
+            "OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_BASE_URL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        server = make_server()
+        async with Client(server) as client:
+            prompts = await client.list_prompts()
+        prompt = next(p for p in prompts if p.name == "summarize-subtree")
+        args = {a.name: a.required for a in (prompt.arguments or [])}
+        assert args == {"paths": True, "focus": False}
+
+    @pytest.mark.usefixtures("_clear_vars")
+    async def test_substitutes_arguments(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for var in (
+            "OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_BASE_URL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        server = make_server()
+        async with Client(server) as client:
+            result = await client.get_prompt(
+                "summarize-subtree",
+                {"paths": "projects/alpha, notes/b.md", "focus": "action items"},
+            )
+        text = result.messages[0].content.text
+        assert "projects/alpha, notes/b.md" in text
+        assert "action items" in text
+        assert "$paths" not in text
+        assert "$focus" not in text
+
+    @pytest.mark.usefixtures("_clear_vars")
+    async def test_recipe_is_subagent_optional_with_attribution(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The body carries the batched recipe: toc-based planning, path
+        attribution, the batch-context rule, and an explicit no-subagents
+        execution path."""
+        for var in (
+            "OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_BASE_URL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        server = make_server()
+        async with Client(server) as client:
+            result = await client.get_prompt("summarize-subtree", {"paths": "x"})
+        text = result.messages[0].content.text
+        assert "get_toc" in text
+        assert "subagent" in text
+        assert "attribution" in text
+        assert "Do not accumulate note bodies" in text
+        assert "No subagents: process the batches yourself" in text
+        # Truncation recovery must re-enumerate completely (higher max_notes
+        # or the uncapped list_documents), never plan from a truncated toc —
+        # notes sorted past the cutoff would be silently omitted.
+        assert "never plan from a truncated listing" in text
+        assert "list_documents" in text
+
+    @pytest.mark.usefixtures("_clear_vars")
+    async def test_no_backend_omits_tool_mention(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a summarize backend the prompt never names the (absent)
+        tool, and the route-note slot is fully removed."""
+        for var in (
+            "OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_BASE_URL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        server = make_server()
+        async with Client(server) as client:
+            result = await client.get_prompt("summarize-subtree", {"paths": "x"})
+        text = result.messages[0].content.text
+        assert "`summarize` tool" not in text
+        assert "route_note" not in text
+
+    @pytest.mark.usefixtures("_clear_vars")
+    async def test_backend_configured_prefers_tool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a backend configured the prompt opens by preferring the
+        server-side tool over the recipe."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        server = make_server()
+        async with Client(server) as client:
+            result = await client.get_prompt("summarize-subtree", {"paths": "x"})
+        text = result.messages[0].content.text
+        assert "`summarize` tool" in text
+        assert "Prefer the tool" in text
+        assert "route_note" not in text
+
+    def test_registration_failure_logged_not_raised(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A malformed summarize-subtree defn is logged at ERROR (packaging
+        defect) without raising — the #799 backstop pattern."""
+        import logging
+
+        from fastmcp import FastMCP
+
+        from markdown_vault_mcp import _server_prompts
+
+        monkeypatch.setattr(
+            _server_prompts,
+            "_load_builtin_prompt",
+            # Missing "description" -> _register_one_builtin_prompt raises.
+            lambda _name: {"arguments": [], "tags": [], "icons": "", "content": "x"},
+        )
+        mcp = FastMCP("test")
+        with caplog.at_level(
+            logging.ERROR, logger="markdown_vault_mcp._server_prompts"
+        ):
+            _server_prompts._register_summarize_subtree(mcp, tool_available=False)
+        assert "summarize-subtree' failed to register" in caplog.text
+
+    @pytest.mark.usefixtures("_clear_vars")
+    async def test_user_prompt_overrides(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A user prompt named summarize-subtree replaces the built-in (the
+        create_from_template skip pattern), registered exactly once."""
+        for var in (
+            "OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_API_KEY",
+            "MARKDOWN_VAULT_MCP_SUMMARIZE_OPENAI_BASE_URL",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        (prompts_dir / "summarize-subtree.md").write_text(
+            "CUSTOM SUBTREE", encoding="utf-8"
+        )
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_PROMPTS_FOLDER", str(prompts_dir))
+        server = make_server()
+        async with Client(server) as client:
+            prompts = await client.list_prompts()
+            result = await client.get_prompt("summarize-subtree", {})
+        assert result.messages[0].content.text == "CUSTOM SUBTREE"
+        assert len([p for p in prompts if p.name == "summarize-subtree"]) == 1
+
+
 class TestRegisterPromptsPerPromptGuard:
     """A malformed prompt is skipped and its siblings still register.
 
