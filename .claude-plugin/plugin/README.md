@@ -18,32 +18,29 @@ write/edit/git.
 
 ## Configure
 
-Set `MARKDOWN_VAULT_MCP_SOURCE_DIR` in your shell profile before starting
-Claude Code. On macOS/Linux:
+Enabling the plugin opens a configuration prompt. The only required field is
+the vault directory; everything else has a sensible default or can stay
+empty. Highlights of the screen:
 
-```bash
-echo 'export MARKDOWN_VAULT_MCP_SOURCE_DIR=/path/to/your/vault' >> ~/.zshrc
-```
-
-On Windows PowerShell:
-
-```powershell
-[Environment]::SetEnvironmentVariable(
-    "MARKDOWN_VAULT_MCP_SOURCE_DIR",
-    "C:\Users\You\Vault",
-    "User")
-```
-
-Optional environment variables:
-
-| Variable | Default | Purpose |
+| Setting | Default | What it sets |
 |---|---|---|
-| `MARKDOWN_VAULT_MCP_READ_ONLY` | `true` | Disable write tools. |
-| `MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER` | *(empty)* | `fastembed` / `ollama` / `openai`. Leave blank for keyword-only search. |
-| `MARKDOWN_VAULT_MCP_EXCLUDE` | `.obsidian/**,.trash/**,.git/**` | Glob patterns to skip. |
+| Vault directory | *(required)* | `MARKDOWN_VAULT_MCP_SOURCE_DIR` |
+| Read-only mode | `true` | `MARKDOWN_VAULT_MCP_READ_ONLY`; set `false` to enable write tools |
+| Exclude patterns | `.obsidian/**,.trash/**,.git/**` | `MARKDOWN_VAULT_MCP_EXCLUDE` |
+| Embedding provider | *(empty)* | `fastembed` / `ollama` / `openai`; empty means keyword-only search |
 
-For the full list of env vars, see the
-[Configuration reference](https://pvliesdonk.github.io/markdown-vault-mcp/configuration/).
+Your answers persist across plugin updates, and sensitive fields (the OpenAI
+API key, the git access token) are masked and stored in secure storage.
+Restart Claude Code after configuring so the server starts with your values.
+
+To change the configuration later, re-open the plugin's configuration from
+the `/plugin` menu, or just ask Claude to set up or repair your vault (the
+`vault-setup` skill walks through it).
+
+Settings the screen does not wire stay reachable through env vars in the
+`env` block of your user-scope `~/.claude/settings.json`; see the
+[Configuration reference](https://pvliesdonk.github.io/markdown-vault-mcp/configuration/)
+for the full list.
 
 ## What you get
 
@@ -58,6 +55,11 @@ For the full list of env vars, see the
   bodies out of the retained conversation context.
 - **Agent:** `vault-mapper` — the summarize skill's map-phase worker,
   restricted to the vault read tools.
+- **Configuration screen:** enabling the plugin prompts for the vault
+  directory (required), read-only mode, embedding provider settings, and
+  git sync — no shell-profile editing. Sensitive fields (API key, git
+  token) are masked and stored securely. The screen is generated from the
+  server's configuration surface, so it cannot drift from the code.
 - **Bootstrap:** a `vault-setup` skill runs a guided discover → validate →
   write-config → restart flow for first-run setup and later repairs (moved
   vault, expired git token), and a SessionStart doctor hook
