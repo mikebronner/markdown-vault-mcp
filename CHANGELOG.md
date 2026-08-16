@@ -2,6 +2,99 @@
 
 <!-- version list -->
 
+## v4.0.0-rc.1 (2026-08-16)
+
+### Bug Fixes
+
+- **fetch**: Close SSRF gaps by migrating to pvl-core's hardened fetch_url (#1029)
+  ([#1029](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1029),
+  [`3e2bf4b`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/3e2bf4bb6f48eb75c4b0eb2d956ce7a2671fcd36))
+
+- **release**: Adopt template v3.2.2 — template-owned bump_manifests, non-mutating CI syncs (#1032)
+  ([#1032](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1032),
+  [`ec9f51d`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/ec9f51d331b01ec0d4798cebf12728c673a12238))
+
+### Chores
+
+- **copier**: Adopt the branch-aware release model via copier update to template v4.0.0 (#1066)
+  ([#1066](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1066),
+  [`9f11ca9`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/9f11ca96e42cbdbfbd3bd985494d5ce17027bc6a))
+
+- **copier**: Update to template v4.1.0 and clear stale rc manifest pins (#1075)
+  ([#1075](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1075),
+  [`923ea21`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/923ea2114535613467c922262df23b20715dba0a))
+
+### Documentation
+
+- Backfill 3.0 and 1.x release notes, reconstruct CHANGELOG.md in machine-generated form (#1067)
+  ([#1067](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1067),
+  [`bf848cc`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/bf848cc2703e7685e094f44a162e63985fa56cfa))
+
+- Bring the CLAUDE.md module map in sync with the source tree (#1062)
+  ([#1062](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1062),
+  [`91f6a9c`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/91f6a9c2e0545a5d362282458f954e4b16aa5f90))
+
+- Correct transfer-links after the pvl-core adoption; document EMBED_TIMEOUT_S (#1061)
+  ([#1061](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1061),
+  [`37a4b2f`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/37a4b2faf244d4e435668eb78245036d432e9e2e))
+
+- Establish docs/releases/ structure with the 3.1 notes page (#1065)
+  ([#1065](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1065),
+  [`b7b2a47`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/b7b2a479df9f7562ca72b66d9cccbad19453ff17))
+
+- Record release-model decision, cut criterion, and remaining map entries (#1080)
+  ([#1080](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1080),
+  [`2a71091`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/2a71091d4c8862f7ac559f281f54ae993c1b19f0))
+
+- Release-notes surface, CLAUDE.md module map, and deployment-guide cleanup (#1076)
+  ([#1076](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1076),
+  [`0e5df1f`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/0e5df1fb2fca1bf21de5aeb7427b42dc89d0083f))
+
+- **design**: Describe the branch-aware release model in the spec (#1074)
+  ([#1074](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1074),
+  [`5297acc`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/5297acc462f9122e2590662fc8f81d99b238b53b))
+
+### Features
+
+- **index**: Make reindex and build_embeddings dual-mode background jobs (#1037)
+  ([#1037](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1037),
+  [`da23481`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/da234811b835d005f569c02d9847e73debd1ceae))
+
+- **packaging**: Adopt template v3.4.0 — generated mcpb screen, curated fields, pre-release checks
+  (#1045) ([#1045](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1045),
+  [`c87e662`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/c87e662d71f5d8c6bd2eca6ec16b394f896db8cd))
+
+- **packaging**: Adopt template v3.5.0 — plugin channel onto the template scaffold (#1046)
+  ([#1046](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1046),
+  [`5197151`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/51971511e4fa59d0ec5d5b786e1c5406ac0fe82e))
+
+- **plugin**: Generated userConfig configuration screen — no more shell-profile setup (#1049)
+  ([#1049](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1049),
+  [`e9232c4`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/e9232c4dba06dad07248cd8271c65ac3705182f2))
+
+- **plugin**: Vault-setup skill and SessionStart doctor hook for in-session bootstrap (#1048)
+  ([#1048](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1048),
+  [`6339fba`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/6339fbab3b13f95af2e3041d1d2cfb132fc2f85d))
+
+- **plugin**: Vault-summarize skill and vault-mapper agent for client-side summarization (#1047)
+  ([#1047](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1047),
+  [`217e192`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/217e19256d92da328f12143250d4efc71c98b90c))
+
+- **prompts**: Ship client-side summarization recipe as summarize-subtree prompt (#1038)
+  ([#1038](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1038),
+  [`0ee8a11`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/0ee8a11d5feda3d100ff741d8c5b9ad7c43c85ae))
+
+- **summarize**: Dual-mode background jobs via pvl-core 4.11.0 + template v3.3.0 (#1034)
+  ([#1034](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1034),
+  [`469b41c`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/469b41c90d6da3075674a85431dd0ab98f3f3b1a))
+
+### Testing
+
+- Stop re-testing pvl-core's SSRF behaviour in the fetch-tool suite (#1031)
+  ([#1031](https://github.com/pvliesdonk/markdown-vault-mcp/pull/1031),
+  [`9cb80e0`](https://github.com/pvliesdonk/markdown-vault-mcp/commit/9cb80e01f6003bce909e6bd0fd1de2b5119a15ef))
+
+
 ## v3.2.0-rc.7 (2026-08-12)
 
 ### Bug Fixes
