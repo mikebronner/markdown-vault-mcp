@@ -95,10 +95,12 @@ plugins:
           - prompts.md: All 6 MCP prompts with workflow descriptions
         Deployment:
           - deployment/index.md: Deployment overview
-          - deployment/docker.md: Docker Compose, Traefik, volumes, UID/GID
+          - deployment/docker.md: Docker Compose, Traefik, volumes, UID/GID, image tags
           - deployment/systemd.md: systemd service — package install, manual install, security hardening
           - deployment/claude-desktop.md: Claude Desktop configuration reference
           - deployment/oidc.md: OIDC authentication setup with Authelia
+          - deployment/release-process.md: Branch-aware release model — channels, release branches, merge-back
+          - deployment/repository-protection.md: Repository rulesets — per-branch posture and bypass model
         Python API:
           - api/vault.md: Vault class API reference
           - api/facets.md: Reader/Writer/Graph/Index facet API reference
@@ -184,6 +186,8 @@ nav:
       - systemd: deployment/systemd.md
       - Claude Desktop: deployment/claude-desktop.md
       - OIDC Authentication: deployment/oidc.md
+      - Release Process: deployment/release-process.md
+      - Repository Protection: deployment/repository-protection.md
   - Python API:
       - Vault: api/vault.md
       - Facets: api/facets.md
