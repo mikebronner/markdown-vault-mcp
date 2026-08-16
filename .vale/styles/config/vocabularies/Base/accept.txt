@@ -255,3 +255,18 @@ accessor
 backoff
 globbed
 subcommands
+
+# --- Release-notes backfill vocabulary (#1058) ---
+backfilled
+catchable
+debounce
+docstring
+enqueues
+inotify
+misconfigured
+multicast
+nfpm
+Syncthing
+
+# --- Maintainer-decision corrections to the backfilled notes (#1058) ---
+upstreams
