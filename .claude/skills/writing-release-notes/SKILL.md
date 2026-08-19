@@ -41,7 +41,7 @@ You are given, or must derive first:
   (branch force-pushed) alongside any re-dispatch of the release PR.
 - Mode — **new page** (the minor's page does not exist: write the whole
   page), **patch append** (the page exists but does not yet cover the
-  target patch release, `Z > 0`: add one dated section inside the patch
+  target patch release, `Z > 0`: add one section inside the patch
   sentinels; leave the rest of the page alone unless it is factually
   wrong), or **redraft** (the page already covers the target — an `X.Y.0`
   page drafted at prepare time, or any target whose `RELEASE-SUMMARY`
@@ -58,9 +58,13 @@ You are given, or must derive first:
 The accepted page is the cache; do not re-research a range the page
 already covers. When the page carries the watermark:
 
-- If the watermark SHA equals `RANGE_END`, the page is already current:
-  change nothing and say so in your final report — the calling workflow
-  treats an unchanged existing page as success.
+- If the watermark SHA equals `RANGE_END`, the page's researched content
+  is already current: do no re-research and leave the prose alone, but
+  still apply the date backfill from the page-format section — it derives
+  from tag existence, not from the research range. Say what you did in
+  your final report either way; the calling workflow treats an unchanged
+  existing page as success, and a backfill-only change lands like any
+  other draft.
 - Otherwise research only `WATERMARK..RANGE_END` (the same fan-out and
   evidence rules, over the delta), fold the findings into the existing
   narrative — extend a theme, add one, or leave prose untouched when the
@@ -155,6 +159,13 @@ Corollary: do not infer outside demand from an issue the maintainer filed —
 if an outside PR preceded the maintainer's tracking issue, the honest
 attribution is the PR.
 
+A quote's citation names the artifact where the quoted words verbatim
+appear, written by the person you attribute them to — fetch that artifact
+and check both before writing the citation. A maintainer-filed tracking
+issue often restates a contributor's words; citing it turns the
+contributor's report into the maintainer's, which is exactly the
+misattribution above wearing a link.
+
 ### 5. Synthesis pass, with licence to regroup
 
 After the briefs return, look across them before writing: separate
@@ -208,8 +219,9 @@ or fix — do not file issues yourself from an automated run.
 
 ## Page format
 
-One page per minor: `docs/releases/MINOR.md`. Patch releases append a dated
-section to the same page, so a minor's story stays in one linkable document.
+One page per minor: `docs/releases/MINOR.md`. Patch releases append a
+section to the same page (dated per the tag-existence gate below), so a
+minor's story stays in one linkable document.
 Skeleton for a new page (the comment markers are load-bearing — the publish
 workflow extracts summary blocks by tag, and later patch drafts insert only
 inside the patch sentinels):
@@ -241,11 +253,34 @@ A patch section goes inside the patch sentinels, oldest first, as:
 
     <evidence-linked detail, same rules as above>
 
+The `— 2026-08-20` date suffix follows the same tag-existence gate as the
+shipped-claim rule below: a prepare-time patch draft, whose tag does not
+exist yet, writes the bare `## v3.2.1` heading, and the post-release draft
+appends the real date.
+
 For a **new** page, also add the minor to the list in
 `docs/releases/index.md` (newest first, between its markers; the first real
 entry replaces the seeded placeholder line). Do not edit
 `mkdocs.yml`: the navigation is project-owned. If the nav has no
 Release Notes entry yet, note that in the PR body instead of adding one.
+
+Never claim the target version has shipped before it has. The gate is
+whether the target's stable tag exists at drafting time (read it through
+the API when unsure). At prepare time it does not — an rc target's stable
+may still be weeks out — so a prepare-time draft gives the target's index
+entry and page no "(released <date>)" qualifier and no past-tense shipping
+claim. A post-release backfill or re-draft, whose target tag does exist,
+states the real date — that is the later draft the target earns its date
+from. That later draft need not target the shipped version: every draft,
+whatever its target, also backfills the date onto any index entry or patch
+heading whose tag now exists but which an earlier pre-tag draft left
+undated, using the tag's own timestamp as the source. The backfill covers
+what the draft's checked-out tree carries: on the default branch that is
+every series, so dates lag by at most one default-branch drafting run; a
+draft on a `release/X.Y` branch may have been cut from an old tag that
+lacks newer pages, and the entries missing there wait for the next
+default-branch draft. An operator who wants a date sooner dispatches a
+re-draft or hand-edits the page.
 
 ## Quality gates — run them, do not assume them
 
@@ -260,8 +295,10 @@ Release Notes entry yet, note that in the PR body instead of adding one.
 
 ## Output
 
-Leave the working tree holding only: the release page, `docs/releases/index.md`
-(new-page mode), any `accept.txt` additions, and your proposed PR body in
+Leave the working tree holding only: the target release page, any other
+release page or `docs/releases/index.md` that the date backfill touched
+(the index also in new-page mode), any `accept.txt` additions, and your
+proposed PR body in
 `.release-notes-pr-body.md` at the repository root (the workflow's mechanical
 step commits the docs paths — onto the release PR's prep branch in the
 primary flow, or as a standalone notes PR from the body file in backfill
