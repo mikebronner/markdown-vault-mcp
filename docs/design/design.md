@@ -376,12 +376,61 @@ Replaces the per-path cap from PR #433 (`_apply_chunks_per_doc_cap`),
 which thinned duplicates but did not group them.
 
 `get_similar` accepts the same `folder` / `filters` scoping as semantic
-`search`, applied post-hoc via the shared `_post_filter_semantic_rows`
-helper (the vector store carries no structured metadata). The post-filter
-matches against full frontmatter, so — unlike keyword-mode `search`
-filters — it is not limited to `indexed_frontmatter_fields`; the candidate
-pool is widened (×4, floor 200) when filtering is active so narrow scopes
-do not starve the result list.
+`search`. The frontmatter and OKF dimensions are applied post-hoc via the
+shared `_post_filter_semantic_rows` helper (the vector store carries no
+structured metadata, and each dimension needs a per-path lookup); the
+folder scope is not, and lives solely in the scan-time predicate below. The
+post-filter matches against full frontmatter, so — unlike keyword-mode
+`search` filters — it is not limited to `indexed_frontmatter_fields`; the
+candidate pool is widened (×4, floor 200) when either is active so narrow
+scopes do not starve the result list.
+
+**The folder scope is applied inside the similarity scan, not after it**
+(issue #1108). Widening is a mitigation and not a guarantee: the vector
+pool is capped at `max(limit × (chunks_per_file + 4), 1000)`, so on a
+large vault a folder whose chunks all score below that cap was discarded
+wholesale and the call returned `[]` — indistinguishable from a folder
+with no related content, and surfacing its notes needed a `limit` in the
+thousands. `VectorIndex.search` / `.search_by_path` therefore take an
+optional `predicate` over each candidate's metadata, applied while
+walking the descending-score order and before the cap, so the cap selects
+the top-k *within* the scope. This costs nothing: the similarity pass is
+a full dot product over every stored chunk regardless of `limit`. Folder
+is the dimension that rides along, because matching it is a string
+compare on metadata the vector store already holds; frontmatter and OKF
+dimensions stay post-hoc (per-path lookups are too expensive to run over
+every chunk — see #875) and keep the widening.
+
+`get_similar` still widens ×4 when a folder is given, for a different
+reason than the post-filter one: grouping keeps only `chunks_per_file`
+chunks per path, so a pool filled by one long in-scope document collapses
+the grouped result to a single file however exact the scope is. The
+predicate answers "are these rows in scope"; the widening answers "are
+there enough distinct paths among them".
+
+**The `folder` argument has three states, not two** (issue #1106). `None`
+means no folder restriction; `""` means root-level documents only (the
+root folder is stored as `""` in the `folder` column and reported as `""`
+by `list_folders`); any other value selects that folder and its
+sub-folders, after backslashes are folded to forward slashes and
+surrounding slashes are stripped, so `"X"`, `"X/"` and `"/X/"` are one
+scope. `utils.normalize_folder` is the single helper every folder-scoped
+surface folds its input through — applied once at the manager entry
+points (`SearchManager.search` / `.list` / `.get_recent` / `.get_similar`,
+`LinkManager.get_broken_links`, and `OkfMigrationManager.convert_links` /
+`.generate_index` / `.seed_log`) rather than per channel, so the SQL and
+vector halves cannot drift apart again (issue #1103). The OKF write tools
+are in that set because they do path *arithmetic* on the value rather
+than comparison: `generate_index` slices note paths by `len(folder) + 1`
+and derives its heading with `rsplit("/", 1)[-1]`, so an unnormalized
+`"guides/"` built the prefix `"guides//"`, truncated every listed entry
+by a character, and produced an empty heading. It deliberately
+never collapses `""` to `None` — an explicit empty folder is a
+restriction, not its absence. Before the fix the vector post-filter normalized with
+`... .strip("/") or None`, whose falsy-empty collapse silently lifted the
+restriction on `mode="semantic"`, `mode="hybrid"` and `get_similar` while
+the SQL-backed surfaces honoured it, so the two halves of the tool surface
+disagreed on the same documented contract.
 
 **Non-goal:** No frontmatter-based ranking. The MCP must not require, recommend, or
 special-case any frontmatter convention on vault content (no `kind`, no `noindex`, no
@@ -1722,7 +1771,28 @@ Links are extracted from markdown content during `parse_note()` and stored in th
 
 **Exclusions**: links inside fenced code blocks (`` ``` ``) and inline code (`` ` ``)
 are not extracted. External URLs (`http://`, `https://`, `mailto:`) and pure anchors
-(`#heading`) are skipped.
+are skipped. "Pure anchor" covers every spelling of a same-document reference:
+`[text](#heading)`, a reference definition whose target starts with `#`, and the
+wikilink form `[[#heading]]` (issue #1107). The wikilink form was the exception
+until #1107: its fragment is split off before `.md` is appended, so the empty path
+portion became the literal target `".md"`, which no document can match, and every
+note using Obsidian's same-note heading reference contributed to
+`broken_link_count`. Recording it as a link to the source note itself would have
+avoided the false positive too, but at the cost of a self-edge that suppresses
+orphan detection and inflates backlink counts, so skipping is what keeps all three
+spellings consistent.
+
+**Markdown footnotes are not links.** `[^label]` and `[^label]: body` differ
+from reference-style link syntax by one character, and both reference regexes
+matched them (issue #1104): a footnote definition was collected as a link
+reference definition with its prose body as the target, and two adjacent
+footnote references (`[^a][^b]`) read as one `[text][ref]` pair, taking the
+label of one footnote as link text and the target of another as its target.
+Because the resulting target was a whole markdown link rather than a URL, the
+external-URL skip did not recognise it and the path resolver joined it against
+the source note's directory, collapsing `https://` to `https:/` in the stored
+`target_path`. Both halves of reference extraction now skip labels beginning
+with `^`.
 
 **Path resolution for markdown links**: relative paths are resolved against the
 source document's directory. `../sibling.md` from `Journal/2024/today.md` resolves
@@ -1734,6 +1804,19 @@ vault root clamps to root.
 **Fragment handling**: `path.md#heading` splits into `target_path=path.md` and
 `fragment=heading`. The fragment is preserved on `LinkInfo` but the target path
 is stored without it.
+
+**Link rewrites preserve the spelling they found.** `rename` and `move_folder`
+repoint links through `compute_new_raw_target`, which recognises three shapes
+for markdown and reference links: leading-slash root-relative (`/folder/x.md`),
+root-relative matching `old_path` (`folder/x.md`), and relative to the source
+file's directory (`../x.md`). Each is rewritten in its own shape. The first was
+missing until issue #1105: `old_path` carries no leading slash, so a
+leading-slash link never compared equal to it and fell into the
+relative-to-source branch, silently converting OKF's recommended spelling (and
+what `okf_convert_links` / `okf_generate_index` emit) into a bare relative
+filename on any rename or folder move. Nothing broke — the output was a correct
+relative path — which is what made it a fidelity defect rather than a
+correctness one, and what let it go unnoticed.
 
 **Wikilink resolution (Obsidian semantics)**: Wikilinks follow Obsidian's
 vault-wide resolution rules rather than relative path resolution:

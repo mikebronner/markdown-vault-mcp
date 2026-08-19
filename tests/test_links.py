@@ -230,6 +230,46 @@ class TestExtractReferenceLinks:
         links = extract_links(content, "index.md")
         assert links == []
 
+    def test_footnote_definition_not_a_link(self) -> None:
+        """[^label]: body is a footnote, not a reference definition (#1104).
+
+        ``[^\\]]+`` in the definition regex accepts a leading ``^``, so a
+        footnote definition was collected as a link reference and its
+        prose body stored as a vault target.
+        """
+        content = (
+            "See NIST SP800-57[^nist-1].\n\n"
+            "[^nist-1]: [SP 800-57 Part 1](https://csrc.nist.gov/sp/800-57-part-1)\n"
+        )
+        assert extract_links(content, "notes/crypto.md") == []
+
+    def test_adjacent_footnote_references_are_not_one_link(self) -> None:
+        """[^a][^b] is two footnote references, not [text][ref] (#1104).
+
+        The usage regex paired the first label as link text with the
+        second as the reference, so the reported link carried the label of
+        one footnote and the target of another.
+        """
+        content = (
+            "See NIST SP800-57[^nist-1][^nist-2][^nist-3].\n\n"
+            "[^nist-1]: first source\n"
+            "[^nist-2]: notes/topic.md\n"
+            "[^nist-3]: third source\n"
+        )
+        assert extract_links(content, "notes/crypto.md") == []
+
+    def test_footnotes_do_not_disturb_real_reference_links(self) -> None:
+        """A real [text][ref] link in a note that also uses footnotes survives."""
+        content = (
+            "A footnote[^a] and a [real link][r].\n\n"
+            "[^a]: some prose\n"
+            "[r]: notes/topic.md\n"
+        )
+        links = extract_links(content, "index.md")
+        assert len(links) == 1
+        assert links[0].target_path == "notes/topic.md"
+        assert links[0].link_text == "real link"
+
     def test_reference_relative_path_resolved(self) -> None:
         """Relative path in reference definition is resolved correctly."""
         content = "See [note][ref]\n\n[ref]: ../sibling.md"
@@ -278,6 +318,28 @@ class TestExtractWikilinks:
         assert links[0].fragment == "section"
         # raw_target re-attaches the fragment to the stem (no .md)
         assert links[0].raw_target == "note#section"
+
+    def test_fragment_only_wikilink_skipped(self) -> None:
+        """[[#Heading]] is a same-note anchor, not a vault link (#1107).
+
+        The fragment is split off before ``.md`` is appended, which left an
+        empty path portion and stored the literal target ``".md"`` — a path
+        that cannot exist, so every such link was reported broken.
+        """
+        links = extract_links("Jump to [[#Real Section]] below.", "notes/frag.md")
+        assert links == []
+
+    def test_fragment_only_wikilink_with_alias_skipped(self) -> None:
+        """The alias form [[#Heading|text]] is skipped for the same reason."""
+        links = extract_links("Jump to [[#Real Section|there]].", "notes/frag.md")
+        assert links == []
+
+    def test_wikilink_to_another_note_fragment_still_extracted(self) -> None:
+        """Only the *empty* path portion is skipped; [[note#heading]] is a link."""
+        links = extract_links("See [[other#Section]].", "notes/frag.md")
+        assert len(links) == 1
+        assert links[0].target_path == "other.md"
+        assert links[0].fragment == "Section"
 
     def test_wikilink_path_stored_as_is(self) -> None:
         """Wikilinks with a path component are stored as-is for vault-wide resolution.
@@ -1259,6 +1321,7 @@ def rename_vault(tmp_path: Path) -> Path:
         linker_wiki_frag.md  contains a wikilink with fragment [[target#heading]]
         no_links.md          no links — should not be modified
         subdir/linker_rel.md contains a relative markdown link ../target.md
+        linker_rootrel.md    contains a root-relative markdown link /target.md
     """
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -1285,6 +1348,9 @@ def rename_vault(tmp_path: Path) -> Path:
     )
     (vault / "subdir" / "linker_rel.md").write_text(
         "# Linker Rel\n\nSee [Target](../target.md) for details.\n"
+    )
+    (vault / "linker_rootrel.md").write_text(
+        "# Linker Root Rel\n\nSee [Target](/target.md) for details.\n"
     )
     (vault / "no_links.md").write_text("# No Links\n\nJust prose.\n")
     return vault
@@ -1380,8 +1446,8 @@ class TestRenameUpdateLinks:
         result = col.writer.rename("target.md", "renamed.md", update_links=True)
 
         # linker_md, linker_wiki, linker_ref, linker_frag, linker_alias,
-        # linker_wiki_frag, subdir/linker_rel = 7
-        assert result.updated_links == 7
+        # linker_wiki_frag, subdir/linker_rel, linker_rootrel = 8
+        assert result.updated_links == 8
 
     def test_update_links_failure_does_not_prevent_rename(
         self, rename_vault: Path
@@ -1410,8 +1476,8 @@ class TestRenameUpdateLinks:
         # Rename succeeded even though one source update failed.
         assert (rename_vault / "renamed.md").is_file()
         assert not (rename_vault / "target.md").is_file()
-        # updated_links is less than the total of 7 (one failure)
-        assert result.updated_links < 7
+        # updated_links is less than the total of 8 (one failure)
+        assert result.updated_links < 8
 
     def test_update_links_wikilink_fragment_preserved(self, rename_vault: Path) -> None:
         """Wikilink with fragment [[target#heading]] becomes [[renamed#heading]]."""
@@ -1438,6 +1504,22 @@ class TestRenameUpdateLinks:
         content = (rename_vault / "subdir" / "linker_rel.md").read_text()
         assert "(../renamed.md)" in content
         assert "(../target.md)" not in content
+
+    def test_update_links_root_relative_preserved(self, rename_vault: Path) -> None:
+        """Root-relative links keep their leading slash after rename (#1105).
+
+        A file with [Target](/target.md) should become [Target](/renamed.md),
+        not the source-directory-relative renamed.md — the spelling OKF
+        recommends must survive an unrelated rename.
+        """
+        col = Vault(source_dir=rename_vault, read_only=False)
+        col.index.build_index()
+
+        col.writer.rename("target.md", "renamed.md", update_links=True)
+
+        content = (rename_vault / "linker_rootrel.md").read_text()
+        assert "(/renamed.md)" in content
+        assert "(/target.md)" not in content
 
     def test_update_links_fts_reindexed_after_update(self, rename_vault: Path) -> None:
         """Updated source documents are re-indexed in FTS."""
@@ -1575,6 +1657,28 @@ class TestResolveVaultWikilinks:
         assert outlinks[0].exists is True
 
         # Must not appear in broken links.
+        assert col.graph.get_broken_links() == []
+        assert col.reader.stats().broken_link_count == 0
+
+    def test_same_note_heading_wikilink_is_not_broken(self, tmp_path: Path) -> None:
+        """[[#Heading]] never reaches the broken-link report (#1107).
+
+        End-to-end companion to the extraction test: the link used to
+        resolve to the literal path ``".md"``, so every note using
+        Obsidian's same-note heading reference contributed to
+        ``broken_link_count``.
+        """
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "frag.md").write_text(
+            "# Frag\n\nJump to [[#Real Section]] below.\n\n## Real Section\n\nHere.\n",
+            encoding="utf-8",
+        )
+
+        col = Vault(source_dir=vault)
+        col.index.build_index()
+
+        assert col.graph.get_outlinks("frag.md") == []
         assert col.graph.get_broken_links() == []
         assert col.reader.stats().broken_link_count == 0
 

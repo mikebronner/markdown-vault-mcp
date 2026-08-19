@@ -216,6 +216,37 @@ class TestList:
         assert attachment_items[0].path == "image.png"
         assert attachment_items[0].kind == "attachment"
 
+    def test_nested_attachment_paths_are_posix_spelled(
+        self, search_vault: Path, search_mgr: SearchManager
+    ) -> None:
+        """A nested attachment reports POSIX ``path`` and ``folder``.
+
+        `str(Path)` yields OS separators, so this used to hand back
+        ``notes\\image.png`` on Windows while the index, the exclusion
+        check and a normalized ``folder`` argument all speak POSIX — the
+        folder filter below then matched no attachment at all. The
+        assertions are trivially true on POSIX runners (CI is
+        ubuntu-only), so they pin the contract rather than reproduce the
+        platform bug.
+        """
+        (search_vault / "notes" / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        items = search_mgr.list(include_attachments=True)
+        attachments = [i for i in items if isinstance(i, AttachmentInfo)]
+        assert [a.path for a in attachments] == ["notes/image.png"]
+        assert attachments[0].folder == "notes"
+
+    def test_nested_attachment_survives_the_folder_filter(
+        self, search_vault: Path, search_mgr: SearchManager
+    ) -> None:
+        """The folder filter reaches nested attachments, in every spelling."""
+        (search_vault / "notes" / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+        for spelling in ("notes", "notes/", "/notes", "notes\\"):
+            items = search_mgr.list(folder=spelling, include_attachments=True)
+            attachments = [i for i in items if isinstance(i, AttachmentInfo)]
+            assert [a.path for a in attachments] == ["notes/image.png"], spelling
+
     def test_list_attachments_respects_extension_filter(
         self, search_vault: Path, search_mgr: SearchManager
     ) -> None:
@@ -858,6 +889,279 @@ def test_hybrid_search_caps_per_file_after_rrf(
         assert len(r.sections) <= 1
 
 
+# ---------------------------------------------------------------------------
+# folder-scoped semantic search is limit-independent (#1108)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def buried_folder_vault(tmp_path: Path) -> Path:
+    """Vault where the ``niche/`` notes are outnumbered by bulk content."""
+    for i in range(30):
+        (tmp_path / f"bulk{i}.md").write_text(
+            f"---\ntitle: Bulk {i}\n---\n# Bulk {i}\n\nBulk body {i}.\n",
+            encoding="utf-8",
+        )
+    (tmp_path / "niche").mkdir()
+    for i in range(2):
+        (tmp_path / "niche" / f"n{i}.md").write_text(
+            f"---\ntitle: Niche {i}\n---\n# Niche {i}\n\nNiche body {i}.\n",
+            encoding="utf-8",
+        )
+    return tmp_path
+
+
+@pytest.fixture()
+def buried_folder_mgr(
+    buried_folder_vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> SearchManager:
+    """SearchManager over ``buried_folder_vault`` with a small candidate floor.
+
+    The production floor is 1000 chunks; shrinking it to 3 reproduces the
+    starvation a 27k-chunk vault shows at the default floor without
+    building a 27k-chunk fixture.
+    """
+    from markdown_vault_mcp.vector_index import VectorIndex
+    from tests.conftest import MockEmbeddingProvider
+
+    monkeypatch.setattr(
+        "markdown_vault_mcp.managers.search._SEMANTIC_CANDIDATE_FLOOR", 3
+    )
+    fts = FTSIndex(db_path=":memory:")
+    provider = MockEmbeddingProvider()
+    vectors = VectorIndex(provider)
+    for note in scan_directory(buried_folder_vault):
+        fts.upsert_note(note)
+        texts = [c.content for c in note.chunks]
+        folder = "niche" if note.path.startswith("niche/") else ""
+        if texts:
+            vectors.add(
+                texts,
+                [
+                    {
+                        "path": note.path,
+                        "title": note.title,
+                        "folder": folder,
+                        "heading": c.heading,
+                        "content": c.content,
+                    }
+                    for c in note.chunks
+                ],
+            )
+    fts.resolve_vault_wikilinks()
+    embeddings_path = buried_folder_vault / "embeddings"
+    vectors.save(embeddings_path)
+    mgr = SearchManager(
+        fts=fts,
+        source_dir=buried_folder_vault,
+        embeddings_path=embeddings_path,
+        embedding_provider=provider,
+    )
+    mgr._vectors = vectors
+    return mgr
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_folder_scoped_semantic_search_is_limit_independent(
+    buried_folder_mgr: SearchManager, mode: str
+) -> None:
+    """A folder-scoped search answers from the folder at any limit (#1108).
+
+    The candidate pool used to be capped before the folder post-filter ran,
+    so a folder whose chunks all ranked below the cap came back empty —
+    and the caller could not tell that from a folder with no related
+    content. Raising ``limit`` used to be the only way to surface them.
+    """
+    small = buried_folder_mgr.search("body", mode=mode, folder="niche", limit=1)
+    assert small, f"expected a niche/ hit at limit=1 in mode={mode}"
+    assert all(r.path.startswith("niche/") for r in small)
+
+    large = buried_folder_mgr.search("body", mode=mode, folder="niche", limit=100)
+    assert {r.path for r in large} == {"niche/n0.md", "niche/n1.md"}
+    assert {r.path for r in small} <= {r.path for r in large}
+
+
+def test_folder_scoped_get_similar_keeps_room_for_other_files(
+    search_mgr_with_embeddings: SearchManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long in-folder document must not crowd every other file out (#1108).
+
+    The folder predicate stops out-of-scope rows from consuming the cap, but
+    not one in-scope document's own chunks: grouping keeps ``chunks_per_file``
+    per path, so a pool filled by a single path collapses to a single result.
+    ``get_similar`` has always widened its pool when a folder is given, and
+    the fake store below returns a ranking where dropping that widening loses
+    the second file entirely.
+    """
+    ranking = [
+        {
+            "path": "notes/long.md",
+            "title": "Long",
+            "folder": "notes",
+            "heading": f"H{i}",
+            "content": f"chunk {i}",
+            "score": 1.0 - i / 1000,
+            "start_line": i,
+        }
+        for i in range(120)
+    ]
+    ranking.append(
+        {
+            "path": "notes/other.md",
+            "title": "Other",
+            "folder": "notes",
+            "heading": "Only",
+            "content": "other chunk",
+            "score": 0.1,
+            "start_line": 0,
+        }
+    )
+
+    def fake_search_by_path(_path, *, limit, predicate=None):
+        eligible = [r for r in ranking if predicate is None or predicate(r)]
+        return [dict(r) for r in eligible[:limit]]
+
+    monkeypatch.setattr(
+        search_mgr_with_embeddings._vectors, "search_by_path", fake_search_by_path
+    )
+
+    results = search_mgr_with_embeddings.get_similar(
+        "alpha.md", folder="notes", limit=2, chunks_per_file=1
+    )
+    assert {r.path for r in results} == {"notes/long.md", "notes/other.md"}
+
+
+def test_folder_scoped_get_similar_is_limit_independent(
+    buried_folder_mgr: SearchManager,
+) -> None:
+    """``get_similar`` scopes inside the similarity scan too (#1108)."""
+    results = buried_folder_mgr.get_similar("bulk0.md", folder="niche", limit=1)
+    assert results, "expected a niche/ hit at limit=1"
+    assert all(r.path.startswith("niche/") for r in results)
+
+
+# ---------------------------------------------------------------------------
+# folder="X/" — trailing/leading slashes fold on every surface (#1103)
+# ---------------------------------------------------------------------------
+
+
+NOTES_FOLDER_NOTES = {"notes/gamma.md", "notes/delta.md"}
+
+
+@pytest.mark.parametrize("spelling", ["notes/", "/notes", "/notes/", "notes\\"])
+@pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+def test_folder_spellings_select_the_same_notes(
+    search_mgr_with_embeddings: SearchManager, mode: str, spelling: str
+) -> None:
+    """Every natural spelling of a folder selects the same notes (#1103).
+
+    The SQL-backed channels compared the value as received, so a trailing
+    slash matched no row and the call returned ``[]`` — indistinguishable
+    from an empty folder.
+    """
+    canonical = search_mgr_with_embeddings.search(
+        "gamma", mode=mode, folder="notes", limit=10
+    )
+    assert canonical, f"fixture precondition: no {mode} hits under notes/"
+    results = search_mgr_with_embeddings.search(
+        "gamma", mode=mode, folder=spelling, limit=10
+    )
+    assert {r.path for r in results} == {r.path for r in canonical}
+    assert {r.path for r in results} <= NOTES_FOLDER_NOTES
+
+
+@pytest.mark.parametrize("spelling", ["notes/", "/notes", "notes\\"])
+def test_list_documents_folds_folder_spellings(
+    search_mgr_with_embeddings: SearchManager, spelling: str
+) -> None:
+    """``list_documents`` folds the same spellings (#1103)."""
+    listed = search_mgr_with_embeddings.list(folder=spelling)
+    assert {n.path for n in listed} == NOTES_FOLDER_NOTES
+
+
+@pytest.mark.parametrize("spelling", ["notes/", "/notes", "notes\\"])
+def test_get_recent_folds_folder_spellings(
+    search_mgr_with_embeddings: SearchManager, spelling: str
+) -> None:
+    """``get_recent`` folds the same spellings (#1103)."""
+    recent = search_mgr_with_embeddings.get_recent(folder=spelling)
+    assert {n.path for n in recent} == NOTES_FOLDER_NOTES
+
+
+@pytest.mark.parametrize("spelling", ["notes/", "/notes", "notes\\"])
+def test_get_similar_folds_folder_spellings(
+    search_mgr_with_embeddings: SearchManager, spelling: str
+) -> None:
+    """``get_similar`` folds the same spellings (#1103)."""
+    results = search_mgr_with_embeddings.get_similar(
+        "alpha.md", folder=spelling, limit=10
+    )
+    assert results, f"expected results for folder={spelling!r}"
+    assert {r.path for r in results} <= NOTES_FOLDER_NOTES
+
+
+@pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+def test_root_slash_folder_is_the_root_selector(
+    search_mgr_with_embeddings: SearchManager, mode: str
+) -> None:
+    """``folder="/"`` folds to the root selector rather than matching nothing."""
+    results = search_mgr_with_embeddings.search(
+        "world", mode=mode, folder="/", limit=10
+    )
+    assert results, f"expected root-level results in mode={mode}"
+    assert {r.path for r in results} <= ROOT_NOTES
+
+
+# ---------------------------------------------------------------------------
+# folder="" — root-level only, on every channel (#1106)
+# ---------------------------------------------------------------------------
+
+
+ROOT_NOTES = {"alpha.md", "beta.md"}
+
+
+@pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+def test_empty_folder_restricts_search_to_root_level(
+    search_mgr_with_embeddings: SearchManager, mode: str
+) -> None:
+    """``folder=""`` selects root-level notes only, in every mode (#1106).
+
+    The vector channel used to collapse ``""`` to "no restriction", so
+    semantic and hybrid answered from the whole vault while keyword and
+    ``list_documents`` honoured the documented root-only contract.
+    """
+    results = search_mgr_with_embeddings.search("world", mode=mode, folder="", limit=10)
+    assert results, f"expected root-level results in mode={mode}"
+    assert {r.path for r in results} <= ROOT_NOTES
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+def test_empty_folder_is_not_the_same_as_no_folder(
+    search_mgr_with_embeddings: SearchManager, mode: str
+) -> None:
+    """An unrestricted search reaches sub-folders that ``folder=""`` excludes."""
+    unrestricted = search_mgr_with_embeddings.search(
+        "world", mode=mode, folder=None, limit=10
+    )
+    assert any(r.path.startswith("notes/") for r in unrestricted)
+
+
+def test_empty_folder_restricts_get_similar_to_root_level(
+    search_mgr_with_embeddings: SearchManager,
+) -> None:
+    """``get_similar`` shares the root-only contract (#1106)."""
+    results = search_mgr_with_embeddings.get_similar("alpha.md", folder="", limit=10)
+    assert {r.path for r in results} <= ROOT_NOTES
+
+
+def test_empty_folder_restricts_list_to_root_level(
+    search_mgr_with_embeddings: SearchManager,
+) -> None:
+    """``list_documents`` already honoured the contract; keep it that way."""
+    listed = search_mgr_with_embeddings.list(folder="")
+    assert {n.path for n in listed} == ROOT_NOTES
+
+
 def test_hybrid_folder_filter_normalizes_trailing_slash(
     search_mgr_with_embeddings: SearchManager,
 ) -> None:
@@ -977,7 +1281,7 @@ def test_hybrid_search_search_type_is_group_union_not_head(
         },
     ]
 
-    def fake_vec_search(_query, *, limit):  # noqa: ARG001
+    def fake_vec_search(_query, *, limit, predicate=None):  # noqa: ARG001
         return list(fake_vec_rows)
 
     monkeypatch.setattr(vectors, "search", fake_vec_search)

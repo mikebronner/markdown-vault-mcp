@@ -39,6 +39,52 @@ def is_path_excluded(path: str, exclude_patterns: Sequence[str] | None) -> bool:
     return any(fnmatch.fnmatch(path, pat) for pat in exclude_patterns)
 
 
+def normalize_folder(folder: str | None) -> str | None:
+    """Fold a caller-supplied folder value to its canonical vault spelling.
+
+    Folder values arrive from tool callers in whatever shape a human types:
+    ``"X/"``, ``"/X"``, ``"X\\Y"``.  The stored ``folder`` column holds a
+    slash-separated path with no surrounding slashes (``""`` for the vault
+    root), so every folder-scoped surface folds its input through here
+    before comparing.
+
+    Three states stay distinct, and only the third is folded:
+
+    - ``None`` -- no folder restriction at all.
+    - ``""`` (and ``"/"``) -- root-level documents only.  Never collapsed to
+      ``None``: an explicit empty folder is a restriction, not its absence.
+    - anything else -- backslashes folded to slashes, surrounding slashes
+      stripped, so ``"X/"`` and ``"/X"`` both select the same notes as
+      ``"X"``.
+
+    Args:
+        folder: Folder value as received from the caller.
+
+    Returns:
+        ``None`` when *folder* is ``None``, else the canonical folder
+        string.
+    """
+    if folder is None:
+        return None
+    return folder.replace("\\", "/").strip("/")
+
+
+def folder_matches(row_folder: str, folder: str) -> bool:
+    """Whether a stored folder value falls inside a normalized folder scope.
+
+    Args:
+        row_folder: The ``folder`` value stored for a row (``""`` for the
+            vault root).
+        folder: A scope already folded through :func:`normalize_folder`.
+
+    Returns:
+        ``True`` when the row is the scope itself or one of its
+        sub-folders.  With *folder* ``""`` only root-level rows match,
+        since no stored folder starts with ``"/"``.
+    """
+    return row_folder == folder or row_folder.startswith(folder + "/")
+
+
 def effective_attachment_extensions(
     attachment_extensions: Sequence[str] | None,
 ) -> frozenset[str]:
