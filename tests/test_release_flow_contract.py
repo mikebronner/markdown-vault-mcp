@@ -511,6 +511,105 @@ def test_notes_workflow_is_callable_and_not_release_triggered() -> None:
         "events; this workflow runs on workflow_dispatch/workflow_call, "
         "where passing it is a hard error before the agent starts"
     )
+    assert "Edit(docs/releases/" in text, (
+        "the drafting agent needs the file tools explicitly (in headless "
+        "mode --allowedTools IS the allowlist), scoped to the notes "
+        "surface via Edit(path) — the only path-scoped file gate Claude "
+        "Code consults, covering the Write tool as well"
+    )
+    allowlist = next(line for line in text.splitlines() if '--allowedTools "' in line)
+    assert "Write(" not in allowlist, (
+        "Write(path) rules are accepted but never matched — a dead rule "
+        "in the allowlist would suggest scoping that does not exist"
+    )
+    assert ",Write," not in text and ",Edit," not in text, (
+        "no unscoped Write/Edit may appear in the allowlist — an unscoped "
+        "write tool lets a prompt-injected research source plant git "
+        "config or hooks that the credentialed landing step executes"
+    )
+    assert "Seed and snapshot the notes surface" in text and "pre-notes" in text, (
+        "the trusted pre-agent step must seed the files a draft may "
+        "create (so Edit suffices) and snapshot the pre-draft surface"
+    )
+    assert "cmp -s" in text, (
+        "the landing overlay must compare against the pre-draft snapshot "
+        "and copy only files the draft changed — never revert concurrent "
+        "notes changes with an hour-old checkout"
+    )
+    assert "git merge-file" in text, (
+        "a file both the draft and the base changed must be three-way "
+        "merged, failing loudly on overlap — a silent clobber reverts "
+        "the concurrent change"
+    )
+    assert "deleted on the base" in text, (
+        "an edit-versus-delete divergence must fail loudly — copying "
+        "would silently resurrect the file the base deleted"
+    )
+    assert "seeded.txt" in text, (
+        "the seed step must record which files it created, and the "
+        "divergence check must exempt them — a seeded placeholder absent "
+        "from the landing clone is the first release of its series, not "
+        "a concurrent deletion"
+    )
+    assert "\n  land:\n    needs: draft" in text, (
+        "the landing must run in a SEPARATE job on a fresh runner — the "
+        "drafting runner may be poisoned beyond the tree (GITHUB_PATH, "
+        "GITHUB_ENV, overwritten executables) and the PAT must never "
+        "exist on it"
+    )
+    draft_half = text[: text.index("\n  land:")]
+    assert "RELEASE_TOKEN" not in draft_half, (
+        "no step of the draft job may carry the release PAT — it exists "
+        "only in the landing job"
+    )
+    assert "notes-surface" in text and "notes-pre" in text, (
+        "the surface and the pre-draft snapshot must cross jobs as "
+        "artifacts — data, not environment"
+    )
+    assert text.count("concurrency:") == 1 and "\nconcurrency:\n" in text, (
+        "concurrency must be workflow-level, covering draft and landing "
+        "end to end — with per-job groups a queued newer draft can "
+        "replace the pending landing, stranding a finished draft"
+    )
+    assert "persist-credentials: false" in text, (
+        "the checkout must not persist the release PAT — the agent's "
+        "unrestricted Read would let a prompt-injected research source "
+        "lift it out of .git/config into published content"
+    )
+    assert "-c credential.helper= " in text.replace("\\\n", " ") and (
+        "credential.helper=!gh auth git-credential" in text
+    ), (
+        "network git must reset inherited credential helpers and name "
+        "gh's per invocation — a helper planted in the checkout must "
+        "never run with the PAT in scope"
+    )
+    assert "Bash(git" not in text, (
+        "the drafting agent gets no local git — read-oriented git "
+        "commands still carry arbitrary-file-write flags (git log "
+        "--output=...) that bypass the write-tool scoping; the skill "
+        "reads tags and files-at-refs through the API instead"
+    )
+    assert 'clone --quiet --single-branch --branch "${PREP_BRANCH:-$DEFAULT}"' in (
+        text
+    ), (
+        "the landing step must run git only in a fresh clone — the "
+        "agent's checkout is data, not git state, and planted config "
+        "(core.fsmonitor, helpers, hooks) would execute on the first "
+        "git command there"
+    )
+    assert "gh auth setup-git" not in text, (
+        "no global credential-helper setup — auth is per-invocation only"
+    )
+    assert "Bash(uv run mkdocs build --strict)" in text, (
+        "mkdocs must be pinned to the exact quality-gate invocation — a "
+        "wildcard admits -f with an agent-written config whose hooks "
+        "execute arbitrary Python"
+    )
+    assert "mkdocs *" not in text, "no mkdocs wildcard may reappear in the allowlist"
+    assert "GIT_CONFIG_GLOBAL: /dev/null" in text, (
+        "the credentialed landing step must read no global git config — "
+        "a gadget reaching $HOME must not hand git code to execute there"
+    )
     call_half = text[text.index('if [ -n "$PREP_BRANCH" ]') :]
     call_half = call_half[: call_half.index("# Dispatch mode")]
     assert "::error::" in call_half and "skip_notes" in call_half, (
