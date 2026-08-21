@@ -1,0 +1,36 @@
+# Domain-owned workflow — NOT rendered by the copier template, so it survives
+# `copier update` untouched (#942). It enforces the domain-only half of the SPA
+# pipeline (`spa/* -> scripts/build_spa.py -> app.src.html`): a stale
+# `app.src.html` (unbuilt `spa/` edits) passes the template's
+# `vendor_spa --check` in ci.yml when `app.html` matches the stale source, so
+# this check must live somewhere — and a template-owned ci.yml cannot carry a
+# domain step without re-forking on every template change.
+#
+# The job name is load-bearing: `extra_required_checks` in .copier-answers.yml
+# names "SPA source up-to-date" as a merge-blocking check context in the
+# rendered rulesets (template #454), so renaming the job here without updating
+# that answer leaves protected branches waiting forever on a check that never
+# reports. No paths: filter for the same reason — a required check must report
+# on every pull request.
+name: SPA Source Check
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+  workflow_dispatch:
+
+jobs:
+  build-spa-check:
+    name: SPA source up-to-date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up project environment
+        uses: ./.github/actions/setup-project-env
+
+      - name: Verify assembled SPA source is up-to-date
+        run: uv run python scripts/build_spa.py --check
