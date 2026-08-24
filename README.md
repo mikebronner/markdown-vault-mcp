@@ -1,5 +1,7 @@
 <!-- DOMAIN-START -->
-<!-- Add an optional project logo or project-specific header here. Kept across copier update. -->
+<p align="center">
+  <img src="assets/icon.svg" alt="Markdown Vault MCP logo" width="128" height="128">
+</p>
 <!-- DOMAIN-END -->
 
 # Markdown Vault MCP
