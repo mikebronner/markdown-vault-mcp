@@ -28,6 +28,7 @@ def make_note(
     chunks: list[Chunk] | None = None,
     content_hash: str = "abc123",
     modified_at: float = 1000.0,
+    content_chars: int = 0,
 ) -> ParsedNote:
     """Create a ParsedNote for testing.
 
@@ -38,6 +39,7 @@ def make_note(
         chunks: List of chunks. Defaults to a single generic chunk.
         content_hash: Hash string stored in the note.
         modified_at: Modification timestamp.
+        content_chars: Body character count stored on the document row.
 
     Returns:
         A fully-populated :class:`ParsedNote` suitable for indexing.
@@ -53,6 +55,7 @@ def make_note(
         chunks=chunks,
         content_hash=content_hash,
         modified_at=modified_at,
+        content_chars=content_chars,
     )
 
 
@@ -1569,3 +1572,138 @@ class TestPersistedRankConfig:
         default_idx.close()
 
         assert reset_scores == default_scores
+
+
+def _index_without_content_chars(tmp_path: Path) -> Path:
+    """Build an index file, then drop the column to emulate an older database."""
+    db = tmp_path / "index.db"
+    index = FTSIndex(str(db))
+    index.build_from_notes([make_note(path="a.md", content_chars=7)])
+    index.close()
+    conn = sqlite3.connect(db)
+    conn.execute("ALTER TABLE documents DROP COLUMN content_chars")
+    conn.commit()
+    conn.close()
+    return db
+
+
+def _alter_raises(message: str):
+    """A sqlite3.connect replacement whose content_chars ALTER always fails.
+
+    sqlite3.Connection is immutable, so the failure is injected through a
+    Connection subclass supplied as the connection factory rather than by
+    patching the method.
+    """
+    real_connect = sqlite3.connect
+
+    class _FailingConnection(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if "ADD COLUMN content_chars" in sql:
+                raise sqlite3.OperationalError(message)
+            return super().execute(sql, *args, **kwargs)
+
+    def _connect(*args, **kwargs):  # type: ignore[no-untyped-def]
+        kwargs["factory"] = _FailingConnection
+        return real_connect(*args, **kwargs)
+
+    return _connect
+
+
+class TestContentChars:
+    """The note-size signal on the enumeration surfaces (#1039)."""
+
+    def test_list_notes_carries_content_chars(self) -> None:
+        index = FTSIndex(":memory:")
+        index.build_from_notes([make_note(path="a.md", content_chars=1234)])
+
+        rows = index.list_notes()
+
+        assert rows[0]["content_chars"] == 1234
+
+    def test_subtree_toc_carries_content_chars(self) -> None:
+        index = FTSIndex(":memory:")
+        index.build_from_notes(
+            [make_note(path="Projects/a.md", title="A", content_chars=99)]
+        )
+
+        notes, _ = index.get_subtree_toc("Projects")
+
+        assert notes[0].content_chars == 99
+
+    def test_distinguishes_notes_sharing_a_chunk_count(self) -> None:
+        """The signal must separate notes chunk_count cannot.
+
+        A stub and a nearly-cap-sized note are both one chunk, which is the
+        under-fill / overflow case #1039 reports; only a character count
+        tells a batch planner they differ.
+        """
+        index = FTSIndex(":memory:")
+        one_chunk = [Chunk(heading="H", heading_level=1, content="x", start_line=0)]
+        index.build_from_notes(
+            [
+                make_note(path="stub.md", chunks=one_chunk, content_chars=40),
+                make_note(path="long.md", chunks=one_chunk, content_chars=1400),
+            ]
+        )
+
+        sizes = {r["path"]: r["content_chars"] for r in index.list_notes()}
+
+        assert index.get_chunk_count("stub.md") == index.get_chunk_count("long.md")
+        assert sizes == {"stub.md": 40, "long.md": 1400}
+
+    def test_defaults_to_zero_for_a_row_indexed_without_it(self) -> None:
+        """A pre-existing row reads 0 rather than raising."""
+        index = FTSIndex(":memory:")
+        index.build_from_notes([make_note(path="a.md")])
+
+        assert index.list_notes()[0]["content_chars"] == 0
+
+    def test_migrates_an_index_built_before_the_column(self, tmp_path: Path) -> None:
+        """The in-place ALTER TABLE path, mirroring the chunk_count precedent."""
+        db = tmp_path / "index.db"
+        index = FTSIndex(str(db))
+        index.build_from_notes([make_note(path="a.md", content_chars=7)])
+        index.close()
+
+        conn = sqlite3.connect(db)
+        conn.execute("ALTER TABLE documents DROP COLUMN content_chars")
+        conn.commit()
+        conn.close()
+
+        reopened = FTSIndex(str(db))
+        cols = {
+            r[1]
+            for r in reopened._conn().execute("PRAGMA table_info(documents)").fetchall()
+        }
+
+        assert "content_chars" in cols
+        assert reopened.list_notes()[0]["content_chars"] == 0
+
+    def test_tolerates_a_concurrent_migration(self, tmp_path: Path) -> None:
+        """Another process adding the column first is not an error."""
+        db = _index_without_content_chars(tmp_path)
+
+        with patch(
+            "markdown_vault_mcp._fts_connection.sqlite3.connect",
+            _alter_raises("duplicate column name: content_chars"),
+        ):
+            index = FTSIndex(str(db))
+
+        # The duplicate-column error is swallowed, so construction completes.
+        # (The column is absent here only because the fake never really added
+        # it; a genuine racing process would have.)
+        assert index is not None
+        index.close()
+
+    def test_reraises_an_unrelated_migration_failure(self, tmp_path: Path) -> None:
+        """Only the duplicate-column race is swallowed."""
+        db = _index_without_content_chars(tmp_path)
+
+        with (
+            patch(
+                "markdown_vault_mcp._fts_connection.sqlite3.connect",
+                _alter_raises("disk I/O error"),
+            ),
+            pytest.raises(sqlite3.OperationalError, match="disk I/O error"),
+        ):
+            FTSIndex(str(db))
