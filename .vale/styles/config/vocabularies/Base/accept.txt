@@ -140,6 +140,7 @@ gosu
 hardcoded
 homelab
 idempotency
+if_match
 ifcraftcorpus
 int
 invalid_client
@@ -242,6 +243,8 @@ venv
 Vespa
 virtualenv
 vLLM
+Voyage
+voyage
 walkthrough
 walkthroughs
 whatever

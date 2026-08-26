@@ -58,6 +58,7 @@ about the disagreement.
 |----------|------|---------|----------|-------------|
 | `MARKDOWN_VAULT_MCP_SOURCE_DIR` | path | (none) | **Yes** | Path to the markdown vault directory. Symbolic links inside the vault are followed on Python 3.13+ (3.11/3.12 do not follow symlinks); cyclic links hang the scan, so symlink-farm layouts must be acyclic |
 | `MARKDOWN_VAULT_MCP_READ_ONLY` | bool | `false` | No | Set to `true` to hide the write tools and serve a search-only vault. See the upgrade note below |
+| `MARKDOWN_VAULT_MCP_WRITE_PROTECT_EXISTING` | bool | `false` | No | Set to `true` to refuse a `write` that would overwrite an existing file when no `if_match` etag is supplied. A deliberate replacement (read the file first, pass its etag as `if_match`) still succeeds, and `edit`, `append`, `delete`, and `rename` are unaffected. Uploads through a `create_upload_link` capability URL are subject to the same guard. Planned to default to `true` in 5.0. See [Write protection](#write-protection) |
 | `MARKDOWN_VAULT_MCP_INDEX_PATH` | path | in-memory | No | Path to the SQLite FTS5 index file; set for persistence across restarts |
 | `MARKDOWN_VAULT_MCP_EMBEDDINGS_PATH` | path | disabled | No | Path to the numpy embeddings file; required to enable semantic search |
 | `MARKDOWN_VAULT_MCP_STATE_PATH` | path | `{SOURCE_DIR}/.markdown_vault_mcp/state.json` | No | Path to the change-tracking state file |
@@ -108,6 +109,43 @@ The file watcher never watches the directories that hold `INDEX_PATH`,
 while indexing do not trigger it again. If you place one of these paths inside a
 content directory, that whole top-level directory stops being watched, so keep
 them at the vault root or outside the vault to keep sibling content watched live.
+
+## Write protection
+
+`write` replaces the whole file, frontmatter included. On a writable vault, an
+LLM client that reaches for `write` where `edit` was meant drops everything the
+note held. `MARKDOWN_VAULT_MCP_WRITE_PROTECT_EXISTING=true` turns that case
+into an error instead:
+
+- A `write` to a path that does not exist yet: unchanged.
+- A `write` to an existing path **without** `if_match`: rejected with
+  `DocumentExistsError`, and the file on disk stays untouched.
+- A `write` to an existing path **with** a matching `if_match` etag: allowed.
+  The caller has read the file, so the replacement is deliberate rather than
+  blind.
+
+`edit`, `append`, `delete`, and `rename` never clobber unread content and are
+left alone. Uploads through a `create_upload_link` capability URL land through
+the same attachment-write path, so they are guarded too: mint the link for a
+fresh path, or remove the old attachment first.
+
+The server's own upkeep of the generated OKF files (the `log.md` bullet after
+an enforced write, and `index.md` regeneration) is exempt: those flows read the
+file and rewrite it in the same breath, which is what the guard exists to
+distinguish from a blind replacement.
+
+The default is `false`, which keeps the historical overwrite behavior.
+
+!!! warning "This guard defaults to `true` from 5.0"
+
+    A default-off guard only protects operators who already know the failure
+    exists, which is the population least likely to hit it. From 5.0 the
+    default flips, so `write` over an existing note refuses unless `if_match`
+    proves the caller read it first
+    ([#1136](https://github.com/pvliesdonk/markdown-vault-mcp/issues/1136)).
+    Set `MARKDOWN_VAULT_MCP_WRITE_PROTECT_EXISTING=false` explicitly to keep
+    blind overwrites after that upgrade, or set it to `true` now to adopt the
+    5.0 behavior early.
 
 ## Index Build Timeout
 
@@ -171,7 +209,7 @@ The first three knobs adjust *ranking and rendering* and take effect immediately
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER` | string | auto-detect | Embedding provider: `openai`, `ollama`, or `fastembed`. **Breaking change** from `EMBEDDING_PROVIDER` in older versions |
+| `MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER` | string | auto-detect | Embedding provider: `openai`, `voyage`, `ollama`, or `fastembed`. `voyage` must be selected explicitly (it is not auto-detected). **Breaking change** from `EMBEDDING_PROVIDER` in older versions |
 | `MARKDOWN_VAULT_MCP_EMBED_CONTEXT` | bool | `false` | Enrich each chunk's embedding input with the note title, the chunk heading, and (on the first chunk) the `SEARCHABLE_FIELDS` values, improving semantic recall for short or context-poor chunks. The raw note content on disk and in search snippets is unchanged. The active format is recorded in the vector sidecar, so flipping this (or changing `SEARCHABLE_FIELDS`) re-embeds the whole vault once on next startup |
 | `MARKDOWN_VAULT_MCP_EMBED_TIMEOUT_S` | float | `30.0` | Per-request wall-clock budget in seconds for a single embedding HTTP call (OpenAI/Ollama). The local FastEmbed backend runs in-process with no network call and ignores this. CPU-only or large-model workloads may need 60-120 s; raise this if batches time out. |
 | `MARKDOWN_VAULT_MCP_EMBEDDING_BATCH_SIZE` | int | `4` | Number of chunks sent per embedding request. Smaller batches shorten each request (useful under a tight timeout on slow models) at the cost of more round-trips. |
@@ -179,6 +217,8 @@ The first three knobs adjust *ranking and rendering* and take effect immediately
 | `OPENAI_API_KEY` | string | (none) | OpenAI API key for the OpenAI embedding provider. **Not** `MARKDOWN_VAULT_MCP_`-prefixed |
 | `MARKDOWN_VAULT_MCP_OPENAI_BASE_URL` / `OPENAI_BASE_URL` | url | `https://api.openai.com/v1` | OpenAI-compatible API base URL for embeddings |
 | `MARKDOWN_VAULT_MCP_OPENAI_EMBEDDING_MODEL` / `OPENAI_EMBEDDING_MODEL` | string | `text-embedding-3-small` | OpenAI-compatible embedding model name |
+| `VOYAGE_API_KEY` | string | (none) | Voyage AI API key for the `voyage` embedding provider. **Not** `MARKDOWN_VAULT_MCP_`-prefixed |
+| `MARKDOWN_VAULT_MCP_VOYAGE_MODEL` | string | `voyage-4` | Voyage AI embedding model name. `voyage-4-large` for quality, `voyage-4-lite` for cost |
 | `MARKDOWN_VAULT_MCP_OLLAMA_MODEL` | string | `nomic-embed-text` | Ollama embedding model name |
 | `MARKDOWN_VAULT_MCP_OLLAMA_CPU_ONLY` | bool | `false` | Force Ollama to use CPU only |
 | `MARKDOWN_VAULT_MCP_FASTEMBED_MODEL` | string | `BAAI/bge-small-en-v1.5` | FastEmbed model name |
@@ -191,7 +231,9 @@ The first three knobs adjust *ranking and rendering* and take effect immediately
     2. **Ollama**, if `OLLAMA_HOST` is reachable
     3. **FastEmbed**, if the `fastembed` package is installed
 
-    Both API providers speak the OpenAI-compatible embeddings protocol through the official `openai` SDK: the `ollama` provider is a preset that targets `{OLLAMA_HOST}/v1` with no key required. The `OLLAMA_*` settings and their behavior are unchanged; `OLLAMA_CPU_ONLY` uses Ollama's native API, which is the only way to request CPU-only inference.
+    All three API providers speak the OpenAI-compatible embeddings protocol through the official `openai` SDK: the `ollama` provider is a preset that targets `{OLLAMA_HOST}/v1` with no key required, and `voyage` is a preset that targets `https://api.voyageai.com/v1`. The `OLLAMA_*` settings and their behavior are unchanged; `OLLAMA_CPU_ONLY` uses Ollama's native API, which is the only way to request CPU-only inference.
+
+    `voyage` is not in the auto-detect chain: a `VOYAGE_API_KEY` exported for another tool must not silently take over an existing index, so set `MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER=voyage` to use it.
 
     **Explicit vs. auto-detect failure handling:** when you set `MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER` to a specific backend and it cannot be constructed at startup — a missing dependency, missing/empty credentials, or an unrecognised value — the server **fails fast** with a `ConfigurationError` rather than silently falling back to keyword-only search. (An unreachable Ollama/OpenAI *service* does not prevent startup — the provider still loads; the failure surfaces later as an embedding error during index build.) When the variable is *unset* (auto-detect) and no backend is available, the server logs a warning and continues with semantic search disabled. Set the variable explicitly if you want a missing provider to be a hard startup error.
 

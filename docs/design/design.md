@@ -62,7 +62,7 @@ markdown-vault-mcp (new package)
 +-- scanner.py        -- file discovery, frontmatter parsing, chunking
 +-- fts_index.py      -- SQLite FTS5 schema, BM25 search
 +-- vector_index.py   -- numpy embeddings, cosine similarity
-+-- providers.py      -- Ollama / OpenAI / SentenceTransformers
++-- providers.py      -- Ollama / OpenAI / Voyage / SentenceTransformers
 +-- tracker.py        -- hash-based change detection
 +-- vault.py          -- thin composition root: lifecycle, wiring, facet accessors (index-write → indexing/coordinator.py)
 +-- write_callback.py -- WriteCallbackDispatcher: deferred git-commit callback worker (#599)
@@ -2106,6 +2106,24 @@ intermediate directories as needed (`mkdir -p` semantics). If `frontmatter` is
 provided, it is serialized as YAML front matter at the top of the file. Updates
 the FTS index and triggers `on_write`.
 
+**`write_protect_existing=True`**: `write()` and `write_attachment()` raise
+`DocumentExistsError` when the target file exists and no `if_match` etag was
+supplied. An `if_match` write proves the caller read the file first, so it
+stays allowed and keeps its regular concurrency semantics; `edit()`,
+`append()`, `delete()`, and `rename()` are untouched. The guard runs before the
+`if_match` check, so a stale etag on an existing file still reports
+`ConcurrentModificationError` rather than the protection error. Default
+`False`, which preserves unconditional overwrite; the operator default flips
+to `true` in 5.0 (#1136), which is an operator-surface breaking change and so
+waits for the major.
+
+The server's own read-modify-write maintenance of generated OKF files
+(`_okf_convention`'s `log.md` bullet, `OkfMigrationManager`'s `index.md`
+regeneration and link conversion) passes `write(..., allow_overwrite=True)`.
+The flag governs what a client can do to content it has not read; it is not a
+lock on the files themselves, and `allow_overwrite` is not reachable from the
+`write` tool.
+
 **`edit()` behavior**: supports three modes: (1) exact match: reads file,
 verifies `old_text` exists exactly once, replaces with `new_text`; (2) line-range:
 replaces lines `line_start..line_end` (1-based, inclusive) with `new_text`;
@@ -2343,7 +2361,7 @@ Copied from ifcraftcorpus, adapted:
 - Keep the same provider ABC and implementations (Ollama, OpenAI,
   SentenceTransformers)
 
-**Unified wire protocol (#916)**: both API providers embed through one
+**Unified wire protocol (#916)**: all API providers embed through one
 shared OpenAI-compatible transport built on the official ``openai`` SDK
 (``_OpenAICompatEmbeddings``). ``OpenAIProvider`` passes its configured
 base URL and key straight through; ``OllamaProvider`` is a preset over the
@@ -2357,6 +2375,23 @@ equivalent and stay on the native REST API: CPU-only inference
 the ``/api/show`` context-length probe, and the ``/api/tags`` reachability
 probe in ``get_embedding_provider``. ``fastembed`` (in-process, non-API)
 is unaffected.
+
+**Voyage preset**: ``VoyageProvider`` is a third preset over the same
+transport, with ``base_url`` pinned to ``https://api.voyageai.com/v1`` and
+its own ``VOYAGE_API_KEY`` / ``MARKDOWN_VAULT_MCP_VOYAGE_MODEL`` surface
+(default ``voyage-4``, the balanced member of the family; the voyage-4 and
+voyage-3.5 families accept 32k tokens, ``voyage-law-2`` 16k). Voyage rejects
+OpenAI fields it does not implement — ``dimensions`` and ``user`` return HTTP
+400 and ``encoding_format="float"`` is refused in favour of ``base64`` — so
+the transport's "send only ``model`` and ``input``, let the SDK pick the
+encoding" shape is a compatibility requirement, not an accident.
+``EMBEDDING_PROVIDER=openai`` with ``OPENAI_BASE_URL`` pointed at Voyage
+remains wire-identical and supported; the provider name exists so the
+endpoint, key variable and model default are discoverable and so the vector
+sidecar records ``voyage`` as its provider identity. Unlike the other three,
+``voyage`` is **not** in the auto-detect chain: a ``VOYAGE_API_KEY`` exported
+for an unrelated tool must not silently take over an index and force a
+re-embed.
 
 ### `tracker.py`: Change Detection
 
@@ -2771,6 +2806,7 @@ For MCP server deployment:
 | `MARKDOWN_VAULT_MCP_DISABLE_APPS_UI` | Hide MCP-Apps UI tools (`browse_vault`, `show_context`) from the listing | `false` |
 | `MARKDOWN_VAULT_MCP_SOURCE_DIR` | Path to markdown files | required |
 | `MARKDOWN_VAULT_MCP_READ_ONLY` | Hide the write tools | `false` |
+| `MARKDOWN_VAULT_MCP_WRITE_PROTECT_EXISTING` | Refuse a `write` over an existing file when no `if_match` is supplied (defaults to `true` from 5.0) | `false` |
 | `MARKDOWN_VAULT_MCP_INDEX_PATH` | SQLite index path | in-memory |
 | `MARKDOWN_VAULT_MCP_EMBEDDINGS_PATH` | Embeddings directory | disabled |
 | `MARKDOWN_VAULT_MCP_INDEXED_FIELDS` | Comma-separated frontmatter fields to index into `document_tags` | none |
@@ -2805,7 +2841,7 @@ For MCP server deployment:
 | `MARKDOWN_VAULT_MCP_MAX_ATTACHMENT_SIZE_MB` | Maximum attachment size in MB, enforced by the `read` / `write` / `fetch` MCP tools (not the vault library); `0` disables the limit | `1.0` |
 | `MARKDOWN_VAULT_MCP_MAX_NOTE_READ_BYTES` | Maximum bytes returned by full-document `read()` for `.md` files; raises `ValueError` if exceeded. `read(path, section=...)` for partial reads bypasses the cap. `0` disables the limit | `262144` (256 KB) |
 | `MARKDOWN_VAULT_MCP_APP_DOMAIN` | Claude app domain for MCP Apps iframe sandboxing; auto-computed from `BASE_URL` via `_compute_claude_app_domain()` | derived from `BASE_URL` |
-| `MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER` | `openai`, `ollama`, `fastembed` | auto-detect |
+| `MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER` | `openai`, `voyage`, `ollama`, `fastembed` (only the first, third and fourth are auto-detected) | auto-detect |
 | `OLLAMA_HOST` | Ollama server URL | `http://localhost:11434` |
 | `MARKDOWN_VAULT_MCP_OLLAMA_MODEL` | Ollama embedding model | `nomic-embed-text` |
 | `MARKDOWN_VAULT_MCP_OLLAMA_CPU_ONLY` | Force CPU-only inference | `false` |
@@ -2814,6 +2850,8 @@ For MCP server deployment:
 | `OPENAI_API_KEY` | OpenAI API key | none |
 | `OPENAI_BASE_URL` / `MARKDOWN_VAULT_MCP_OPENAI_BASE_URL` | OpenAI-compatible API base URL (SiliconFlow, Together, internal gateways, …) | `https://api.openai.com/v1` |
 | `OPENAI_EMBEDDING_MODEL` / `MARKDOWN_VAULT_MCP_OPENAI_EMBEDDING_MODEL` | OpenAI-compatible embedding model name | `text-embedding-3-small` |
+| `VOYAGE_API_KEY` | Voyage AI API key | none |
+| `MARKDOWN_VAULT_MCP_VOYAGE_MODEL` | Voyage AI embedding model name | `voyage-4` |
 
 #### Example Configurations
 

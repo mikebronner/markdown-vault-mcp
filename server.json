@@ -69,6 +69,11 @@
           "isSecret": true
         },
         {
+          "name": "VOYAGE_API_KEY",
+          "description": "Voyage AI API key for the voyage embedding provider. Bare (not MARKDOWN_VAULT_MCP_-prefixed), matching the OPENAI_API_KEY / OLLAMA_HOST convention. Setting it never auto-selects the provider; choose it explicitly with MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER=voyage.",
+          "isSecret": true
+        },
+        {
           "name": "OPENAI_BASE_URL",
           "description": "Bare fallback for MARKDOWN_VAULT_MCP_OPENAI_BASE_URL (embeddings). For the summarize tool it only routes traffic when an API key already enables the feature; it never enables summarize by itself."
         },
@@ -97,6 +102,12 @@
         {
           "name": "MARKDOWN_VAULT_MCP_READ_ONLY",
           "description": "Set to true to hide the write tools (write, edit, append, delete, rename, move_folder, fetch, git_sync, the okf_* tools, create_upload_link) and serve a search-only vault. git_sync also needs managed git mode; create_upload_link needs an HTTP transport.",
+          "format": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "MARKDOWN_VAULT_MCP_WRITE_PROTECT_EXISTING",
+          "description": "Set to true to refuse a write that would overwrite an existing file when no if_match etag is supplied. Deliberate replacement (read first, pass if_match) still works, and edit / append / delete / rename are unaffected.",
           "format": "boolean",
           "default": "false"
         },
@@ -233,7 +244,7 @@
         },
         {
           "name": "MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER",
-          "description": "Embedding provider: openai, ollama, or fastembed. Unset auto-detects from the environment."
+          "description": "Embedding provider: openai, voyage, ollama, or fastembed. Unset auto-detects from the environment (never voyage)."
         },
         {
           "name": "MARKDOWN_VAULT_MCP_OLLAMA_MODEL",
@@ -245,6 +256,11 @@
           "description": "Force Ollama to embed on CPU only.",
           "format": "boolean",
           "default": "false"
+        },
+        {
+          "name": "MARKDOWN_VAULT_MCP_VOYAGE_MODEL",
+          "description": "Voyage AI embedding model name.",
+          "default": "voyage-4"
         },
         {
           "name": "MARKDOWN_VAULT_MCP_OPENAI_BASE_URL",
@@ -604,6 +620,11 @@
           "isSecret": true
         },
         {
+          "name": "VOYAGE_API_KEY",
+          "description": "Voyage AI API key for the voyage embedding provider. Bare (not MARKDOWN_VAULT_MCP_-prefixed), matching the OPENAI_API_KEY / OLLAMA_HOST convention. Setting it never auto-selects the provider; choose it explicitly with MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER=voyage.",
+          "isSecret": true
+        },
+        {
           "name": "OPENAI_BASE_URL",
           "description": "Bare fallback for MARKDOWN_VAULT_MCP_OPENAI_BASE_URL (embeddings). For the summarize tool it only routes traffic when an API key already enables the feature; it never enables summarize by itself."
         },
@@ -632,6 +653,12 @@
         {
           "name": "MARKDOWN_VAULT_MCP_READ_ONLY",
           "description": "Set to true to hide the write tools (write, edit, append, delete, rename, move_folder, fetch, git_sync, the okf_* tools, create_upload_link) and serve a search-only vault. git_sync also needs managed git mode; create_upload_link needs an HTTP transport.",
+          "format": "boolean",
+          "default": "false"
+        },
+        {
+          "name": "MARKDOWN_VAULT_MCP_WRITE_PROTECT_EXISTING",
+          "description": "Set to true to refuse a write that would overwrite an existing file when no if_match etag is supplied. Deliberate replacement (read first, pass if_match) still works, and edit / append / delete / rename are unaffected.",
           "format": "boolean",
           "default": "false"
         },
@@ -768,7 +795,7 @@
         },
         {
           "name": "MARKDOWN_VAULT_MCP_EMBEDDING_PROVIDER",
-          "description": "Embedding provider: openai, ollama, or fastembed. Unset auto-detects from the environment."
+          "description": "Embedding provider: openai, voyage, ollama, or fastembed. Unset auto-detects from the environment (never voyage)."
         },
         {
           "name": "MARKDOWN_VAULT_MCP_OLLAMA_MODEL",
@@ -780,6 +807,11 @@
           "description": "Force Ollama to embed on CPU only.",
           "format": "boolean",
           "default": "false"
+        },
+        {
+          "name": "MARKDOWN_VAULT_MCP_VOYAGE_MODEL",
+          "description": "Voyage AI embedding model name.",
+          "default": "voyage-4"
         },
         {
           "name": "MARKDOWN_VAULT_MCP_OPENAI_BASE_URL",
