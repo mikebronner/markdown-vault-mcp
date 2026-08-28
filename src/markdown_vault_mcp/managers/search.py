@@ -19,7 +19,7 @@ import sqlite3
 from dataclasses import dataclass
 from dataclasses import replace as _dc_replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 
 from markdown_vault_mcp.exceptions import EmbeddingsNotConfiguredError
 from markdown_vault_mcp.managers._vector_loader import load_or_self_heal
@@ -328,6 +328,7 @@ class SearchManager:
         chunks_per_file: int = 2,
         snippet_words: int = 200,
         length_downweight_alpha: float = 0.25,
+        default_mode: str = "keyword",
     ) -> None:
         self._fts = fts
         self._source_dir = source_dir
@@ -341,6 +342,7 @@ class SearchManager:
         self._chunks_per_file = chunks_per_file
         self._snippet_words = snippet_words
         self._length_downweight_alpha = length_downweight_alpha
+        self._default_mode = default_mode
 
         # Vector index is loaded lazily (only if embeddings_path is set).
         self._vectors: VectorIndex | None = None
@@ -374,9 +376,51 @@ class SearchManager:
         """
         validate_path(path, self._source_dir)
 
+    def _resolve_mode(
+        self, mode: Literal["keyword", "semantic", "hybrid"] | None
+    ) -> Literal["keyword", "semantic", "hybrid"]:
+        """Resolve a caller's *mode* against the configured default.
+
+        ``None`` means "no preference": the configured ``default_mode``
+        applies, and if that default needs embeddings this vault has not
+        configured, it degrades to ``"keyword"`` rather than raising — an
+        unconfigured vault should still be searchable.
+
+        An explicit mode is always honoured verbatim, including when it
+        cannot be served.  Silently downgrading a caller who asked for
+        semantic search would return keyword results under a semantic
+        label; that failure belongs at the call site, not buried here.
+
+        Args:
+            mode: The caller's requested mode, or ``None`` for the default.
+
+        Returns:
+            The mode to execute.
+        """
+        if mode is not None:
+            return mode
+        default = self._default_mode
+        if default != "keyword" and not self._vectors_available():
+            logger.debug(
+                "search: default mode %r needs embeddings; using keyword", default
+            )
+            return "keyword"
+        return cast('Literal["keyword", "semantic", "hybrid"]', default)
+
+    def _vectors_available(self) -> bool:
+        """Report whether semantic search is configured for this vault.
+
+        Returns:
+            ``True`` when both an embedding provider and an embeddings path
+            are set.
+        """
+        return (
+            self._embedding_provider is not None and self._embeddings_path is not None
+        )
+
     def _require_vectors(self) -> None:
         """Raise :class:`EmbeddingsNotConfiguredError` if semantic search is unconfigured."""
-        if self._embedding_provider is None or self._embeddings_path is None:
+        if not self._vectors_available():
             raise EmbeddingsNotConfiguredError(
                 "Semantic search requires both 'embedding_provider' and "
                 "'embeddings_path' to be configured."
@@ -539,7 +583,7 @@ class SearchManager:
         query: str,
         *,
         limit: int = 10,
-        mode: Literal["keyword", "semantic", "hybrid"] = "keyword",
+        mode: Literal["keyword", "semantic", "hybrid"] | None = None,
         filters: dict[str, str] | None = None,
         folder: str | None = None,
         chunks_per_file: int | None = None,
@@ -552,7 +596,9 @@ class SearchManager:
             limit: Maximum number of files (not chunks) to return.
             mode: ``"keyword"`` for BM25 FTS5, ``"semantic"`` for cosine
                 similarity, or ``"hybrid"`` for Reciprocal Rank Fusion of
-                both.
+                both.  ``None`` (the default) uses the configured
+                ``search.default_mode``, falling back to ``"keyword"`` when
+                that default needs embeddings this vault has not configured.
             filters: Dict of ``{frontmatter_key: value}`` pairs (AND
                 semantics).  Only works for fields in
                 ``indexed_frontmatter_fields``.
@@ -569,14 +615,16 @@ class SearchManager:
             by descending file score (max of section scores).
 
         Raises:
-            EmbeddingsNotConfiguredError: If *mode* is ``"semantic"`` or
-                ``"hybrid"`` but no embedding provider or embeddings path is
-                configured (a ``ValueError`` subclass).
+            EmbeddingsNotConfiguredError: If *mode* is **explicitly**
+                ``"semantic"`` or ``"hybrid"`` but no embedding provider or
+                embeddings path is configured (a ``ValueError`` subclass).
+                An implicit default never raises — it degrades to keyword.
         """
         eff_cap = (
             chunks_per_file if chunks_per_file is not None else self._chunks_per_file
         )
         eff_snip = snippet_words if snippet_words is not None else self._snippet_words
+        mode = self._resolve_mode(mode)
 
         if mode == "keyword":
             return self._keyword_search(

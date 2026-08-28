@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from markdown_vault_mcp.exceptions import ConfigurationError
+
+_SEARCH_MODES = frozenset({"keyword", "semantic", "hybrid"})
 
 
 @dataclass(frozen=True)
@@ -17,6 +20,7 @@ class SearchConfig:
     max_chunk_words: int = 400
     max_chunk_chars_override: int | None = None
     chunk_overlap_words: int = 40
+    default_mode: str = "keyword"
 
     def __post_init__(self) -> None:
         """Validate ranges on every construction path (#638).
@@ -54,6 +58,11 @@ class SearchConfig:
             raise ConfigurationError(
                 f"chunk_overlap_words must be >= 0, got {self.chunk_overlap_words}"
             )
+        if self.default_mode not in _SEARCH_MODES:
+            raise ConfigurationError(
+                "default_mode must be one of "
+                f"{', '.join(sorted(_SEARCH_MODES))}; got {self.default_mode!r}"
+            )
 
     @classmethod
     def from_env(cls, prefix: str) -> SearchConfig:
@@ -82,4 +91,5 @@ class SearchConfig:
             max_chunk_words=env_int(prefix, "MAX_CHUNK_WORDS", 400),
             max_chunk_chars_override=opt_int(prefix, "MAX_CHUNK_CHARS"),
             chunk_overlap_words=env_int(prefix, "CHUNK_OVERLAP_WORDS", 40),
+            default_mode=os.environ.get(f"{prefix}_DEFAULT_SEARCH_MODE", "keyword"),
         )

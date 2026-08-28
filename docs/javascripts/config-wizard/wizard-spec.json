@@ -711,6 +711,28 @@
       "advancedGroup": "Timeouts"
     },
     {
+      "id": "default_search_mode",
+      "label": "Default search mode",
+      "help": "Used when a search call omits 'mode'. Hybrid falls back to keyword automatically when no embeddings are configured.",
+      "type": "select",
+      "options": [
+        {
+          "value": "hybrid",
+          "label": "Hybrid (keyword + semantic)"
+        },
+        {
+          "value": "keyword",
+          "label": "Keyword (FTS5/BM25)"
+        },
+        {
+          "value": "semantic",
+          "label": "Semantic (vector similarity)"
+        }
+      ],
+      "var": "MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE",
+      "advancedGroup": "Search & chunking"
+    },
+    {
       "id": "chunks_per_file",
       "label": "Chunks per file",
       "type": "number",

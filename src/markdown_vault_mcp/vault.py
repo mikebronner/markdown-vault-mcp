@@ -191,6 +191,7 @@ class Vault:
         chunks_per_file: int = 2,
         snippet_words: int = 200,
         length_downweight_alpha: float = 0.25,
+        default_search_mode: str = "keyword",
         max_chunk_words: int = 400,
         max_chunk_chars: int | None = None,
         max_chunk_chars_override: int | None = None,
@@ -330,6 +331,7 @@ class Vault:
             chunks_per_file=chunks_per_file,
             snippet_words=snippet_words,
             length_downweight_alpha=length_downweight_alpha,
+            default_mode=default_search_mode,
         )
         # Deferred write callback (issue #175): the git-commit on_write
         # callback runs on a background worker so write methods return after

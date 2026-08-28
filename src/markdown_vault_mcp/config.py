@@ -166,6 +166,7 @@ class ProjectConfig:
             "chunks_per_file": self.search.chunks_per_file,
             "snippet_words": self.search.snippet_words,
             "length_downweight_alpha": self.search.length_downweight_alpha,
+            "default_search_mode": self.search.default_mode,
             "max_chunk_words": self.search.max_chunk_words,
             "chunk_overlap_words": self.search.chunk_overlap_words,
         }

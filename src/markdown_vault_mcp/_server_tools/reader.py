@@ -31,7 +31,7 @@ def register(mcp: FastMCP) -> None:
     async def search(
         query: str,
         limit: int = 10,
-        mode: Literal["keyword", "semantic", "hybrid"] = "keyword",
+        mode: Literal["keyword", "semantic", "hybrid"] | None = None,
         folder: str | None = None,
         filters: dict[str, str] | None = None,
         chunks_per_file: int | None = None,
@@ -41,10 +41,16 @@ def register(mcp: FastMCP) -> None:
     ) -> list[dict[str, Any]]:
         """Find documents matching a query using full-text or semantic search.
 
-        Search the vault. Default mode is "keyword" (FTS5/BM25). Pass
+        Search the vault. Omitting 'mode' uses the vault's configured
+        default (keyword unless the operator changed it). Pass
         mode="hybrid" when 'stats' shows semantic_search_available=True —
         hybrid fuses keyword and vector results for best quality. Use
         mode="semantic" for pure vector similarity.
+
+        Queries are matched as literal terms when FTS5 rejects them as an
+        expression, so hyphenated names ('memory-lint') search correctly
+        without quoting. Deliberate FTS5 syntax (NOT, prefix *, "phrase
+        queries") is still honoured when the query parses.
 
         The 'content' field in each result is a snippet by default, not the
         full document. Use read(path, section=heading) to retrieve the full
@@ -56,6 +62,9 @@ def register(mcp: FastMCP) -> None:
             mode: "keyword" uses FTS5/BM25 for exact terms. "semantic" uses
                 vector similarity (requires embeddings). "hybrid" fuses both
                 via reciprocal rank fusion — best quality when available.
+                None (the default) uses the vault's configured default_mode,
+                degrading to "keyword" if that needs absent embeddings; an
+                explicit "semantic"/"hybrid" still errors when unconfigured.
             folder: Restrict to documents under this folder path (e.g.
                 "Journal"). Must match a value from 'list_folders'.
                 Use folder="" for root-level (top-level) documents only.

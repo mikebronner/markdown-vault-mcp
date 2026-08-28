@@ -1623,6 +1623,28 @@ class TestSearchConfigFromEnv:
         with pytest.raises(ConfigurationError, match="chunks_per_file"):
             SearchConfig.from_env("MARKDOWN_VAULT_MCP")
 
+    def test_default_mode_defaults_to_keyword(self, monkeypatch):
+        """The shipped default is a no-op: existing behaviour is unchanged."""
+        from markdown_vault_mcp.config_sections import SearchConfig
+
+        monkeypatch.delenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", raising=False)
+        assert SearchConfig.from_env("MARKDOWN_VAULT_MCP").default_mode == "keyword"
+
+    @pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+    def test_default_mode_accepts_each_valid_mode(self, monkeypatch, mode):
+        from markdown_vault_mcp.config_sections import SearchConfig
+
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", mode)
+        assert SearchConfig.from_env("MARKDOWN_VAULT_MCP").default_mode == mode
+
+    def test_default_mode_invalid_raises(self, monkeypatch):
+        """An unknown mode fails at config load, not at the first search."""
+        from markdown_vault_mcp.config_sections import SearchConfig
+
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", "fuzzy")
+        with pytest.raises(ConfigurationError, match="default_mode"):
+            SearchConfig.from_env("MARKDOWN_VAULT_MCP")
+
     def test_chunks_per_file_invalid_raises(self, monkeypatch):
         from markdown_vault_mcp.config_sections import SearchConfig
 

@@ -13,7 +13,12 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-from markdown_vault_mcp.fts_index import FTSIndex, _json_default
+from markdown_vault_mcp.fts_index import (
+    FTSIndex,
+    _is_malformed_query_error,
+    _json_default,
+    _quote_fts_terms,
+)
 from markdown_vault_mcp.types import Chunk, FTSResult, ParsedNote
 
 # ---------------------------------------------------------------------------
@@ -365,6 +370,208 @@ class TestSearch:
 
         with pytest.raises(sqlite3.OperationalError, match="database is locked"):
             idx.search("hello")
+
+    def test_search_operational_error_propagates_without_retrying(self) -> None:
+        """An operational fault propagates on the first try — no rewrite retry.
+
+        The literal-term retry exists to rescue a user's query, not to paper
+        over an I/O fault.  Retrying there would double the work and delay
+        the error the caller needs, so the first execute must classify the
+        exception before deciding to retry.
+
+        Uses a non-lock fault deliberately: ``SQLITE_LOCKED`` is retried by
+        :func:`_retry_on_locked` around the whole method, which would mask
+        the call count this test pins.
+        """
+        from unittest.mock import MagicMock
+
+        idx = FTSIndex(":memory:")
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = sqlite3.OperationalError("disk I/O error")
+        idx._conn = lambda: mock_conn  # type: ignore[method-assign]
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            idx.search("memory-lint orphan")
+        assert mock_conn.execute.call_count == 1
+
+    def test_search_whitespace_only_query_returns_empty(self) -> None:
+        """A query with no tokens has no literal rewrite to retry.
+
+        ``if not query`` upstream catches ``""`` but not ``"   "``, which is
+        truthy and reaches FTS5.  Its rewrite is the empty string, so the
+        retry must be abandoned rather than issued.
+        """
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "a.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="hello world",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        assert idx.search("   ") == []
+
+    def test_search_returns_empty_when_literal_retry_is_also_rejected(self) -> None:
+        """Both attempts rejected → empty list, not an exception."""
+        from unittest.mock import MagicMock
+
+        idx = FTSIndex(":memory:")
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = sqlite3.OperationalError("no such column: lint")
+        idx._conn = lambda: mock_conn  # type: ignore[method-assign]
+
+        assert idx.search("memory-lint orphan") == []
+        assert mock_conn.execute.call_count == 2
+
+    def test_search_operational_error_on_retry_propagates(self) -> None:
+        """An operational fault surfacing only on the retry still propagates.
+
+        The second execute needs the same classifier guard as the first —
+        without it, a disk fault that appears mid-search would be reported
+        to the caller as "no matches".
+        """
+        from unittest.mock import MagicMock
+
+        idx = FTSIndex(":memory:")
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = [
+            sqlite3.OperationalError("no such column: lint"),
+            sqlite3.OperationalError("disk I/O error"),
+        ]
+        idx._conn = lambda: mock_conn  # type: ignore[method-assign]
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            idx.search("memory-lint orphan")
+
+    def test_search_hyphenated_term_matches_instead_of_returning_empty(self) -> None:
+        """A hyphenated term is matched literally, not parsed as an operator.
+
+        Regression: FTS5 reads ``memory-lint orphan`` as an expression and
+        raises ``no such column: lint``, which search() swallowed into an
+        empty list.  Every hyphenated project name searched this way
+        silently returned nothing.
+        """
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "a.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="the memory-lint run found an orphan",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        results = idx.search("memory-lint orphan")
+        assert [r.path for r in results] == ["a.md"]
+
+    def test_search_colon_term_matches_instead_of_returning_empty(self) -> None:
+        """A colon in a term is matched literally, not as a column filter."""
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "a.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="config queue: after_commit was false",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        results = idx.search("queue: after_commit")
+        assert [r.path for r in results] == ["a.md"]
+
+    def test_search_valid_fts5_operators_are_not_rewritten(self) -> None:
+        """A query FTS5 accepts keeps its operator semantics.
+
+        The literal-term retry must fire only on a parse rejection.  If it
+        ran unconditionally, ``NOT`` would degrade to a literal and this
+        search would match the excluded document.
+        """
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "keep.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="alpha beta",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        idx.upsert_note(
+            make_note(
+                "drop.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="alpha gamma",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        results = idx.search("alpha NOT gamma")
+        assert [r.path for r in results] == ["keep.md"]
+
+    def test_search_returns_empty_when_literal_retry_also_matches_nothing(self) -> None:
+        """A rescued query that genuinely matches nothing still returns []."""
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "a.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content="hello world",
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        assert idx.search("absent-term orphan") == []
+
+    def test_search_start_line_survives_the_literal_retry(self) -> None:
+        """Rows from the retry path carry the same fields as the direct path.
+
+        The retry re-executes the identical SQL with rebuilt parameters; a
+        parameter-order mistake there would surface as a wrong start_line
+        rather than as an error.
+        """
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "a.md",
+                chunks=[
+                    Chunk(
+                        heading="Section",
+                        heading_level=2,
+                        content="the memory-lint orphan report",
+                        start_line=42,
+                    )
+                ],
+            )
+        )
+        (result,) = idx.search("memory-lint orphan")
+        assert result.start_line == 42
+        assert result.heading == "Section"
 
     def test_search_returns_start_line(self) -> None:
         """search() propagates start_line from the sections row.
@@ -987,3 +1194,76 @@ def test_chunking_meta_stores_none_as_empty(tmp_path):
     assert idx.get_chunking_meta() == ChunkingMeta(
         model=None, max_chunk_chars_override=None
     )
+
+
+class TestQuoteFtsTerms:
+    """Unit tests for the literal-term rewrite helper."""
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("memory-lint orphan", '"memory-lint" "orphan"'),
+            ("queue: after_commit", '"queue:" "after_commit"'),
+            ("single", '"single"'),
+            ("  padded   spacing  ", '"padded" "spacing"'),
+            ("", ""),
+            ("   ", ""),
+        ],
+    )
+    def test_quotes_each_whitespace_token(self, query: str, expected: str) -> None:
+        """Every token is double-quoted; whitespace-only yields no terms."""
+        assert _quote_fts_terms(query) == expected
+
+    def test_embedded_double_quote_is_doubled(self) -> None:
+        """An embedded quote is escaped by doubling, not left to terminate."""
+        assert _quote_fts_terms('say"hi') == '"say""hi"'
+
+    def test_rewritten_query_is_accepted_by_fts5(self) -> None:
+        """The rewrite of a rejected query actually parses.
+
+        Guards the escaping contract end-to-end: a naive rewrite would
+        produce an unterminated string and fail the same way as the input.
+        """
+        idx = FTSIndex(":memory:")
+        idx.upsert_note(
+            make_note(
+                "a.md",
+                chunks=[
+                    Chunk(
+                        heading=None,
+                        heading_level=0,
+                        content='a say"hi token',
+                        start_line=0,
+                    )
+                ],
+            )
+        )
+        assert [r.path for r in idx.search('say"hi')] == ["a.md"]
+
+
+class TestIsMalformedQueryError:
+    """Unit tests for the query-parse-error classifier."""
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "no such column: lint",
+            "fts5: syntax error near '-'",
+            "unterminated string",
+        ],
+    )
+    def test_query_parse_failures_are_recognised(self, message: str) -> None:
+        """Messages naming a query-parse fault classify as malformed."""
+        assert _is_malformed_query_error(sqlite3.OperationalError(message)) is True
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "database is locked",
+            "disk I/O error",
+            "attempt to write a readonly database",
+        ],
+    )
+    def test_operational_faults_are_not_recognised(self, message: str) -> None:
+        """Operational faults must not be mistaken for a bad query."""
+        assert _is_malformed_query_error(sqlite3.OperationalError(message)) is False

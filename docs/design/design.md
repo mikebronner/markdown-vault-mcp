@@ -1804,6 +1804,22 @@ Uses the schema defined in [Database Schema](#database-schema). Note that
 with RRF scoring in hybrid mode; each file appears once with up to
 `chunks_per_file` matching sections).
 
+**Query-parse rescue.** The `query` argument reaches FTS5's `MATCH` as a
+query *expression*, where `-`, `:`, and `*` are operators rather than
+characters. A natural-language query naming a hyphenated project —
+`memory-lint orphan` — therefore parses as an expression and is rejected
+with `no such column: lint`. That rejection used to be swallowed into an
+empty result list, making a malformed query indistinguishable from a
+genuine no-match.
+
+`search()` now retries a rejected query exactly once with every
+whitespace-separated token wrapped in double quotes (`"memory-lint"
+"orphan"`), demoting each to a string literal matched verbatim under FTS5's
+default AND semantics. A query that parses cleanly never reaches the retry,
+so deliberate FTS5 syntax — `NOT`, prefix `*`, `"phrase queries"` — keeps
+its meaning. Operational faults (locked database, disk I/O) are classified
+before the retry and propagate immediately rather than being retried.
+
 ### `vector_index.py`: Numpy Embeddings
 
 Adapted from ifcraftcorpus `embeddings.py`. Rename `EmbeddingIndex` to

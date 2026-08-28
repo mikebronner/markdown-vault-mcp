@@ -281,6 +281,48 @@ def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _is_malformed_query_error(exc: sqlite3.OperationalError) -> bool:
+    """Report whether *exc* means FTS5 rejected the query string itself.
+
+    Distinguishes a caller's malformed MATCH expression from an operational
+    fault (locked database, missing table) that must propagate.
+
+    Args:
+        exc: The exception raised by ``execute`` on an FTS5 MATCH.
+
+    Returns:
+        ``True`` when the message identifies a query-parse failure.
+    """
+    msg = str(exc).lower()
+    return (
+        "fts5" in msg
+        or "syntax error" in msg
+        or "no such column" in msg
+        or "unterminated" in msg
+    )
+
+
+def _quote_fts_terms(query: str) -> str:
+    """Rewrite a query as a conjunction of quoted FTS5 string literals.
+
+    FTS5's grammar reads ``-``, ``:``, ``*`` and friends as operators, so a
+    natural-language query naming a hyphenated project (``memory-lint
+    orphan``) parses as an expression and is rejected with ``no such
+    column: lint`` rather than matching anything.  Double-quoting each
+    whitespace-separated token demotes every one of them to a literal
+    string, which FTS5 matches verbatim under the default AND semantics.
+
+    Args:
+        query: Raw user query string.
+
+    Returns:
+        Every whitespace-separated token double-quoted and space-joined, or
+        ``""`` when *query* contains no tokens.  Embedded double quotes are
+        escaped by doubling, per FTS5 string-literal syntax.
+    """
+    return " ".join('"' + tok.replace('"', '""') + '"' for tok in query.split())
+
+
 def _derive_folder(path: str) -> str:
     """Derive the folder from a document's relative path.
 
@@ -1081,6 +1123,61 @@ class FTSIndex:
         override: int | None = int(override_raw) if override_raw else None
         return ChunkingMeta(model=model, max_chunk_chars_override=override)
 
+    def _execute_match(
+        self,
+        sql: str,
+        make_params: Callable[[str], list[object]],
+        query: str,
+    ) -> sqlite3.Cursor | None:
+        """Run an FTS5 MATCH, retrying a rejected query as literal terms.
+
+        A query FTS5 cannot parse is not a failure to report to the user as
+        "no matches" — it is a query whose operators the user never intended
+        to write.  ``search-term`` is one token to a person and an operator
+        expression to FTS5.  So a parse rejection triggers exactly one retry
+        with every token quoted (see :func:`_quote_fts_terms`); a query that
+        parses cleanly never reaches that path, leaving deliberate FTS5
+        syntax — ``NOT``, prefix ``*``, phrase quoting — untouched.
+
+        Args:
+            sql: The full SELECT carrying a single ``notes_fts MATCH ?``.
+            make_params: Builds the parameter list for a given MATCH string.
+            query: The caller's raw query string.
+
+        Returns:
+            A cursor over the result rows, or ``None`` when FTS5 rejected
+            both the original query and its literal-term rewrite.
+
+        Raises:
+            sqlite3.OperationalError: If the failure is operational (locked
+                database, missing table) rather than a query-parse error.
+        """
+        try:
+            return self._conn().execute(sql, make_params(query))
+        except sqlite3.OperationalError as exc:
+            if not _is_malformed_query_error(exc):
+                raise
+            first_error = exc
+
+        literal = _quote_fts_terms(query)
+        if not literal or literal == query:
+            logger.debug("FTS search: malformed query %r — %s", query, first_error)
+            return None
+
+        logger.debug(
+            "FTS search: %r rejected (%s); retrying as literal terms %r",
+            query,
+            first_error,
+            literal,
+        )
+        try:
+            return self._conn().execute(sql, make_params(literal))
+        except sqlite3.OperationalError as exc:
+            if not _is_malformed_query_error(exc):
+                raise
+            logger.debug("FTS search: literal retry of %r rejected — %s", query, exc)
+            return None
+
     @_retry_on_locked
     def search(
         self,
@@ -1192,13 +1289,15 @@ class FTSIndex:
         if not query:
             return []
 
-        params: list[object] = [
-            *snippet_params,
-            query,
-            *folder_params,
-            *tag_params,
-            limit,
-        ]
+        def make_params(match: str) -> list[object]:
+            return [
+                *snippet_params,
+                match,
+                *folder_params,
+                *tag_params,
+                limit,
+            ]
+
         logger.debug(
             "FTS search: query=%r folder=%r filters=%r limit=%d snippet_words=%r",
             query,
@@ -1207,19 +1306,9 @@ class FTSIndex:
             limit,
             snippet_words,
         )
-        try:
-            cur = self._conn().execute(sql, params)
-        except sqlite3.OperationalError as exc:
-            msg = str(exc).lower()
-            if (
-                "fts5" in msg
-                or "syntax error" in msg
-                or "no such column" in msg
-                or "unterminated" in msg
-            ):
-                logger.debug("FTS search: malformed query %r — %s", query, exc)
-                return []
-            raise
+        cur = self._execute_match(sql, make_params, query)
+        if cur is None:
+            return []
         rows = cur.fetchall()
         logger.debug("FTS search: %d results for query=%r", len(rows), query)
 

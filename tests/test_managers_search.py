@@ -1183,3 +1183,85 @@ class TestGetContextSurfacesInternalFailure:
             result = search_mgr.get_context("alpha.md")
         assert result.similar == []
         assert not any("get_similar failed" in r.message for r in caplog.records)
+
+
+def _mgr(vault_dir: Path, *, default_mode: str) -> SearchManager:
+    """Build a SearchManager over *vault_dir* with an explicit default mode."""
+    fts = FTSIndex(db_path=":memory:", indexed_frontmatter_fields=["tags"])
+    for note in scan_directory(vault_dir):
+        fts.upsert_note(note)
+    return SearchManager(
+        fts=fts,
+        source_dir=vault_dir,
+        indexed_frontmatter_fields=["tags"],
+        link_manager=LinkManager(fts=fts, source_dir=vault_dir),
+        attachment_extensions=["png"],
+        default_mode=default_mode,
+    )
+
+
+class TestDefaultModeResolution:
+    """mode=None resolves from config; explicit modes keep their contract."""
+
+    def test_shipped_default_is_keyword(self, search_mgr: SearchManager) -> None:
+        """The shipped default is a no-op, leaving existing behaviour intact."""
+        assert search_mgr._default_mode == "keyword"
+
+    def test_operator_hybrid_default_degrades_without_embeddings(
+        self, search_vault: Path
+    ) -> None:
+        """An operator-set hybrid default must not break an embedding-less vault.
+
+        Configuring ``hybrid`` on a vault with no embedding provider has to
+        stay searchable rather than raising on every unqualified call.
+        """
+        mgr = _mgr(search_vault, default_mode="hybrid")
+        results = mgr.search("alpha")
+        assert "alpha.md" in [r.path for r in results]
+        assert all(r.search_type == "keyword" for r in results)
+
+    def test_explicit_hybrid_still_raises_without_embeddings(
+        self, search_mgr: SearchManager
+    ) -> None:
+        """An explicit hybrid request is never silently downgraded.
+
+        Degrading it would hand back keyword results under a semantic
+        label — the caller must learn their vault cannot serve the mode.
+        """
+        from markdown_vault_mcp.exceptions import EmbeddingsNotConfiguredError
+
+        with pytest.raises(EmbeddingsNotConfiguredError):
+            search_mgr.search("alpha", mode="hybrid")
+
+    def test_explicit_semantic_still_raises_without_embeddings(
+        self, search_mgr: SearchManager
+    ) -> None:
+        """Same contract for an explicit semantic request."""
+        from markdown_vault_mcp.exceptions import EmbeddingsNotConfiguredError
+
+        with pytest.raises(EmbeddingsNotConfiguredError):
+            search_mgr.search("alpha", mode="semantic")
+
+    def test_explicit_keyword_is_honoured(self, search_mgr: SearchManager) -> None:
+        """An explicit keyword request runs keyword search."""
+        results = search_mgr.search("alpha", mode="keyword")
+        assert "alpha.md" in [r.path for r in results]
+
+    def test_keyword_default_is_not_treated_as_needing_embeddings(
+        self, search_vault: Path
+    ) -> None:
+        """A keyword default resolves without consulting vectors."""
+        assert _mgr(search_vault, default_mode="keyword")._resolve_mode(None) == (
+            "keyword"
+        )
+
+    def test_configured_default_is_used_when_vectors_are_available(
+        self, search_vault: Path
+    ) -> None:
+        """With vectors present, the configured default is not downgraded."""
+        import pathlib
+
+        mgr = _mgr(search_vault, default_mode="hybrid")
+        mgr._embedding_provider = object()  # type: ignore[assignment]
+        mgr._embeddings_path = pathlib.Path("embeddings.npy")
+        assert mgr._resolve_mode(None) == "hybrid"
