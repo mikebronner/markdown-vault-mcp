@@ -342,6 +342,21 @@ class ProjectConfig:
             "wizard": {"group": "Content"},
         },
     )
+    default_search_mode: str = field(
+        default="keyword",
+        metadata={
+            "help": (
+                "Mode used when a search call omits 'mode': keyword, "
+                "semantic, or hybrid. The default preserves keyword-only "
+                "behaviour. A configured semantic/hybrid default degrades to "
+                "keyword when no embeddings are available, so enabling it "
+                "cannot make a vault without embeddings unsearchable; an "
+                "explicit mode= argument is never downgraded."
+            ),
+            "tags": ("search",),
+            "wizard": {"group": "Search tuning"},
+        },
+    )
     chunks_per_file: int = field(
         default=2,
         metadata={
@@ -898,6 +913,7 @@ class ProjectConfig:
             chunk_overlap_words=self.chunk_overlap_words,
             folder_weights=self.folder_weights,
             fts_weights=self.fts_weights,
+            default_mode=self.default_search_mode,
         )
 
     @property
@@ -1054,6 +1070,7 @@ class ProjectConfig:
                 _ENV_PREFIX, "MAX_ATTACHMENT_SIZE_MB", 1.0
             ),
             max_note_read_bytes=env_int(_ENV_PREFIX, "MAX_NOTE_READ_BYTES", 262144),
+            default_search_mode=env(_ENV_PREFIX, "DEFAULT_SEARCH_MODE") or "keyword",
             chunks_per_file=env_int(_ENV_PREFIX, "CHUNKS_PER_FILE", 2),
             snippet_words=env_int(_ENV_PREFIX, "SNIPPET_WORDS", 200),
             length_downweight_alpha=env_float(

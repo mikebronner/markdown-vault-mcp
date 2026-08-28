@@ -14,6 +14,9 @@ _FTS_COLUMNS = ("path", "title", "folder", "heading", "content", "summary")
 # parse_weight_map) or an already-frozen tuple of (key, weight) pairs.
 _WeightMap = Mapping[str, float] | Sequence[tuple[str, float]]
 
+# Modes accepted for default_mode, mirroring the search tool's Literal.
+_SEARCH_MODES = frozenset({"keyword", "semantic", "hybrid"})
+
 
 @dataclass(frozen=True)
 class SearchConfig:
@@ -27,6 +30,7 @@ class SearchConfig:
     chunk_overlap_words: int = 40
     folder_weights: _WeightMap | None = None
     fts_weights: _WeightMap | None = None
+    default_mode: str = "keyword"
 
     def _freeze_weight_map(
         self, name: str, normalise_key: bool = False
@@ -110,4 +114,9 @@ class SearchConfig:
         if self.chunk_overlap_words < 0:
             raise ConfigurationError(
                 f"chunk_overlap_words must be >= 0, got {self.chunk_overlap_words}"
+            )
+        if self.default_mode not in _SEARCH_MODES:
+            raise ConfigurationError(
+                "default_mode must be one of "
+                f"{', '.join(sorted(_SEARCH_MODES))}; got {self.default_mode!r}"
             )

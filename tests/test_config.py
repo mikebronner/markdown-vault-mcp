@@ -1729,6 +1729,41 @@ class TestEmbeddingsConfigFromEnv:
             EmbeddingsConfig().provider = "ollama"  # type: ignore[misc]
 
 
+class TestDefaultSearchMode:
+    """MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE and its validation."""
+
+    def test_defaults_to_keyword(self, monkeypatch):
+        """The shipped default is an exact no-op."""
+        monkeypatch.delenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", raising=False)
+        assert ProjectConfig.from_env().search.default_mode == "keyword"
+
+    @pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+    def test_accepts_each_valid_mode(self, monkeypatch, mode):
+        """Every mode the search tool accepts is a valid default."""
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", mode)
+        assert ProjectConfig.from_env().search.default_mode == mode
+
+    def test_invalid_mode_raises(self, monkeypatch):
+        """An unknown mode fails at config load, not at the first search."""
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", "fuzzy")
+        with pytest.raises(ConfigurationError, match="default_mode"):
+            ProjectConfig.from_env()
+
+    def test_empty_value_falls_back_to_keyword(self, monkeypatch):
+        """An exported-but-empty var is treated as unset, not as invalid."""
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", "")
+        assert ProjectConfig.from_env().search.default_mode == "keyword"
+
+    def test_reaches_the_vault_kwargs(self, monkeypatch):
+        """The value is threaded through to Vault, not just parsed."""
+        from markdown_vault_mcp.config_sections._assembly import to_vault_kwargs
+
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", "hybrid")
+        assert to_vault_kwargs(ProjectConfig.from_env())["default_search_mode"] == (
+            "hybrid"
+        )
+
+
 class TestSearchConfigFromEnv:
     def test_defaults(self, monkeypatch):
         from markdown_vault_mcp.config_sections import SearchConfig

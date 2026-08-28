@@ -259,6 +259,7 @@ class Vault:
         chunks_per_file: int = 2,
         snippet_words: int = 200,
         length_downweight_alpha: float = 0.25,
+        default_search_mode: str = "keyword",
         max_chunk_words: int = 400,
         max_chunk_chars: int | None = None,
         max_chunk_chars_override: int | None = None,
@@ -477,6 +478,7 @@ class Vault:
             chunks_per_file=chunks_per_file,
             snippet_words=snippet_words,
             length_downweight_alpha=length_downweight_alpha,
+            default_mode=default_search_mode,
             folder_weights=folder_weights,
             embed_text_format=self._embed_builder.format_token(),
         )

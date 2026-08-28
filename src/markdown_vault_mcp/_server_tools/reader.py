@@ -37,7 +37,7 @@ def register(mcp: FastMCP) -> None:
     async def search(
         query: str,
         limit: int = 10,
-        mode: Literal["keyword", "semantic", "hybrid"] = "keyword",
+        mode: Literal["keyword", "semantic", "hybrid"] | None = None,
         folder: str | None = None,
         filters: dict[str, str] | None = None,
         chunks_per_file: int | None = None,
@@ -47,7 +47,8 @@ def register(mcp: FastMCP) -> None:
     ) -> list[dict[str, Any]]:
         """Find documents matching a query using full-text or semantic search.
 
-        Search the vault. Default mode is "keyword" (FTS5/BM25). Pass
+        Search the vault. Omitting 'mode' uses the vault's configured
+        default (keyword unless the operator changed it). Pass
         mode="hybrid" when 'stats' shows semantic_search_available=True —
         hybrid fuses keyword and vector results for best quality. Use
         mode="semantic" for pure vector similarity.
@@ -62,6 +63,10 @@ def register(mcp: FastMCP) -> None:
             mode: "keyword" uses FTS5/BM25 for exact terms. "semantic" uses
                 vector similarity (requires embeddings). "hybrid" fuses both
                 via reciprocal rank fusion — best quality when available.
+                None (the default) uses the vault's configured
+                DEFAULT_SEARCH_MODE, which degrades to "keyword" when it
+                needs embeddings the vault lacks; an explicit
+                "semantic"/"hybrid" still errors when unconfigured.
             folder: Restrict to documents under this folder path (e.g.
                 "Journal"). Must match a value from 'list_folders'.
                 Use folder="" for root-level (top-level) documents only.

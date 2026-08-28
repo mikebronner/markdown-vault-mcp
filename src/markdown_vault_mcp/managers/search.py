@@ -14,7 +14,7 @@ import json
 import logging
 import mimetypes
 import sqlite3
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 from markdown_vault_mcp.embed_text import is_embeddable
 from markdown_vault_mcp.exceptions import EmbeddingsNotConfiguredError
@@ -186,6 +186,7 @@ class SearchManager:
         chunks_per_file: int = 2,
         snippet_words: int = 200,
         length_downweight_alpha: float = 0.25,
+        default_mode: str = "keyword",
         folder_weights: dict[str, float] | None = None,
         embed_text_format: str = "v1",
     ) -> None:
@@ -202,6 +203,7 @@ class SearchManager:
         self._chunks_per_file = chunks_per_file
         self._snippet_words = snippet_words
         self._length_downweight_alpha = length_downweight_alpha
+        self._default_mode = default_mode
         self._folder_weights = folder_weights
         self._embed_text_format = embed_text_format
 
@@ -237,9 +239,52 @@ class SearchManager:
         """
         validate_path(path, self._source_dir)
 
+    def _vectors_available(self) -> bool:
+        """Report whether semantic search is configured for this vault.
+
+        Returns:
+            ``True`` when both an embedding provider and an embeddings path
+            are set.
+        """
+        return (
+            self._embedding_provider is not None and self._embeddings_path is not None
+        )
+
+    def _resolve_mode(
+        self, mode: Literal["keyword", "semantic", "hybrid"] | None
+    ) -> Literal["keyword", "semantic", "hybrid"]:
+        """Resolve a caller's *mode* against the configured default.
+
+        ``None`` means "no preference": the configured ``default_mode``
+        applies, and if that default needs embeddings this vault has not
+        configured, it degrades to ``"keyword"`` rather than raising — so
+        enabling a semantic default cannot make an unconfigured vault
+        unsearchable.
+
+        An explicit mode is honoured verbatim, including when it cannot be
+        served. Silently downgrading a caller who asked for semantic search
+        would return keyword results under a semantic label; that failure
+        belongs at the call site.
+
+        Args:
+            mode: The caller's requested mode, or ``None`` for the default.
+
+        Returns:
+            The mode to execute.
+        """
+        if mode is not None:
+            return mode
+        default = self._default_mode
+        if default != "keyword" and not self._vectors_available():
+            logger.debug(
+                "search: default mode %r needs embeddings; using keyword", default
+            )
+            return "keyword"
+        return cast('Literal["keyword", "semantic", "hybrid"]', default)
+
     def _require_vectors(self) -> None:
         """Raise :class:`EmbeddingsNotConfiguredError` if semantic search is unconfigured."""
-        if self._embedding_provider is None or self._embeddings_path is None:
+        if not self._vectors_available():
             raise EmbeddingsNotConfiguredError(
                 "Semantic search requires both 'embedding_provider' and "
                 "'embeddings_path' to be configured."
@@ -633,7 +678,7 @@ class SearchManager:
         query: str,
         *,
         limit: int = 10,
-        mode: Literal["keyword", "semantic", "hybrid"] = "keyword",
+        mode: Literal["keyword", "semantic", "hybrid"] | None = None,
         filters: dict[str, str] | None = None,
         folder: str | None = None,
         chunks_per_file: int | None = None,
@@ -676,6 +721,8 @@ class SearchManager:
         eff_snip = snippet_words if snippet_words is not None else self._snippet_words
         folder = normalize_folder(folder)
         filters, okf_filters = self._split_okf_filters(filters)
+
+        mode = self._resolve_mode(mode)
 
         if mode == "keyword":
             return self._keyword_search(
