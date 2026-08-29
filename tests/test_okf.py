@@ -19,6 +19,7 @@ from markdown_vault_mcp.okf import (
     TRUST_MACHINE,
     TRUST_UNVERIFIED,
     OkfDetector,
+    ReservedFrontmatterPolicy,
     derive_annotation,
     derive_stale,
     derive_trust_tier,
@@ -267,26 +268,31 @@ class TestOkfConfig:
         assert ProjectConfig.from_env().content.okf_mode == "auto"
 
 
+def _guidance(**kwargs: object) -> str:
+    """Render the domain snippets the way pvl-core's builder serialises them.
+
+    ``finalize_instructions`` joins snippets with a blank line, so this is the
+    domain half of the text the server actually emits — minus the identity,
+    documentation and job-polling snippets other contributors add.
+    """
+    from markdown_vault_mcp._instructions import _domain_snippets
+
+    return "\n\n".join(s.text for s in _domain_snippets(**kwargs))  # type: ignore[arg-type]
+
+
 class TestOkfInstructions:
     def test_off_omits_okf_guidance(self) -> None:
-        from markdown_vault_mcp._instructions import build_default_instructions
-
-        text = build_default_instructions(read_only=True, okf_mode="off")
-        assert "OKF" not in text
+        assert "OKF" not in _guidance(read_only=True, okf_mode="off")
 
     @pytest.mark.parametrize("mode", ["auto", "on"])
     def test_permitting_modes_emit_okf_guidance(self, mode: str) -> None:
-        from markdown_vault_mcp._instructions import build_default_instructions
-
-        text = build_default_instructions(read_only=True, okf_mode=mode)
+        text = _guidance(read_only=True, okf_mode=mode)
         assert "OKF" in text
         assert "okf_version" in text
         assert "trust tier" in text
 
     def test_default_omits_okf_guidance(self) -> None:
-        from markdown_vault_mcp._instructions import build_default_instructions
-
-        assert "OKF" not in build_default_instructions(read_only=True)
+        assert "OKF" not in _guidance(read_only=True)
 
 
 @pytest.mark.parametrize(
@@ -875,3 +881,68 @@ class TestAppendOkfLogEntry:
 
         out = append_okf_log_entry("# Log\n", date="2026-08-09", summary="x")
         assert out == "# Log\n\n## 2026-08-09\n\n- x\n"
+
+
+class TestReservedFrontmatterPolicy:
+    """The gate the generated reserved files must survive (#1174, #1175).
+
+    ``index.md`` and ``log.md`` are written by the server, but
+    ``required_frontmatter`` is set by the operator — so without this policy
+    the server generates files its own indexer then skips as
+    ``missing_frontmatter``.
+    """
+
+    def test_unconfigured_vault_gets_no_frontmatter(self) -> None:
+        """No required fields → body-only files, exactly as before the fix.
+
+        Closing the defect must cost a vault that never had it any churn: a
+        frontmatter block on every generated file would rewrite (and, on a
+        git vault, commit) the reserved files of every existing bundle.
+        """
+        assert ReservedFrontmatterPolicy().build(None, title="Log") is None
+
+    def test_existing_frontmatter_is_preserved_unconfigured(self) -> None:
+        """Preservation does not depend on a required field being configured."""
+        policy = ReservedFrontmatterPolicy()
+        assert policy.build({"okf_version": "0.2"}, title="Index") == {
+            "okf_version": "0.2"
+        }
+
+    def test_title_field_is_seeded_with_the_derived_title(self) -> None:
+        policy = ReservedFrontmatterPolicy(required_fields=("title",))
+        assert policy.build(None, title="Log") == {"title": "Log"}
+
+    def test_other_required_fields_are_seeded_as_null(self) -> None:
+        """The gate tests presence, not value, and the server knows no value."""
+        policy = ReservedFrontmatterPolicy(required_fields=("title", "type"))
+        assert policy.build(None, title="guides") == {"title": "guides", "type": None}
+
+    def test_existing_values_win_over_seeded_ones(self) -> None:
+        """A hand-authored title survives regeneration untouched."""
+        policy = ReservedFrontmatterPolicy(required_fields=("title",))
+        assert policy.build({"title": "Change history"}, title="Log") == {
+            "title": "Change history"
+        }
+
+    def test_root_declaration_survives_alongside_a_seeded_field(self) -> None:
+        policy = ReservedFrontmatterPolicy(required_fields=("title",))
+        assert policy.build({"okf_version": "0.2"}, title="Index") == {
+            "okf_version": "0.2",
+            "title": "Index",
+        }
+
+    def test_okf_version_is_never_synthesized(self) -> None:
+        """A folder index carrying ``okf_version`` audits as ``misplaced``.
+
+        Only the bundle root may declare it, so seeding it would trade the
+        missing-frontmatter defect for a conformance one.
+        """
+        policy = ReservedFrontmatterPolicy(required_fields=("title",))
+        assert "okf_version" not in policy.build(None, title="guides")
+
+    def test_custom_title_field_is_honoured(self) -> None:
+        """The seeded key follows the vault's configured ``title_field``."""
+        policy = ReservedFrontmatterPolicy(
+            title_field="heading", required_fields=("heading",)
+        )
+        assert policy.build(None, title="Log") == {"heading": "Log"}
