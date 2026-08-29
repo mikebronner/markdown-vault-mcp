@@ -171,6 +171,7 @@ def to_vault_kwargs(config: ProjectConfig) -> dict[str, Any]:
         "max_attachment_size_mb": config.content.max_attachment_size_mb,
         "max_note_read_bytes": config.content.max_note_read_bytes,
         "git_pull_interval_s": 0,
+        "default_search_mode": config.search.default_mode,
         "chunks_per_file": config.search.chunks_per_file,
         "snippet_words": config.search.snippet_words,
         "length_downweight_alpha": config.search.length_downweight_alpha,
