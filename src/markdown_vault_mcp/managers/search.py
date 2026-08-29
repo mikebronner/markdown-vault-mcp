@@ -186,7 +186,7 @@ class SearchManager:
         chunks_per_file: int = 2,
         snippet_words: int = 200,
         length_downweight_alpha: float = 0.25,
-        default_mode: str = "keyword",
+        default_mode: str = "auto",
         folder_weights: dict[str, float] | None = None,
         embed_text_format: str = "v1",
     ) -> None:
@@ -255,11 +255,15 @@ class SearchManager:
     ) -> Literal["keyword", "semantic", "hybrid"]:
         """Resolve a caller's *mode* against the configured default.
 
-        ``None`` means "no preference": the configured ``default_mode``
-        applies, and if that default needs embeddings this vault has not
-        configured, it degrades to ``"keyword"`` rather than raising — so
-        enabling a semantic default cannot make an unconfigured vault
-        unsearchable.
+        ``None`` means "no preference", so the configured ``default_mode``
+        applies. The shipped default, ``"auto"``, picks ``"hybrid"`` when
+        this vault has embeddings and ``"keyword"`` when it does not: a
+        vault that paid to build a vector index should search it without
+        every caller having to ask.
+
+        A pinned ``"semantic"``/``"hybrid"`` default degrades the same way
+        as ``"auto"`` when embeddings are absent, rather than raising — so
+        no configured default can make an unconfigured vault unsearchable.
 
         An explicit mode is honoured verbatim, including when it cannot be
         served. Silently downgrading a caller who asked for semantic search
@@ -280,6 +284,8 @@ class SearchManager:
                 "search: default mode %r needs embeddings; using keyword", default
             )
             return "keyword"
+        if default == "auto":
+            return "hybrid"
         return cast('Literal["keyword", "semantic", "hybrid"]', default)
 
     def _require_vectors(self) -> None:

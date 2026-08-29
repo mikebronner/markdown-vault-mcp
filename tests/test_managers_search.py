@@ -1792,17 +1792,64 @@ def _mgr(vault_dir: Path, *, default_mode: str) -> SearchManager:
 class TestDefaultModeResolution:
     """mode=None resolves from config; explicit modes keep their contract."""
 
-    def test_shipped_default_is_keyword(self, search_mgr: SearchManager) -> None:
-        """The shipped default is an exact no-op — behaviour is unchanged."""
-        assert search_mgr._default_mode == "keyword"
-        assert search_mgr._resolve_mode(None) == "keyword"
+    def test_shipped_default_is_auto(self, search_mgr: SearchManager) -> None:
+        """The shipped default defers the choice to the vault's capabilities."""
+        assert search_mgr._default_mode == "auto"
 
-    def test_operator_hybrid_default_degrades_without_embeddings(
+    def test_auto_picks_keyword_without_embeddings(
+        self, search_mgr: SearchManager
+    ) -> None:
+        """A vault with no vector index still searches, via keyword."""
+        assert search_mgr._resolve_mode(None) == "keyword"
+        results = search_mgr.search("alpha")
+        assert "alpha.md" in [r.path for r in results]
+        assert all(r.search_type == "keyword" for r in results)
+
+    def test_auto_picks_hybrid_with_embeddings(
+        self, search_mgr_with_embeddings: SearchManager
+    ) -> None:
+        """A vault that built a vector index searches it without being asked.
+
+        This is the whole point of the auto default: the operator paid for
+        embeddings, so an unqualified search should use them.
+        """
+        mgr = search_mgr_with_embeddings
+        assert mgr._default_mode == "auto"
+        assert mgr._resolve_mode(None) == "hybrid"
+
+        implicit = [r.path for r in mgr.search("alpha")]
+        explicit_hybrid = [r.path for r in mgr.search("alpha", mode="hybrid")]
+        explicit_keyword = [r.path for r in mgr.search("alpha", mode="keyword")]
+
+        assert implicit == explicit_hybrid
+        # Guard against a vacuous pass: if hybrid and keyword agree on this
+        # fixture the comparison above proves nothing, so require a
+        # difference before trusting it.
+        assert explicit_hybrid != explicit_keyword
+
+    def test_pinned_keyword_suppresses_hybrid_with_embeddings(
+        self, search_mgr_with_embeddings: SearchManager
+    ) -> None:
+        """Pinning keyword is a real escape hatch, not a no-op.
+
+        An operator on a metered embedding provider pins keyword to keep
+        unqualified searches from embedding every query. If auto won here,
+        that setting would be decorative.
+        """
+        mgr = search_mgr_with_embeddings
+        mgr._default_mode = "keyword"
+        assert mgr._resolve_mode(None) == "keyword"
+
+        implicit = [r.path for r in mgr.search("alpha")]
+        assert implicit == [r.path for r in mgr.search("alpha", mode="keyword")]
+        assert implicit != [r.path for r in mgr.search("alpha", mode="hybrid")]
+
+    def test_pinned_hybrid_degrades_without_embeddings(
         self, search_vault: Path
     ) -> None:
-        """A configured hybrid default must not break an embedding-less vault.
+        """A pinned hybrid default must not break an embedding-less vault.
 
-        Without the degrade, enabling the option on a vault that has no
+        Without the degrade, pinning the option on a vault that has no
         embeddings would raise on every unqualified search — turning a
         preference into an outage.
         """
@@ -1811,7 +1858,7 @@ class TestDefaultModeResolution:
         assert "alpha.md" in [r.path for r in results]
         assert all(r.search_type == "keyword" for r in results)
 
-    def test_operator_semantic_default_also_degrades(self, search_vault: Path) -> None:
+    def test_pinned_semantic_also_degrades(self, search_vault: Path) -> None:
         """The degrade covers semantic, not just hybrid."""
         assert _mgr(search_vault, default_mode="semantic")._resolve_mode(None) == (
             "keyword"
@@ -1843,25 +1890,3 @@ class TestDefaultModeResolution:
         """An explicit keyword request runs keyword search."""
         results = search_mgr.search("alpha", mode="keyword")
         assert "alpha.md" in [r.path for r in results]
-
-    def test_hybrid_default_is_used_when_embeddings_are_configured(
-        self, search_mgr_with_embeddings: SearchManager
-    ) -> None:
-        """With vectors present, a hybrid default actually runs hybrid.
-
-        The degrade must be conditional on vector availability, not
-        unconditional — otherwise the option would never do anything.
-        """
-        mgr = search_mgr_with_embeddings
-        mgr._default_mode = "hybrid"
-        assert mgr._resolve_mode(None) == "hybrid"
-
-        implicit = [r.path for r in mgr.search("alpha")]
-        explicit_hybrid = [r.path for r in mgr.search("alpha", mode="hybrid")]
-        explicit_keyword = [r.path for r in mgr.search("alpha", mode="keyword")]
-
-        assert implicit == explicit_hybrid
-        # Guard against a vacuous pass: if hybrid and keyword agree on this
-        # fixture the comparison above proves nothing, so require a
-        # difference before trusting it.
-        assert explicit_hybrid != explicit_keyword

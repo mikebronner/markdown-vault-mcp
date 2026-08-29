@@ -343,15 +343,19 @@ class ProjectConfig:
         },
     )
     default_search_mode: str = field(
-        default="keyword",
+        default="auto",
         metadata={
             "help": (
-                "Mode used when a search call omits 'mode': keyword, "
-                "semantic, or hybrid. The default preserves keyword-only "
-                "behaviour. A configured semantic/hybrid default degrades to "
-                "keyword when no embeddings are available, so enabling it "
-                "cannot make a vault without embeddings unsearchable; an "
-                "explicit mode= argument is never downgraded."
+                "Mode used when a search call omits 'mode': auto, keyword, "
+                "semantic, or hybrid. The default 'auto' picks hybrid when "
+                "embeddings are configured and keyword when they are not. "
+                "Pin 'keyword' to keep unqualified searches off the "
+                "embedding provider (each hybrid or semantic search embeds "
+                "the query, which costs an API call on a metered provider). "
+                "A configured semantic/hybrid default also degrades to "
+                "keyword without embeddings, so no setting can make a vault "
+                "unsearchable; an explicit mode= argument is never "
+                "downgraded."
             ),
             "tags": ("search",),
             "wizard": {"group": "Search tuning"},
@@ -1070,7 +1074,7 @@ class ProjectConfig:
                 _ENV_PREFIX, "MAX_ATTACHMENT_SIZE_MB", 1.0
             ),
             max_note_read_bytes=env_int(_ENV_PREFIX, "MAX_NOTE_READ_BYTES", 262144),
-            default_search_mode=env(_ENV_PREFIX, "DEFAULT_SEARCH_MODE") or "keyword",
+            default_search_mode=env(_ENV_PREFIX, "DEFAULT_SEARCH_MODE") or "auto",
             chunks_per_file=env_int(_ENV_PREFIX, "CHUNKS_PER_FILE", 2),
             snippet_words=env_int(_ENV_PREFIX, "SNIPPET_WORDS", 200),
             length_downweight_alpha=env_float(

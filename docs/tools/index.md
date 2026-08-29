@@ -72,7 +72,7 @@ Find documents matching a query using full-text or semantic search.
 |-----------|------|---------|-------------|
 | `query` | string | required | Natural language or keyword query string |
 | `limit` | int | `10` | Maximum results to return |
-| `mode` | string | `"keyword"` | `"keyword"` (FTS5/BM25), `"semantic"` (vector similarity), or `"hybrid"` (reciprocal rank fusion) |
+| `mode` | string | server default (`auto`) | `"keyword"` (FTS5/BM25), `"semantic"` (vector similarity), or `"hybrid"` (reciprocal rank fusion). Omit it to follow `MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE`, which ships as `auto`: hybrid where embeddings are configured, keyword where they are not. |
 | `folder` | string | `null` | Restrict to documents under this folder path |
 | `filters` | object | `null` | Filter by indexed frontmatter field values (such as `{"tags": "pacing"}`), ANDed. On an OKF bundle, `status` (`stable` also matches notes without one), `stale` (`true`/`false`), and `trust_tier` carry OKF semantics; `type` filters normally |
 | `chunks_per_file` | int | server default (`2`) | Maximum number of matching sections returned per file. Overrides `MARKDOWN_VAULT_MCP_CHUNKS_PER_FILE` for this call. `0` is rejected. |
@@ -87,10 +87,13 @@ Find documents matching a query using full-text or semantic search.
     By default, each section's `content` is a snippet of approximately 200 words centered on the query terms (not the full chunk). Pass `snippet_words=0` to receive the complete chunk. To read the full section after receiving a search result, call `read(path=result["path"], section=result["sections"][0]["heading"])`; this returns the entire section (body plus any sub-sections) reconstructed from the document.
 
 !!! tip "Choosing a search mode"
-    - Use `mode="hybrid"` when semantic search is available, combining keyword precision with semantic understanding
-    - Use `mode="keyword"` for exact term matches
+    - Omit `mode` for the best mode this vault can serve: hybrid where embeddings are configured, keyword where they are not
+    - Use `mode="keyword"` for exact term matches, FTS5 operators, or filenames
     - Use `mode="semantic"` for meaning-based similarity
+    - Use `mode="hybrid"` to force fusion regardless of the server default
     - Check `stats` to see if `semantic_search_available` is true
+
+    An explicit `mode="semantic"` or `mode="hybrid"` raises when the vault has no embeddings. The server default degrades to `keyword` instead, so an unqualified search never fails for want of a vector index. An operator who wants to keep unqualified searches off a metered embedding provider pins `MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE=keyword`.
 
     Keyword and hybrid modes accept FTS5 operators (`AND`, `OR`, `NEAR`, `"exact phrase"`, `prefix*`). A natural-language query whose terms contain characters FTS5 reserves (a hyphenated slug such as `vault-mcp`, or a colon) is matched literally rather than failing, so plain queries do not need escaping.
 

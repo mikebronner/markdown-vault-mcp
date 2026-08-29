@@ -83,10 +83,13 @@ def build_default_instructions(
         )
     )
     search_guidance = (
-        " Use 'search' (mode='hybrid' preferred when available) to find documents, "
-        "'read' for full content, 'list_documents' to enumerate, 'stats' to check "
-        "capabilities. 'browse_vault' and 'show_context' open a visual UI for the "
-        "user — do not call them to retrieve vault content; use 'search', 'read', "
+        " Use 'search' to find documents, 'read' for full content, "
+        "'list_documents' to enumerate, 'stats' to check capabilities. Omit "
+        "'mode' on 'search' and the server picks the best mode this vault can "
+        "serve — hybrid where embeddings exist, keyword otherwise; pass "
+        "mode='keyword' for exact terms, operators, or filenames. "
+        "'browse_vault' and 'show_context' open a visual UI for the user — do "
+        "not call them to retrieve vault content; use 'search', 'read', "
         "'list_documents', or 'get_context' instead."
     )
     conventions_guidance = (

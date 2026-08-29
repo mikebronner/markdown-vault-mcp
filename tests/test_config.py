@@ -1732,14 +1732,14 @@ class TestEmbeddingsConfigFromEnv:
 class TestDefaultSearchMode:
     """MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE and its validation."""
 
-    def test_defaults_to_keyword(self, monkeypatch):
-        """The shipped default is an exact no-op."""
+    def test_defaults_to_auto(self, monkeypatch):
+        """The shipped default lets the server pick per vault."""
         monkeypatch.delenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", raising=False)
-        assert ProjectConfig.from_env().search.default_mode == "keyword"
+        assert ProjectConfig.from_env().search.default_mode == "auto"
 
-    @pytest.mark.parametrize("mode", ["keyword", "semantic", "hybrid"])
+    @pytest.mark.parametrize("mode", ["auto", "keyword", "semantic", "hybrid"])
     def test_accepts_each_valid_mode(self, monkeypatch, mode):
-        """Every mode the search tool accepts is a valid default."""
+        """Every mode the search tool accepts is a valid default, plus auto."""
         monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", mode)
         assert ProjectConfig.from_env().search.default_mode == mode
 
@@ -1749,18 +1749,32 @@ class TestDefaultSearchMode:
         with pytest.raises(ConfigurationError, match="default_mode"):
             ProjectConfig.from_env()
 
-    def test_empty_value_falls_back_to_keyword(self, monkeypatch):
+    def test_empty_value_falls_back_to_auto(self, monkeypatch):
         """An exported-but-empty var is treated as unset, not as invalid."""
         monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", "")
-        assert ProjectConfig.from_env().search.default_mode == "keyword"
+        assert ProjectConfig.from_env().search.default_mode == "auto"
+
+    def test_dataclass_default_is_auto_without_env(self):
+        """A directly-constructed config gets auto too, not just from_env.
+
+        ProjectConfig and SearchConfig are importable library surface; a
+        consumer who builds one in code must land on the same default an
+        operator gets from the environment.
+        """
+        from markdown_vault_mcp.config_sections import SearchConfig
+
+        assert SearchConfig().default_mode == "auto"
+        assert ProjectConfig(source_dir=Path("/tmp/vault")).search.default_mode == (
+            "auto"
+        )
 
     def test_reaches_the_vault_kwargs(self, monkeypatch):
         """The value is threaded through to Vault, not just parsed."""
         from markdown_vault_mcp.config_sections._assembly import to_vault_kwargs
 
-        monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", "hybrid")
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_DEFAULT_SEARCH_MODE", "keyword")
         assert to_vault_kwargs(ProjectConfig.from_env())["default_search_mode"] == (
-            "hybrid"
+            "keyword"
         )
 
 
