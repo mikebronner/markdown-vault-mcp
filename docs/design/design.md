@@ -2458,6 +2458,16 @@ untouched. `GitWriteStrategy.__call__` consumes the Principal's
 `display_name`/`email` as the commit `--author` (committer stays the static
 identity); the `git/` package imports nothing from `fastmcp` (guard-tested),
 so non-MCP drivers supply a `Principal` instead of faking request context.
+
+`resolve_mcp_principal()` is the **only** place the subject rules live
+(#1231) — `human:<subject>`, and the `"local"` sentinel counting as no human
+identity. `_okf_write.py` used to re-derive them in a fallback branch that
+read `get_subject()` itself; it now resolves a `Principal` instead, so the
+rules cannot drift between two copies. The dead `resolve_write_actor()` went
+with that branch: since #1160 the write tools stamp
+`principal.okf_actor(...)` directly. Registering the claim keys likewise
+moved out of the git-strategy builder into `to_vault_instances`, so
+configuring identity is not the git builder's job.
 Background paths without an acting person — the pull-loop conflict commits,
 the webhook, the transfer-route uploads — carry no Principal and use the
 static identity / tool actor, as before.
@@ -2529,6 +2539,12 @@ Uses the schema defined in [Database Schema](#database-schema). Note that
 with RRF scoring in hybrid mode; each file appears once with up to
 `chunks_per_file` matching sections).
 
+`FTSIndex` satisfies the `KeywordIndex` and `GraphStore` protocols
+(`interfaces.py`, #1230) structurally — it does not inherit from them. The
+managers are typed against those protocols rather than against this class, so
+the concrete backend is substitutable; `Vault` constructs the `FTSIndex` and
+that construction is where mypy proves the conformance.
+
 ### `vector_index.py`: Numpy Embeddings
 
 Adapted from ifcraftcorpus `embeddings.py`. Rename `EmbeddingIndex` to
@@ -2556,6 +2572,37 @@ Key methods:
   mismatch (the residue of a crash between the two independent atomic
   replaces), which the load-time self-heal routes to a `force=True`
   rebuild (#734).
+
+`VectorIndex` satisfies the `VectorStore` protocol (`interfaces.py`, #1230)
+structurally. The managers hold `VectorStore`; `_vector_loader.py` and
+`EmbeddingsManager` are the factory sites that still name `VectorIndex`
+concretely, because constructing one is exactly what they are for. `load()`
+is deliberately outside the protocol for the same reason — how a backend is
+built is not part of what consumers ask of it.
+
+### `interfaces.py`: Storage Protocols (#1230)
+
+Three concepts, four protocols, mirroring the move already
+made for `EmbeddingProvider` and applying it to the storage that provider
+feeds:
+
+- `KeywordIndex` — the relational document store, full-text search,
+  enumeration, tombstones, and the build-state bookkeeping.
+- `GraphStore` — the link graph. A distinct concept from search: it answers
+  *structure* (what links to what), not *relevance* (what matches a query).
+- `KeywordGraphIndex` — both, which is what one SQLite database serves today.
+  Consumers needing members from both facets are typed against this, so the
+  two concepts stay separable without pretending the current backend
+  separates them.
+- `VectorStore` — the semantic surface.
+
+Each protocol carries exactly what its consumers call, not everything the
+current implementation exposes; grow one when a consumer needs more. A
+protocol wider than its consumers is a god interface with extra steps.
+
+This is the seam the standing "if tens of thousands, evaluate Qdrant" risk
+note needs: substituting a backend is now a matter of satisfying a protocol
+rather than editing six manager constructors.
 
 ### `providers.py`: Embedding Providers
 
@@ -3447,6 +3494,34 @@ locks were introduced — so the documented lock-ordering contracts of the
 pull/write paths (`_force_pull_rebase_fallback` requires the lock held;
 `_quiesce_writes` drains before the lock is taken) are unchanged.
 
+**Facet protocols (`git/interfaces.py`, #1229)**: the three concerns are
+also expressed as protocols, so each consumer depends on the surface it uses
+rather than on the concrete class:
+
+- `HistorySource` — `get_file_history` / `get_file_diff`. `GitQueryManager`
+  depends on this and nothing else.
+- `Syncer` — pull/push (`force_pull`, `force_push`, `sync_once`), the loop
+  lifecycle (`start`/`stop`/`flush`/`close`/`set_write_quiescer`), and the
+  repository reads the `git_sync` tool needs (`is_managed`,
+  `resolve_force_repo`, `head_sha`, `branch_name`).
+- `Versioner` — the per-write commit; structurally the same shape as
+  `PrincipalAwareWriteCallback`, restated so the module needs no runtime
+  import beyond `typing`.
+- `VersionedStore` — all three, which is what `Vault` holds.
+
+`GitWriteStrategy` remains the single object implementing all of them, and is
+still wired as both `git_strategy` and `on_write`; `Vault.close()` compares
+the two by identity to avoid closing one object twice. Splitting into three
+*objects* is deliberately not done — the collaborators share one lock, and
+that identity check depends on there being one object.
+
+The promotion of `is_managed`, `resolve_force_repo`, `head_sha`, and
+`branch_name` to the public surface replaced private-attribute reads
+(`strategy._managed`, `strategy._git(...)`) that the MCP tool layer had been
+making; the `git_sync` managed-mode gate now tests `isinstance(strategy,
+Syncer) and strategy.is_managed`, i.e. what the store can do rather than
+which class it is.
+
 For private repos, HTTPS token auth uses:
 
 - `MARKDOWN_VAULT_MCP_GIT_USERNAME` (default `x-access-token`)
@@ -3512,7 +3587,7 @@ whose restore failed instead of committing stale local content over them.
 auto-commit locally and there is no remote to reach. It gated `sync_once`
 alone, so `force_pull` ran the pipeline regardless — `git fetch origin`
 against a checkout with no `origin` (reporting the retryable-looking
-`fetch_failed`), and `CalledProcessError` out of `_head_sha` against a vault
+`fetch_failed`), and `CalledProcessError` out of `head_sha` against a vault
 that is not a git repository at all. `force_pull` now returns
 `applied=False, reason="pull_disabled"` before running any git command. The
 reason is terminal by construction: retrying cannot change it without
@@ -3794,7 +3869,7 @@ real release runs. No committed manifest bump is needed for the bundle.
 | Risk | Mitigation |
 |-|-|
 | VRAM contention (Ollama on RTX 4060 8 GB) | `cpu_only` mode, batch embeddings |
-| Vault scale (numpy in-memory) | Fine for thousands of documents. If tens of thousands, evaluate Qdrant. |
+| Vault scale (numpy in-memory) | Fine for thousands of documents. If tens of thousands, evaluate Qdrant behind the `VectorStore` protocol (`interfaces.py`, #1230). |
 | Concurrent writes (Obsidian + MCP) | Use git as sync layer. MCP server should not write directly to live Obsidian vault without git in between. |
 | FastMCP breaking changes | Pin `>=3.0,<4`. Monitor for 4.0 migration. |
 | `Vault` API doesn't fit ifcraftcorpus | Validate in Phase 1 before building MCP server. |

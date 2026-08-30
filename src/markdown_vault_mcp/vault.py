@@ -53,13 +53,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-    from markdown_vault_mcp.git import GitWriteStrategy, PullResult
+    from markdown_vault_mcp.git import PullResult, VersionedStore
+    from markdown_vault_mcp.interfaces import VectorStore
     from markdown_vault_mcp.providers import EmbeddingProvider
     from markdown_vault_mcp.summarizer import Summarizer
     from markdown_vault_mcp.types import (
         WriteCallback,
     )
-    from markdown_vault_mcp.vector_index import VectorIndex
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +334,7 @@ class Vault:
         required_frontmatter: list[str] | None = None,
         chunk_strategy: str | ChunkStrategy = "heading",
         on_write: WriteCallback | None = None,
-        git_strategy: GitWriteStrategy | None = None,
+        git_strategy: VersionedStore | None = None,
         git_pull_interval_s: int = 0,
         exclude_patterns: list[str] | None = None,
         attachment_extensions: list[str] | None = None,
@@ -896,8 +896,9 @@ class Vault:
     def force_pull(self) -> PullResult | None:
         """Pull from the git remote synchronously.
 
-        Thin public facade over :meth:`GitWriteStrategy.force_pull` used by
-        the GitHub webhook handler so the strategy stays an implementation detail.
+        Thin public facade over :meth:`~markdown_vault_mcp.git.Syncer.force_pull`
+        used by the GitHub webhook handler so the store stays an implementation
+        detail.
 
         The strategy self-quiesces around its own merge: it pauses new writes
         (via the :meth:`pause_writes` callable wired in :meth:`__init__` through
@@ -968,12 +969,12 @@ class Vault:
         self._coordinator.require_built()
 
     @property
-    def _vectors(self) -> VectorIndex | None:
+    def _vectors(self) -> VectorStore | None:
         """Bridge property: vector index is owned by SearchManager."""
         return self._search_mgr.vectors
 
     @_vectors.setter
-    def _vectors(self, value: VectorIndex | None) -> None:
+    def _vectors(self, value: VectorStore | None) -> None:
         self._search_mgr.vectors = value
 
     # ------------------------------------------------------------------

@@ -46,6 +46,7 @@ src/markdown_vault_mcp/
   git/
     __init__.py        -- package facade preserving the historical single-module import surface (incl. test patch targets)
     _run.py            -- low-level git subprocess + credential plumbing
+    interfaces.py      -- HistorySource/Syncer/Versioner/VersionedStore: the versioning seam; GitWriteStrategy is the one implementation (#1229)
     strategy.py        -- GitWriteStrategy: auto-commit per write; composes RepoBootstrap + PushScheduler over one shared lock (#893)
     bootstrap.py       -- RepoBootstrap: managed-clone bootstrap, remote-protocol validation, memoised git-root discovery (#893)
     push_scheduler.py  -- PushScheduler: deferred-push timer + pending-flag mechanics and push execution (#893)
@@ -53,6 +54,7 @@ src/markdown_vault_mcp/
     query.py           -- read-only git history/diff queries; lock-free pure functions
     types.py           -- PullResult/PushResult + pull/push reason-code constants
   scanner.py           -- file discovery, frontmatter parsing, chunking
+  interfaces.py        -- KeywordIndex/GraphStore/KeywordGraphIndex/VectorStore: the search/index storage seam (#1230)
   fts_index.py         -- SQLite FTS5 schema, BM25 search
   _fts_connection.py   -- per-thread sqlite connection registry + SQLITE_LOCKED retry (#760)
   vector_index.py      -- numpy embeddings, cosine similarity
@@ -67,7 +69,7 @@ src/markdown_vault_mcp/
   okf_bundle.py        -- OKF bundle-zip export from live vault state, served via an okf-bundle download ref (#963)
   _okf_convention.py   -- OKF reserved-file maintenance after enforced writes: log.md bullet + index.md refresh (#964)
   _okf_write.py        -- OKF enforced-write runtime: contextvar actor + provenance stamp / verified clear (#964)
-  _identity.py         -- Principal write identity: tool-edge resolution, contextvar carry, claim-key registration (#1160)
+  _identity.py         -- Principal write identity: tool-edge resolution, contextvar carry, claim-key registration (#1160); sole owner of the subject rules (#1231)
   summarizer.py        -- Summarizer ABC + OpenAI-compatible chat-completions backend (#915)
   vault.py             -- thin composition root: settings-first dual-mode construction (#1158), lifecycle, wiring, facet accessors (index-write → indexing/coordinator.py)
   write_callback.py    -- WriteCallbackDispatcher: deferred git-commit callback worker (#599)
