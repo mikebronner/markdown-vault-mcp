@@ -6122,3 +6122,329 @@ class TestRenameCommitEndToEnd:
             " M bystander.md",
             "?? .markdown_vault_mcp/",
         }
+
+
+# ---------------------------------------------------------------------------
+# gitignored renames (#1238)
+# ---------------------------------------------------------------------------
+
+
+class TestRenameStagingSkipsIgnoredPaths:
+    """A gitignored file's move is a no-op for git, not a failed ``git add``.
+
+    Since #1238 ``move_folder`` reports *every* moved file to the write
+    callback, not just the ones on the attachment allowlist. That is what
+    lets git learn about a moved ``.bin`` or ``.txt``; it also means the
+    vault's own ignored clutter (``.DS_Store``, ``.obsidian/``) now reaches
+    the staging helper. ``git add -A`` exits non-zero on an explicitly named
+    ignored pathspec, so without filtering each such file would raise
+    ``CalledProcessError`` and log a git error on every folder move.
+    """
+
+    @staticmethod
+    def _seed(repo: Path) -> None:
+        """Commit a note plus a ``.gitignore`` excluding ``.DS_Store``."""
+        import subprocess
+
+        (repo / ".gitignore").write_text(".DS_Store\ncache/\n", encoding="utf-8")
+        (repo / "note.md").write_text("# Note\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "."], capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "seed"],
+            capture_output=True,
+            check=True,
+        )
+
+    def test_moving_an_ignored_file_does_not_raise(self, git_repo: Path) -> None:
+        """Both sides ignored: nothing to stage, and no error."""
+        from markdown_vault_mcp.git import _stage_and_commit
+
+        self._seed(git_repo)
+        head_before = _head(git_repo)
+
+        old_abs = git_repo / "a" / ".DS_Store"
+        new_abs = git_repo / "b" / ".DS_Store"
+        old_abs.parent.mkdir()
+        new_abs.parent.mkdir()
+        new_abs.write_bytes(b"junk")
+
+        _stage_and_commit(git_repo, new_abs, "rename", old_path=old_abs)
+
+        # Nothing was staged, so nothing was committed and the ignored file
+        # stays invisible to git rather than being force-added.
+        assert _head(git_repo) == head_before
+        assert _worktree_status(git_repo) == set()
+
+    def test_ignored_destination_still_records_the_deletion(
+        self, git_repo: Path
+    ) -> None:
+        """A tracked file moved *into* an ignored folder is deleted, not added.
+
+        Only the ignored half drops out of the pathspec; the old path's
+        disappearance is still recorded, so git does not keep serving content
+        the vault no longer has there.
+        """
+        from markdown_vault_mcp.git import _stage_and_commit
+
+        self._seed(git_repo)
+
+        old_abs = git_repo / "note.md"
+        new_abs = git_repo / "cache" / "note.md"
+        new_abs.parent.mkdir()
+        old_abs.rename(new_abs)
+
+        _stage_and_commit(git_repo, new_abs, "rename", old_path=old_abs)
+
+        assert _commit_files(git_repo) == {"note.md"}
+        assert _worktree_status(git_repo) == set()
+
+    @staticmethod
+    def _commit_legacy(repo: Path) -> Path:
+        """Force-commit ``cache/legacy.md``, tracked despite ``cache/`` being ignored.
+
+        The awkward case ``check-ignore --no-index`` exists for: a file
+        committed before its directory was excluded stays tracked, yet
+        ``git add -A`` still refuses to name it. The default, index-aware
+        ``check-ignore`` would call it "not ignored" and let it through.
+        """
+        import subprocess
+
+        legacy = repo / "cache" / "legacy.md"
+        legacy.parent.mkdir()
+        legacy.write_text("# Legacy\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "-f", "--", str(legacy)],
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "legacy"],
+            capture_output=True,
+            check=True,
+        )
+        return legacy
+
+    def test_tracked_file_moved_within_an_ignored_directory_records_the_deletion(
+        self, git_repo: Path
+    ) -> None:
+        """The destination is unstageable, but the departure is still real.
+
+        Dropping the old path because an exclude rule covers it would leave
+        git serving content the vault no longer has there. ``git add -u``
+        records the deletion: it acts on tracked files only, so the exclude
+        rules never apply to it.
+        """
+        from markdown_vault_mcp.git import _stage_and_commit
+
+        self._seed(git_repo)
+        legacy = self._commit_legacy(git_repo)
+        head_before = _head(git_repo)
+
+        moved = git_repo / "cache" / "moved.md"
+        legacy.rename(moved)
+
+        _stage_and_commit(git_repo, moved, "rename", old_path=legacy)
+
+        assert _head(git_repo) != head_before
+        assert _commit_files(git_repo) == {"cache/legacy.md"}
+        # The old path is gone from the index; the new one is ignored, so it
+        # stays out of the repository rather than being force-added.
+        assert "cache/legacy.md" not in _tracked_files(git_repo)
+        assert "cache/moved.md" not in _tracked_files(git_repo)
+
+    def test_tracked_file_moved_out_of_an_ignored_directory_stages_both_sides(
+        self, git_repo: Path
+    ) -> None:
+        """Codex P2: the deletion must not be dropped with the ignored old path.
+
+        Filtering the old path out of the ``add -A`` pathspec staged the
+        arrival at the new path while silently leaving the departure
+        unstaged, so the commit added a file without removing the one it
+        replaced.
+        """
+        from markdown_vault_mcp.git import _stage_and_commit
+
+        self._seed(git_repo)
+        legacy = self._commit_legacy(git_repo)
+
+        moved = git_repo / "kept.md"
+        legacy.rename(moved)
+
+        _stage_and_commit(git_repo, moved, "rename", old_path=legacy)
+
+        assert _commit_files(git_repo) == {"cache/legacy.md", "kept.md"}
+        assert _worktree_status(git_repo) == set()
+
+    def test_a_noop_rename_does_not_commit_unrelated_staged_work(
+        self, git_repo: Path
+    ) -> None:
+        """Codex P1: skipping the ``git add`` must skip the commit too.
+
+        The diff check in ``_stage_and_commit`` is repository-wide. With
+        nothing staged for this operation, it saw the operator's own staged
+        work and committed it under the rename's message — the exact class of
+        leak #894 exists to prevent, through a new door.
+        """
+        import subprocess
+
+        from markdown_vault_mcp.git import _stage_and_commit
+
+        self._seed(git_repo)
+
+        # The operator stages something of their own, deliberately uncommitted.
+        (git_repo / "note.md").write_text("# Staged by the operator\n", "utf-8")
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "--", str(git_repo / "note.md")],
+            capture_output=True,
+            check=True,
+        )
+        head_before = _head(git_repo)
+
+        old_abs = git_repo / "a" / ".DS_Store"
+        new_abs = git_repo / "b" / ".DS_Store"
+        old_abs.parent.mkdir()
+        new_abs.parent.mkdir()
+        new_abs.write_bytes(b"junk")
+
+        _stage_and_commit(git_repo, new_abs, "rename", old_path=old_abs)
+
+        assert _head(git_repo) == head_before
+        # Still staged, still theirs to commit when they choose.
+        assert _worktree_status(git_repo) == {"M  note.md"}
+
+
+def _head(repo: Path) -> str:
+    """Return the repository's current HEAD sha."""
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout.strip()
+
+
+class TestMoveFolderCommitsEveryFile:
+    """``move_folder`` end-to-end over a real git-backed vault (#1238)."""
+
+    @staticmethod
+    def _vault_repo(tmp_path: Path) -> Path:
+        """A git repo whose ``src/`` folder holds a note and three artifacts."""
+        import subprocess
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        for cmd in (
+            ["git", "-C", str(vault), "init"],
+            ["git", "-C", str(vault), "config", "user.email", "t@t.com"],
+            ["git", "-C", str(vault), "config", "user.name", "T"],
+        ):
+            subprocess.run(cmd, capture_output=True, check=True)
+        (vault / ".gitignore").write_text(".DS_Store\n", encoding="utf-8")
+        src = vault / "src"
+        src.mkdir()
+        (src / "note.md").write_text("# Note\n", encoding="utf-8")
+        (src / "photo.png").write_bytes(b"\x89PNG\r\n")
+        # Not on the attachment allowlist, so before #1238 it moved without a
+        # callback and git was never told.
+        (src / "data.bin").write_bytes(b"\x00\x01")
+        (src / ".DS_Store").write_bytes(b"junk")
+        subprocess.run(
+            ["git", "-C", str(vault), "add", "."], capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(vault), "commit", "-m", "seed"],
+            capture_output=True,
+            check=True,
+        )
+        return vault
+
+    def test_every_moved_file_lands_in_a_commit(self, tmp_path: Path) -> None:
+        """After the move, git tracks the files at their new paths only.
+
+        The regression #1238 fixes: a non-allowlisted file was moved on disk
+        but never staged, leaving the repository with an unstaged delete and
+        an untracked add that no later commit would pick up.
+        """
+        from markdown_vault_mcp.git.strategy import GitWriteStrategy
+        from markdown_vault_mcp.vault import Vault
+
+        vault = self._vault_repo(tmp_path)
+        strategy = GitWriteStrategy(
+            token=None,
+            repo_url=None,
+            managed=False,
+            enable_pull=False,
+            enable_push=False,
+            repo_path=vault,
+        )
+        col = Vault(
+            source_dir=vault,
+            git_strategy=strategy,
+            on_write=strategy,
+            read_only=False,
+        )
+        try:
+            col.index.build_index()
+            col.writer.move_folder("src", "dst")
+            col._write_callback.drain()
+        finally:
+            col.close()
+
+        tracked = _tracked_files(vault)
+        assert "dst/note.md" in tracked
+        assert "dst/photo.png" in tracked
+        assert "dst/data.bin" in tracked
+        assert not any(name.startswith("src/") for name in tracked)
+        # The ignored file moved on disk but stayed out of the repository,
+        # and staging it never errored.
+        assert (vault / "dst" / ".DS_Store").exists()
+        assert ".DS_Store" not in " ".join(tracked)
+
+    def test_the_move_leaves_no_unstaged_remnant(self, tmp_path: Path) -> None:
+        """Nothing from the moved folder is left dirty or untracked."""
+        from markdown_vault_mcp.git.strategy import GitWriteStrategy
+        from markdown_vault_mcp.vault import Vault
+
+        vault = self._vault_repo(tmp_path)
+        strategy = GitWriteStrategy(
+            token=None,
+            repo_url=None,
+            managed=False,
+            enable_pull=False,
+            enable_push=False,
+            repo_path=vault,
+        )
+        col = Vault(
+            source_dir=vault,
+            git_strategy=strategy,
+            on_write=strategy,
+            read_only=False,
+        )
+        try:
+            col.index.build_index()
+            col.writer.move_folder("src", "dst")
+            col._write_callback.drain()
+        finally:
+            col.close()
+
+        # Only the index state directory the Vault created remains, which was
+        # never the server's to commit.
+        assert _worktree_status(vault) == {"?? .markdown_vault_mcp/"}
+
+
+def _tracked_files(repo: Path) -> set[str]:
+    """Return every path in the repository index."""
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "-C", str(repo), "ls-files"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {line for line in out.stdout.splitlines() if line.strip()}

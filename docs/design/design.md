@@ -2350,6 +2350,16 @@ can leave the subtree partially moved with the index unchanged; a subsequent
 allowlisted attachments, and any other files). Only `.md` files are
 re-indexed; non-markdown files are moved on disk without index updates.
 
+Every moved file also gets a `rename` write callback, whether or not its
+extension is allowlisted (#1238). Those two rules are independent, and
+conflating them was a bug: the allowlist governs which files the *tools*
+expose, not what the repository tracks. Git staging is scoped to the paths a
+callback names, so a file moved without one leaves an unstaged delete at the
+old path and an untracked add at the new one, and is never committed —
+silently, since the file does arrive where the caller asked. Skipping the
+move instead is not an option: the source tree is removed afterwards, so an
+unmoved file would be destroyed.
+
 *Link rewrite*: after all files are moved, a single pass over the vault
 rewrites every outbound link (markdown links and wikilinks) whose target falls
 under the old prefix. This covers links between documents inside the moved
@@ -2427,6 +2437,29 @@ path is covered, and an explicit pathspec so nothing else in the working tree
 is. An old path git does not track is dropped from the pathspec rather than
 passed — `git add` fails the whole invocation on a pathspec matching nothing,
 which would leave the new path unstaged too.
+
+A **gitignored** path is dropped for the same reason (#1238): `git add` exits
+non-zero on an explicitly named ignored pathspec, and once `move_folder`
+started reporting every moved file, the vault's own ignored clutter
+(`.DS_Store`, `.obsidian/`) began arriving here. Force-adding it instead was
+never on the table — that would commit a file the operator deliberately
+excluded — so an ignored path is skipped, and when both sides are ignored the
+`git add` is skipped entirely rather than run with an empty pathspec, which
+would sweep in the whole repository. The probe is
+`git check-ignore --no-index`: the default, index-aware answer calls a tracked
+file "not ignored", but `git add` still refuses to name a tracked file living
+under an ignored directory, so only `--no-index` predicts the rule the filter
+exists to satisfy.
+
+Two consequences of that filter are load-bearing. A **tracked** path an exclude
+rule covers is still staged, with `git add -u` rather than `-A`: its deletion is
+real, dropping it would leave git serving content the vault no longer has there,
+and `-u` acts on tracked files only, so the exclude rules never apply to it.
+And when the filter leaves nothing at all to stage, `_stage_rename` reports that
+to its caller, which skips the commit rather than falling through — the
+`git diff --cached --quiet` check below it is repository-wide, so an operator's
+own staged work would otherwise be committed under the rename's message and
+pushed, the very leak this section exists to prevent.
 
 **Write identity: the `Principal` value (#1160, fixes #1218).** "Who is
 acting" is resolved **once, at the MCP tool edge**, into a frozen
