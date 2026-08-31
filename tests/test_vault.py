@@ -2031,7 +2031,7 @@ class TestAtomicWrites:
         self, writable: Vault, vault_path: Path
     ) -> None:
         """A freshly written document lands at 0o666 & ~umask, not tempfile's 0o600."""
-        from markdown_vault_mcp.managers import document as doc
+        from markdown_vault_mcp.managers import _write_kernel as doc
 
         old = os.umask(0o027)
         doc._umask = None  # force a re-read of the umask we just set
@@ -2049,7 +2049,7 @@ class TestAtomicWrites:
         self, writable: Vault, vault_path: Path
     ) -> None:
         """A freshly written attachment lands at 0o666 & ~umask, not 0o600."""
-        from markdown_vault_mcp.managers import document as doc
+        from markdown_vault_mcp.managers import _write_kernel as doc
 
         old = os.umask(0o027)
         doc._umask = None
@@ -2065,7 +2065,7 @@ class TestAtomicWrites:
 
     def test_process_umask_caches_across_calls(self) -> None:
         """_process_umask caches: repeat calls return the same value."""
-        from markdown_vault_mcp.managers import document as doc
+        from markdown_vault_mcp.managers import _write_kernel as doc
 
         doc._umask = None
         try:
@@ -2100,29 +2100,6 @@ class TestAtomicWrites:
 
 
 class TestAttachmentHelpers:
-    def test_is_attachment_pdf(self, vault_path: Path) -> None:
-        """_is_attachment() returns True for a .pdf path with default allowlist."""
-        col = Vault(source_dir=vault_path)
-        assert col._doc_mgr._is_attachment("assets/report.pdf") is True
-
-    def test_is_attachment_md_always_false(self, vault_path: Path) -> None:
-        """_is_attachment() always returns False for .md paths."""
-        col = Vault(source_dir=vault_path)
-        assert col._doc_mgr._is_attachment("notes/note.md") is False
-
-    def test_is_attachment_disallowed_extension(self, vault_path: Path) -> None:
-        """_is_attachment() returns False for extensions not in the default list."""
-        col = Vault(source_dir=vault_path)
-        # .xyz is not in the default list
-        assert col._doc_mgr._is_attachment("file.xyz") is False
-
-    def test_is_attachment_wildcard_allows_all(self, vault_path: Path) -> None:
-        """_is_attachment() returns True for any non-.md extension when '*' is set."""
-        col = Vault(source_dir=vault_path, attachment_extensions=["*"])
-        assert col._doc_mgr._is_attachment("file.xyz") is True
-        assert col._doc_mgr._is_attachment("file.bin") is True
-        assert col._doc_mgr._is_attachment("notes/note.md") is False
-
     def test_validate_attachment_path_rejects_md(self, vault_path: Path) -> None:
         """_validate_attachment_path() raises ValueError for .md paths."""
         col = Vault(source_dir=vault_path)
