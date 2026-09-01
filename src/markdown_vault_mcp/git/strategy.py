@@ -24,11 +24,16 @@ import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
     from pathlib import Path
 
     from markdown_vault_mcp._identity import Principal
-    from markdown_vault_mcp.types import CommitDiff, HistoryEntry, WriteOperation
+    from markdown_vault_mcp.types import (
+        CommitDiff,
+        HistoryEntry,
+        WriteBatchItem,
+        WriteOperation,
+    )
 
 from markdown_vault_mcp.git import conflict, query
 from markdown_vault_mcp.git._run import (
@@ -280,6 +285,74 @@ class GitWriteStrategy:
     #: request-context read that is always empty on the dispatcher thread
     #: (#1218). See :data:`~markdown_vault_mcp.types.ACCEPTS_PRINCIPAL_ATTR`.
     accepts_principal: bool = True
+
+    #: Opt into the dispatcher's batched dispatch (#1264), so every write from
+    #: one tool call lands in a single commit named after that tool instead of
+    #: one commit per file. See
+    #: :data:`~markdown_vault_mcp.types.ACCEPTS_BATCH_ATTR`.
+    accepts_batch: bool = True
+
+    def on_write_batch(
+        self,
+        items: Sequence[WriteBatchItem],
+        tool_name: str,
+    ) -> None:
+        """Commit every write from one tool call as a single commit.
+
+        Mirrors :meth:`__call__`'s guards and push scheduling; only the commit
+        boundary differs. The author identity is taken from the first item's
+        principal — one tool call has one acting principal, so the items cannot
+        legitimately disagree.
+
+        Args:
+            items: The tool call's writes, in the order they were fired.
+            tool_name: The MCP tool that produced them.
+        """
+        if self._closed or not items:
+            return
+
+        first_path = items[0][0]
+        self._ensure_git_root(first_path)
+        if self._git_root is None:
+            logger.debug(
+                "No git repository found for %s; git operations disabled", first_path
+            )
+            return
+
+        self._ensure_write_init()
+        if self._git_root is None:
+            return
+
+        principal = items[0][4]
+        principal_name = principal.display_name if principal is not None else None
+        principal_email = principal.email if principal is not None else None
+        effective_name = principal_name or self._commit_name
+        effective_email = principal_email or self._commit_email
+
+        try:
+            with self._lock:
+                _stage_and_commit_batch(
+                    self._git_root,
+                    items,
+                    tool_name,
+                    commit_name=self._commit_name,
+                    commit_email=self._commit_email,
+                    author_name=effective_name
+                    if effective_name != self._commit_name
+                    else None,
+                    author_email=effective_email
+                    if effective_email != self._commit_email
+                    else None,
+                )
+            if self._enable_push:
+                self._push_scheduler.schedule_push()
+        except subprocess.CalledProcessError as exc:
+            logger.error(
+                "git_batch_failed tool=%s files=%s: %s",
+                tool_name,
+                len(items),
+                self._redact(exc.stderr or ""),
+            )
 
     def __call__(
         self,
@@ -1666,6 +1739,50 @@ def _stage_rename(root: str, path: Path, old_path: Path | None) -> bool:
     return bool(deletions or pathspec)
 
 
+def _stage_one(
+    root: str,
+    path: Path,
+    operation: WriteOperation,
+    old_path: Path | None,
+) -> bool:
+    """Stage one write's paths, scoped to what that operation touched.
+
+    Extracted so the single-write and batched commit paths stage identically;
+    duplicating the three branches would let them drift.
+
+    Args:
+        root: Git repository root, as a string for ``git -C``.
+        path: Absolute path the operation landed on; the *new* path on a rename.
+        operation: The kind of write that occurred.
+        old_path: For a rename, the absolute path the file moved from.
+
+    Returns:
+        ``False`` when a rename had nothing stageable, so the caller can bail
+        out rather than committing whatever else happened to be staged.
+        ``True`` otherwise.
+    """
+    if operation == "delete":
+        # File already removed from disk; stage the deletion.
+        subprocess.run(
+            ["git", "-C", root, "add", "-u", "--", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    elif operation == "rename":
+        if not _stage_rename(root, path, old_path):
+            logger.debug("git_stage_rename_noop path=%s", path)
+            return False
+    else:
+        subprocess.run(
+            ["git", "-C", root, "add", "--", str(path)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    return True
+
+
 def _stage_and_commit(
     git_root: Path,
     path: Path,
@@ -1702,30 +1819,12 @@ def _stage_and_commit(
     """
     root = str(git_root)
 
-    # Stage the change.
-    if operation == "delete":
-        # File already removed from disk; stage the deletion.
-        subprocess.run(
-            ["git", "-C", root, "add", "-u", "--", str(path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    elif operation == "rename":
-        if not _stage_rename(root, path, old_path):
-            # Nothing this operation touched is stageable. Returning here
-            # rather than falling through matters: the diff check below is
-            # repository-wide, so an operator's unrelated staged work would
-            # otherwise be committed under this rename's message and pushed.
-            logger.debug("git_stage_rename_noop path=%s", path)
-            return
-    else:
-        subprocess.run(
-            ["git", "-C", root, "add", "--", str(path)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+    if not _stage_one(root, path, operation, old_path):
+        # Nothing this operation touched is stageable. Returning here
+        # rather than falling through matters: the diff check below is
+        # repository-wide, so an operator's unrelated staged work would
+        # otherwise be committed under this rename's message and pushed.
+        return
 
     # Generate commit message from operation and relative path.
     try:
@@ -1744,8 +1843,103 @@ def _stage_and_commit(
         )
         return
 
-    commit_msg = f"{operation}: {rel_path}"
+    _commit_staged(
+        root,
+        f"{operation}: {rel_path}",
+        commit_name=commit_name,
+        commit_email=commit_email,
+        author_name=author_name,
+        author_email=author_email,
+    )
 
+    logger.info("Git: committed %s (%s)", rel_path, operation)
+
+
+def _stage_and_commit_batch(
+    git_root: Path,
+    items: Sequence[WriteBatchItem],
+    tool_name: str,
+    *,
+    commit_name: str = GitWriteStrategy.DEFAULT_COMMIT_NAME,
+    commit_email: str = GitWriteStrategy.DEFAULT_COMMIT_EMAIL,
+    author_name: str | None = None,
+    author_email: str | None = None,
+) -> None:
+    """Stage every write from one tool call and commit them together.
+
+    Staging is per item, using the same scoped rules as a single write, so a
+    batch never widens what gets swept in: a delete still stages only its own
+    path, and a rename still stages exactly its two. Only the commit is shared.
+
+    Args:
+        git_root: Git repository root.
+        items: The tool call's writes, in the order they were fired.
+        tool_name: MCP tool that produced them, used as the commit subject.
+        commit_name: Git committer name (overrides git config).
+        commit_email: Git committer email (overrides git config).
+        author_name: Git author name override.
+        author_email: Git author email override.
+    """
+    root = str(git_root)
+    staged = 0
+    for path, _content, operation, old_path, _principal in items:
+        try:
+            if _stage_one(root, path, operation, old_path):
+                staged += 1
+        except subprocess.CalledProcessError:
+            # One unstageable path must not cost the rest of the batch its
+            # commit — the files are already written to disk either way.
+            logger.error(
+                "git_stage_failed path=%s op=%s", path, operation, exc_info=True
+            )
+    if staged == 0:
+        logger.debug("git_batch_nothing_staged tool=%s count=%s", tool_name, len(items))
+        return
+
+    # Skip commit if staging produced no diff (e.g. rewriting identical bytes).
+    check_result = subprocess.run(
+        ["git", "-C", root, "diff", "--cached", "--quiet"],
+        capture_output=True,
+    )
+    if check_result.returncode == 0:
+        logger.debug("git_batch_no_diff tool=%s", tool_name)
+        return
+
+    noun = "file" if staged == 1 else "files"
+    _commit_staged(
+        root,
+        f"{tool_name}: {staged} {noun}",
+        commit_name=commit_name,
+        commit_email=commit_email,
+        author_name=author_name,
+        author_email=author_email,
+    )
+    logger.info("git_batch_committed tool=%s files=%s", tool_name, staged)
+
+
+def _commit_staged(
+    root: str,
+    commit_msg: str,
+    *,
+    commit_name: str,
+    commit_email: str,
+    author_name: str | None,
+    author_email: str | None,
+) -> None:
+    """Commit whatever is staged, under the resolved committer/author identity.
+
+    Extracted so the single-write and batched commit paths share one copy of
+    the identity resolution; the sanitisation below is a commit-object header
+    injection guard, and two copies could drift apart silently.
+
+    Args:
+        root: Git repository root, as a string for ``git -C``.
+        commit_msg: The commit subject.
+        commit_name: Git committer name (overrides git config).
+        commit_email: Git committer email (overrides git config).
+        author_name: Git author name override, or ``None`` to use the committer.
+        author_email: Git author email override, or ``None`` for the committer.
+    """
     # Build author string when per-request identity differs from committer.
     # Sanitize both sides of the comparison so a commit_name that itself
     # contains stripped chars (e.g. angle brackets) doesn't trigger a
@@ -1793,5 +1987,3 @@ def _stage_and_commit(
         text=True,
         check=True,
     )
-
-    logger.info("Git: committed %s (%s)", rel_path, operation)

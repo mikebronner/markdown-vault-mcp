@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -884,6 +884,43 @@ class RenameAwareWriteCallback(Protocol):
 #: :data:`ACCEPTS_OLD_PATH_ATTR` so a third-party three-argument callback
 #: keeps working untouched.
 ACCEPTS_PRINCIPAL_ATTR = "accepts_principal"
+
+#: One buffered write, in the shape the dispatcher queues it:
+#: ``(path, content, operation, old_path, principal)``.
+WriteBatchItem = tuple[Path, str, "WriteOperation", "Path | None", "Principal | None"]
+
+#: Attribute a :data:`WriteCallback` sets to ``True`` to receive a whole tool
+#: call's writes in one invocation via ``on_write_batch``, rather than one call
+#: per file. Without it the dispatcher fires each buffered write individually,
+#: so a third-party callback keeps its existing contract — grouping is an
+#: optimisation a callback opts into, mirroring :data:`ACCEPTS_OLD_PATH_ATTR`
+#: and :data:`ACCEPTS_PRINCIPAL_ATTR`.
+ACCEPTS_BATCH_ATTR = "accepts_batch"
+
+
+class BatchAwareWriteCallback(Protocol):
+    """A :data:`WriteCallback` that can commit a whole tool call at once.
+
+    Structural type for the opt-in described at :data:`ACCEPTS_BATCH_ATTR`.
+    Implementations must remain callable per-write as well: the dispatcher
+    still dispatches individually for writes with no owning tool call.
+    """
+
+    accepts_batch: bool
+
+    def on_write_batch(
+        self,
+        items: Sequence[WriteBatchItem],
+        tool_name: str,
+    ) -> None:
+        """Handle every write fired by one tool call.
+
+        Args:
+            items: The buffered writes, in the order they were fired. Never
+                empty — the dispatcher discards empty groups.
+            tool_name: The MCP tool that produced them, for the commit subject.
+        """
+        ...
 
 
 class PrincipalAwareWriteCallback(Protocol):

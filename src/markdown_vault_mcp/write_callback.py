@@ -16,16 +16,24 @@ import queue
 import threading
 from typing import TYPE_CHECKING, cast
 
+from markdown_vault_mcp._commit_scope import current_commit_scope
 from markdown_vault_mcp._identity import current_principal
-from markdown_vault_mcp.types import ACCEPTS_OLD_PATH_ATTR, ACCEPTS_PRINCIPAL_ATTR
+from markdown_vault_mcp.types import (
+    ACCEPTS_BATCH_ATTR,
+    ACCEPTS_OLD_PATH_ATTR,
+    ACCEPTS_PRINCIPAL_ATTR,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
     from typing import Any
 
+    from markdown_vault_mcp._commit_scope import CommitScope
     from markdown_vault_mcp._identity import Principal
     from markdown_vault_mcp.types import (
+        BatchAwareWriteCallback,
         PrincipalAwareWriteCallback,
+        WriteBatchItem,
         WriteCallback,
         WriteOperation,
     )
@@ -39,12 +47,32 @@ class _DrainMarker:
     Unlike the ``None`` close-sentinel, the worker does NOT exit on this: it
     sets ``event`` and continues. FIFO ordering guarantees every real item
     enqueued before the marker has been processed when the worker reaches it.
+
+    Reaching this marker also flushes every still-open commit scope. A scope
+    normally closes when its tool call returns, but ``drain`` runs before a git
+    pull specifically so queued commits land before the merge touches the
+    working tree — leaving a buffered group uncommitted would let the pull
+    merge over writes that are on disk but not yet in a commit.
     """
 
     __slots__ = ("event",)
 
     def __init__(self) -> None:
         self.event = threading.Event()
+
+
+class _ScopeEnd:
+    """Queue sentinel closing one commit scope, flushing its buffered writes.
+
+    Enqueued by :class:`~markdown_vault_mcp._commit_scope.CommitScopeMiddleware`
+    when a tool call returns. FIFO ordering guarantees every write that call
+    fired precedes this marker, so no wait or handshake is needed.
+    """
+
+    __slots__ = ("token",)
+
+    def __init__(self, token: int) -> None:
+        self.token = token
 
 
 class WriteCallbackDispatcher:
@@ -73,11 +101,26 @@ class WriteCallbackDispatcher:
         # the write path.
         self._accepts_old_path = bool(getattr(on_write, ACCEPTS_OLD_PATH_ATTR, False))
         self._accepts_principal = bool(getattr(on_write, ACCEPTS_PRINCIPAL_ATTR, False))
+        # A callback that cannot take a batch still gets every write, one call
+        # at a time — grouping is an optimisation the callback opts into, never
+        # a contract change third-party callbacks must absorb.
+        self._accepts_batch = bool(getattr(on_write, ACCEPTS_BATCH_ATTR, False))
         self._queue: queue.Queue[
-            tuple[Path, str, WriteOperation, Path | None, Principal | None]
+            tuple[
+                Path,
+                str,
+                WriteOperation,
+                Path | None,
+                Principal | None,
+                CommitScope | None,
+            ]
             | _DrainMarker
+            | _ScopeEnd
             | None
         ] = queue.Queue()
+        # Buffered writes per open scope token, drained by _ScopeEnd (or by a
+        # _DrainMarker, which must not report success over uncommitted work).
+        self._open_scopes: dict[int, tuple[CommitScope, list[WriteBatchItem]]] = {}
         self._worker: threading.Thread | None = None
         # Guards every read/write of ``_worker`` and ``_closed`` AND the
         # ``_queue.put`` of a real item, so ``fire`` is atomic with respect to
@@ -121,6 +164,12 @@ class WriteCallbackDispatcher:
         if self._on_write is None:
             return
         principal = current_principal()
+        # Snapshotted here for the same reason as the principal above: ``fire``
+        # runs on the request's ``to_thread`` worker, whose copied context
+        # carries the variable, while the dispatcher's own thread has no request
+        # context at all. Reading the scope on the worker would always see None
+        # and silently reinstate per-file commits.
+        scope = current_commit_scope()
         with self._worker_lock:
             if self._closed:
                 logger.warning(
@@ -132,7 +181,99 @@ class WriteCallbackDispatcher:
             self._ensure_worker_locked()
             # Enqueue under the lock so close() cannot slip the sentinel in
             # ahead of this item (which would leave it permanently undrained).
-            self._queue.put((abs_path, content, operation, old_path, principal))
+            self._queue.put((abs_path, content, operation, old_path, principal, scope))
+
+    def end_scope(self, scope: CommitScope) -> None:
+        """Close *scope*, committing everything fired under it as one group.
+
+        A no-op when no callback is configured, after :meth:`close`, or when
+        the worker was never started — in each case there is nothing buffered
+        to flush. Never blocks: the marker is enqueued and the worker flushes
+        it in FIFO order, behind every write the scope fired.
+
+        Args:
+            scope: The scope to close, as returned by
+                :func:`~markdown_vault_mcp._commit_scope.bound_commit_scope`.
+        """
+        if self._on_write is None:
+            return
+        with self._worker_lock:
+            if self._closed or self._worker is None:
+                return
+            self._queue.put(_ScopeEnd(scope.token))
+
+    def _flush_scope(self, token: int) -> None:
+        """Dispatch one buffered scope's writes, then forget it.
+
+        Silent when the token has no buffer: a tool that wrote nothing still
+        closes its scope, and a drain may already have flushed it.
+        """
+        entry = self._open_scopes.pop(token, None)
+        if entry is None:
+            return
+        scope, items = entry
+        if not items:
+            return
+        on_write = self._on_write
+        assert on_write is not None
+        try:
+            if self._accepts_batch:
+                batch = cast("BatchAwareWriteCallback", on_write)
+                batch.on_write_batch(items, scope.tool_name)
+            else:
+                # No batch support: preserve the previous contract exactly
+                # rather than dropping writes a third-party callback expects.
+                for item in items:
+                    self._dispatch_one(*item)
+        except Exception:
+            logger.error(
+                "write_callback_batch_failed tool=%s count=%s",
+                scope.tool_name,
+                len(items),
+                exc_info=True,
+            )
+
+    def _flush_all_scopes(self) -> None:
+        """Flush every open scope, newest last.
+
+        Called when a drain marker is reached: ``drain`` is what a git pull
+        waits on before merging, so returning with writes still buffered would
+        let the merge run over changes no commit contains.
+        """
+        for token in list(self._open_scopes):
+            self._flush_scope(token)
+
+    def _dispatch_one(
+        self,
+        abs_path: Path,
+        content: str,
+        operation: WriteOperation,
+        old_path: Path | None,
+        principal: Principal | None,
+    ) -> None:
+        """Invoke the callback for a single write with its opted-in keywords."""
+        on_write = self._on_write
+        assert on_write is not None
+        try:
+            # Build the opted-in keywords flat so the four
+            # (old_path, principal) combinations stay one call site.
+            extra: dict[str, Any] = {}
+            if old_path is not None and self._accepts_old_path:
+                extra["old_path"] = old_path
+            if principal is not None and self._accepts_principal:
+                extra["principal"] = principal
+            if extra:
+                aware = cast("PrincipalAwareWriteCallback", on_write)
+                aware(abs_path, content, operation, **extra)
+            else:
+                on_write(abs_path, content, operation)
+        except Exception:
+            logger.error(
+                "Write callback failed for %s (%s)",
+                abs_path,
+                operation,
+                exc_info=True,
+            )
 
     def _ensure_worker_locked(self) -> None:
         """Start the background worker if it is not running.
@@ -157,31 +298,27 @@ class WriteCallbackDispatcher:
             while True:
                 item = self._queue.get()
                 if item is None:
+                    # Closing: flush what is buffered rather than discarding
+                    # writes that are already on disk.
+                    self._flush_all_scopes()
                     break
                 if isinstance(item, _DrainMarker):
+                    self._flush_all_scopes()
                     item.event.set()
                     continue
-                abs_path, content, operation, old_path, principal = item
-                try:
-                    # Build the opted-in keywords flat so the four
-                    # (old_path, principal) combinations stay one call site.
-                    extra: dict[str, Any] = {}
-                    if old_path is not None and self._accepts_old_path:
-                        extra["old_path"] = old_path
-                    if principal is not None and self._accepts_principal:
-                        extra["principal"] = principal
-                    if extra:
-                        aware = cast("PrincipalAwareWriteCallback", on_write)
-                        aware(abs_path, content, operation, **extra)
-                    else:
-                        on_write(abs_path, content, operation)
-                except Exception:
-                    logger.error(
-                        "Write callback failed for %s (%s)",
-                        abs_path,
-                        operation,
-                        exc_info=True,
+                if isinstance(item, _ScopeEnd):
+                    self._flush_scope(item.token)
+                    continue
+                abs_path, content, operation, old_path, principal, scope = item
+                if scope is None:
+                    # No owning tool call — a background or startup write.
+                    # Commits on its own, exactly as before.
+                    self._dispatch_one(
+                        abs_path, content, operation, old_path, principal
                     )
+                    continue
+                _, items = self._open_scopes.setdefault(scope.token, (scope, []))
+                items.append((abs_path, content, operation, old_path, principal))
         except BaseException:
             # A BaseException (SystemExit/KeyboardInterrupt/MemoryError) kills the
             # worker thread. Log it so drain()/close() are not the only signal —
