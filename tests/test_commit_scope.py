@@ -379,3 +379,277 @@ class TestCommitModeKnob:
 
         with pytest.raises(ConfigurationError, match="commit_mode must be one of"):
             GitConfig(commit_mode="per-request")
+
+
+def _repo(tmp_path: Path) -> Path:
+    """A git repo holding one committed note."""
+    import subprocess
+
+    repo = tmp_path / "vault"
+    repo.mkdir()
+    for cmd in (
+        ["git", "-C", str(repo), "init"],
+        ["git", "-C", str(repo), "config", "user.email", "t@t.com"],
+        ["git", "-C", str(repo), "config", "user.name", "T"],
+        ["git", "-C", str(repo), "config", "commit.gpgsign", "false"],
+    ):
+        subprocess.run(cmd, capture_output=True, check=True)
+    (repo / "note.md").write_text("# Note\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-A"], capture_output=True, check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "seed"],
+        capture_output=True,
+        check=True,
+    )
+    return repo
+
+
+def _subjects(repo: Path) -> list[str]:
+    """Commit subjects, newest first."""
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "-C", str(repo), "log", "--format=%s"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout.splitlines()
+
+
+def _files_in_head(repo: Path) -> set[str]:
+    import subprocess
+
+    out = subprocess.run(
+        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {line for line in out.stdout.splitlines() if line}
+
+
+class TestBatchCommitsForReal:
+    """End-to-end against a real repo: the dispatcher plus GitWriteStrategy.
+
+    The dispatcher tests above use a recorder, so they never exercise the code
+    that actually stages and commits. These do.
+    """
+
+    @staticmethod
+    def _strategy(repo: Path):
+        from markdown_vault_mcp.git.strategy import GitWriteStrategy
+
+        return GitWriteStrategy(
+            token=None,
+            repo_url=None,
+            managed=False,
+            enable_pull=False,
+            enable_push=False,
+            commit_mode="tool-call",
+            repo_path=repo,
+        )
+
+    def test_one_tool_call_makes_one_commit(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        dispatcher = WriteCallbackDispatcher(strategy)
+        before = len(_subjects(repo))
+
+        with bound_commit_scope("okf_convert_links") as scope:
+            for i in range(4):
+                target = repo / f"n{i}.md"
+                target.write_text(f"# {i}\n", encoding="utf-8")
+                dispatcher.fire(target, f"# {i}\n", "write")
+            dispatcher.end_scope(scope)
+        dispatcher.close()
+        strategy.close()
+
+        subjects = _subjects(repo)
+        assert len(subjects) == before + 1, subjects
+        assert subjects[0] == "okf_convert_links: 4 files"
+        assert _files_in_head(repo) == {f"n{i}.md" for i in range(4)}
+
+    def test_per_write_mode_still_commits_each_file(self, tmp_path: Path) -> None:
+        from markdown_vault_mcp.git.strategy import GitWriteStrategy
+
+        repo = _repo(tmp_path)
+        strategy = GitWriteStrategy(
+            token=None,
+            repo_url=None,
+            managed=False,
+            enable_pull=False,
+            enable_push=False,
+            repo_path=repo,
+        )
+        dispatcher = WriteCallbackDispatcher(strategy)
+        before = len(_subjects(repo))
+
+        with bound_commit_scope("okf_convert_links") as scope:
+            for i in range(3):
+                target = repo / f"n{i}.md"
+                target.write_text(f"# {i}\n", encoding="utf-8")
+                dispatcher.fire(target, f"# {i}\n", "write")
+            dispatcher.end_scope(scope)
+        dispatcher.close()
+        strategy.close()
+
+        assert len(_subjects(repo)) == before + 3
+
+    def test_a_single_file_commit_reads_naturally(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        dispatcher = WriteCallbackDispatcher(strategy)
+
+        with bound_commit_scope("write") as scope:
+            target = repo / "one.md"
+            target.write_text("# One\n", encoding="utf-8")
+            dispatcher.fire(target, "# One\n", "write")
+            dispatcher.end_scope(scope)
+        dispatcher.close()
+        strategy.close()
+
+        assert _subjects(repo)[0] == "write: 1 file"
+
+    def test_a_batch_of_identical_content_commits_nothing(self, tmp_path: Path) -> None:
+        """Rewriting the same bytes stages no diff, so there is nothing to commit."""
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        dispatcher = WriteCallbackDispatcher(strategy)
+        before = len(_subjects(repo))
+
+        with bound_commit_scope("okf_convert_links") as scope:
+            dispatcher.fire(repo / "note.md", "# Note\n", "write")
+            dispatcher.end_scope(scope)
+        dispatcher.close()
+        strategy.close()
+
+        assert len(_subjects(repo)) == before
+
+    def test_a_delete_in_a_batch_stages_its_own_removal(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        dispatcher = WriteCallbackDispatcher(strategy)
+
+        with bound_commit_scope("delete") as scope:
+            (repo / "note.md").unlink()
+            dispatcher.fire(repo / "note.md", "", "delete")
+            dispatcher.end_scope(scope)
+        dispatcher.close()
+        strategy.close()
+
+        assert _subjects(repo)[0] == "delete: 1 file"
+        assert _files_in_head(repo) == {"note.md"}
+
+    def test_an_unstageable_path_does_not_cost_the_batch_its_commit(
+        self, tmp_path: Path
+    ) -> None:
+        """One bad path is logged; the files that did land still get committed."""
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        dispatcher = WriteCallbackDispatcher(strategy)
+
+        with bound_commit_scope("okf_convert_links") as scope:
+            good = repo / "good.md"
+            good.write_text("# Good\n", encoding="utf-8")
+            dispatcher.fire(good, "# Good\n", "write")
+            # Never created on disk: `git add` exits non-zero on it.
+            dispatcher.fire(repo / "ghost.md", "", "write")
+            dispatcher.end_scope(scope)
+        dispatcher.close()
+        strategy.close()
+
+        assert _subjects(repo)[0] == "okf_convert_links: 1 file"
+        assert _files_in_head(repo) == {"good.md"}
+
+    def test_a_closed_strategy_ignores_a_batch(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        before = len(_subjects(repo))
+        strategy.close()
+
+        (repo / "after.md").write_text("# After\n", encoding="utf-8")
+        strategy.on_write_batch(
+            [(repo / "after.md", "# After\n", "write", None, None)], "write"
+        )
+
+        assert len(_subjects(repo)) == before
+
+    def test_an_empty_batch_is_a_noop(self, tmp_path: Path) -> None:
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        before = len(_subjects(repo))
+
+        strategy.on_write_batch([], "write")
+        strategy.close()
+
+        assert len(_subjects(repo)) == before
+
+    def test_a_path_outside_any_repo_is_logged_not_raised(self, tmp_path: Path) -> None:
+        """No git repository above the path: git is simply disabled."""
+        from markdown_vault_mcp.git.strategy import GitWriteStrategy
+
+        outside = tmp_path / "not-a-repo"
+        outside.mkdir()
+        note = outside / "n.md"
+        note.write_text("# N\n", encoding="utf-8")
+        strategy = GitWriteStrategy(
+            token=None,
+            repo_url=None,
+            managed=False,
+            enable_pull=False,
+            enable_push=False,
+            commit_mode="tool-call",
+            repo_path=outside,
+        )
+
+        # Must not raise.
+        strategy.on_write_batch([(note, "# N\n", "write", None, None)], "write")
+        strategy.close()
+
+    def test_a_failing_commit_is_logged_not_raised(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """A CalledProcessError from the commit must not escape into the tool."""
+        import logging
+        import subprocess
+
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        note = repo / "x.md"
+        note.write_text("# X\n", encoding="utf-8")
+
+        real_run = subprocess.run
+
+        def _explode(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and "commit" in cmd:
+                raise subprocess.CalledProcessError(1, cmd, stderr="boom")
+            return real_run(cmd, *args, **kwargs)
+
+        with (
+            mock.patch("markdown_vault_mcp.git.strategy.subprocess.run", _explode),
+            caplog.at_level(logging.ERROR),
+        ):
+            strategy.on_write_batch([(note, "# X\n", "write", None, None)], "write")
+        strategy.close()
+
+        assert any("git_batch_failed" in r.message for r in caplog.records)
+
+    def test_a_batch_where_nothing_stages_commits_nothing(self, tmp_path: Path) -> None:
+        """Every path unstageable: no commit, and no crash."""
+        repo = _repo(tmp_path)
+        strategy = self._strategy(repo)
+        before = len(_subjects(repo))
+
+        strategy.on_write_batch(
+            [
+                (repo / "ghost-a.md", "", "write", None, None),
+                (repo / "ghost-b.md", "", "write", None, None),
+            ],
+            "okf_convert_links",
+        )
+        strategy.close()
+
+        assert len(_subjects(repo)) == before
