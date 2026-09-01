@@ -212,10 +212,9 @@ class WriteCallbackDispatcher:
         if entry is None:
             return
         scope, items = entry
-        if not items:
-            return
         on_write = self._on_write
-        assert on_write is not None
+        if not items or on_write is None:
+            return
         try:
             if self._accepts_batch:
                 batch = cast("BatchAwareWriteCallback", on_write)
@@ -253,7 +252,8 @@ class WriteCallbackDispatcher:
     ) -> None:
         """Invoke the callback for a single write with its opted-in keywords."""
         on_write = self._on_write
-        assert on_write is not None
+        if on_write is None:
+            return
         try:
             # Build the opted-in keywords flat so the four
             # (old_path, principal) combinations stay one call site.

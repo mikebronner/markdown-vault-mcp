@@ -21,6 +21,7 @@ import logging
 import re
 import subprocess
 import threading
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -335,14 +336,14 @@ class GitWriteStrategy:
                     self._git_root,
                     items,
                     tool_name,
-                    commit_name=self._commit_name,
-                    commit_email=self._commit_email,
-                    author_name=effective_name
-                    if effective_name != self._commit_name
-                    else None,
-                    author_email=effective_email
-                    if effective_email != self._commit_email
-                    else None,
+                    _CommitIdentity(
+                        self._commit_name,
+                        self._commit_email,
+                        effective_name if effective_name != self._commit_name else None,
+                        effective_email
+                        if effective_email != self._commit_email
+                        else None,
+                    ),
                 )
             if self._enable_push:
                 self._push_scheduler.schedule_push()
@@ -1846,24 +1847,38 @@ def _stage_and_commit(
     _commit_staged(
         root,
         f"{operation}: {rel_path}",
-        commit_name=commit_name,
-        commit_email=commit_email,
-        author_name=author_name,
-        author_email=author_email,
+        _CommitIdentity(commit_name, commit_email, author_name, author_email),
     )
 
     logger.info("Git: committed %s (%s)", rel_path, operation)
+
+
+@dataclass(frozen=True, slots=True)
+class _CommitIdentity:
+    """Committer and author identity for one commit.
+
+    Grouped into an object because the four fields travel together through
+    every commit path, and passing them individually puts both helpers past
+    the five-parameter ceiling.
+
+    Attributes:
+        commit_name: Git committer name (overrides git config).
+        commit_email: Git committer email (overrides git config).
+        author_name: Git author name override, or ``None`` for the committer.
+        author_email: Git author email override, or ``None`` for the committer.
+    """
+
+    commit_name: str
+    commit_email: str
+    author_name: str | None = None
+    author_email: str | None = None
 
 
 def _stage_and_commit_batch(
     git_root: Path,
     items: Sequence[WriteBatchItem],
     tool_name: str,
-    *,
-    commit_name: str = GitWriteStrategy.DEFAULT_COMMIT_NAME,
-    commit_email: str = GitWriteStrategy.DEFAULT_COMMIT_EMAIL,
-    author_name: str | None = None,
-    author_email: str | None = None,
+    identity: _CommitIdentity,
 ) -> None:
     """Stage every write from one tool call and commit them together.
 
@@ -1875,10 +1890,7 @@ def _stage_and_commit_batch(
         git_root: Git repository root.
         items: The tool call's writes, in the order they were fired.
         tool_name: MCP tool that produced them, used as the commit subject.
-        commit_name: Git committer name (overrides git config).
-        commit_email: Git committer email (overrides git config).
-        author_name: Git author name override.
-        author_email: Git author email override.
+        identity: Committer and author identity for the commit.
     """
     root = str(git_root)
     staged = 0
@@ -1906,25 +1918,14 @@ def _stage_and_commit_batch(
         return
 
     noun = "file" if staged == 1 else "files"
-    _commit_staged(
-        root,
-        f"{tool_name}: {staged} {noun}",
-        commit_name=commit_name,
-        commit_email=commit_email,
-        author_name=author_name,
-        author_email=author_email,
-    )
+    _commit_staged(root, f"{tool_name}: {staged} {noun}", identity)
     logger.info("git_batch_committed tool=%s files=%s", tool_name, staged)
 
 
 def _commit_staged(
     root: str,
     commit_msg: str,
-    *,
-    commit_name: str,
-    commit_email: str,
-    author_name: str | None,
-    author_email: str | None,
+    identity: _CommitIdentity,
 ) -> None:
     """Commit whatever is staged, under the resolved committer/author identity.
 
@@ -1935,11 +1936,12 @@ def _commit_staged(
     Args:
         root: Git repository root, as a string for ``git -C``.
         commit_msg: The commit subject.
-        commit_name: Git committer name (overrides git config).
-        commit_email: Git committer email (overrides git config).
-        author_name: Git author name override, or ``None`` to use the committer.
-        author_email: Git author email override, or ``None`` for the committer.
+        identity: Committer and author identity for the commit.
     """
+    commit_name = identity.commit_name
+    commit_email = identity.commit_email
+    author_name = identity.author_name
+    author_email = identity.author_email
     # Build author string when per-request identity differs from committer.
     # Sanitize both sides of the comparison so a commit_name that itself
     # contains stripped chars (e.g. angle brackets) doesn't trigger a
