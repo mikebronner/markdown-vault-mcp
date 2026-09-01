@@ -151,6 +151,7 @@ class GitWriteStrategy:
         commit_name_claim: str | None = None,
         commit_email_claim: str | None = None,
         git_lfs: bool = True,
+        commit_mode: str = "write",
         repo_path: Path | None = None,
     ) -> None:
         # Token is retained for GIT_ASKPASS credential forwarding in subprocesses.
@@ -167,6 +168,10 @@ class GitWriteStrategy:
         self._commit_name_claim = commit_name_claim
         self._commit_email_claim = commit_email_claim
         self._git_lfs = git_lfs
+        # accepts_batch is read once by the dispatcher at construction, so the
+        # mode has to be an instance attribute shadowing the class default
+        # rather than a check inside on_write_batch (#1264).
+        self.accepts_batch = commit_mode == "tool-call"
         # Retain the configured repo_path so methods invoked after construction
         # (e.g. force_pull / force_push) can reach the working tree without
         # the caller re-passing it.  Distinct from ``_pull_repo_path`` which
@@ -294,9 +299,11 @@ class GitWriteStrategy:
 
     #: Opt into the dispatcher's batched dispatch (#1264), so every write from
     #: one tool call lands in a single commit named after that tool instead of
-    #: one commit per file. See
+    #: one commit per file. Set per instance from ``commit_mode``; the class
+    #: default is ``False`` because #54 designed the new mode as opt-in with
+    #: per-write commits remaining the default. See
     #: :data:`~markdown_vault_mcp.types.ACCEPTS_BATCH_ATTR`.
-    accepts_batch: bool = True
+    accepts_batch: bool = False
 
     def on_write_batch(
         self,

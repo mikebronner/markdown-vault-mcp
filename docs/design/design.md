@@ -3610,14 +3610,21 @@ Three git modes:
 Backward compatibility: `GIT_TOKEN` without `GIT_REPO_URL` keeps previous
 pull+push behavior against the existing checkout but logs a deprecation warning.
 
-In managed/legacy push-enabled modes, `GitWriteStrategy` commits per **tool
-call** and defers push to a background timer
+In managed/legacy push-enabled modes, `GitWriteStrategy` commits per write —
+or per **tool call** when `MARKDOWN_VAULT_MCP_GIT_COMMIT_MODE=tool-call` — and
+defers push to a background timer
 (`MARKDOWN_VAULT_MCP_GIT_PUSH_DELAY_S`, default 30 s). After the idle period
 elapses with no writes, all accumulated local commits are pushed in a single
 `git push`. On shutdown, `Vault.close()` flushes any pending push.
 
-**Commit scoping (#1264)**: the commit boundary is the MCP tool call, not the
-file. `CommitScopeMiddleware` (`_commit_scope.py`) binds a `CommitScope` —
+**Commit scoping (#1264)**: `MARKDOWN_VAULT_MCP_GIT_COMMIT_MODE` selects the
+commit boundary. `write` (the default) commits each file as it is written;
+`tool-call` makes the boundary the MCP tool call. Per-write stays the default
+because #54 designed the two to coexist with the new mode opt-in, and only the
+knob it specified was ever missing.
+
+Under `tool-call`, `CommitScopeMiddleware` (`_commit_scope.py`) binds a
+`CommitScope` —
 a process-unique token plus the tool name — for the duration of each
 `on_call_tool`, and `WriteCallbackDispatcher.fire` snapshots it into the queue
 item. The worker buffers writes by token and dispatches each group once, via

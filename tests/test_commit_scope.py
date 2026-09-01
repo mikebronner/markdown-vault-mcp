@@ -341,3 +341,41 @@ class TestMiddleware:
             side_effect=RuntimeError("Vault not initialised"),
         ):
             assert await self._run(middleware, context, seen) == "ok"
+
+
+class TestCommitModeKnob:
+    """The mode is opt-in: #54 designed per-write commits to stay the default."""
+
+    def test_default_strategy_does_not_batch(self) -> None:
+        from markdown_vault_mcp.git.strategy import GitWriteStrategy
+
+        strategy = GitWriteStrategy(token=None, enable_pull=False, enable_push=False)
+        assert strategy.accepts_batch is False
+
+    def test_tool_call_mode_enables_batching(self) -> None:
+        from markdown_vault_mcp.git.strategy import GitWriteStrategy
+
+        strategy = GitWriteStrategy(
+            token=None,
+            enable_pull=False,
+            enable_push=False,
+            commit_mode="tool-call",
+        )
+        assert strategy.accepts_batch is True
+
+    def test_git_config_defaults_to_per_write(self) -> None:
+        from markdown_vault_mcp.config_sections.git import GitConfig
+
+        assert GitConfig().commit_mode == "write"
+
+    def test_git_config_accepts_tool_call(self) -> None:
+        from markdown_vault_mcp.config_sections.git import GitConfig
+
+        assert GitConfig(commit_mode="tool-call").commit_mode == "tool-call"
+
+    def test_an_unknown_mode_is_rejected(self) -> None:
+        from markdown_vault_mcp.config_sections.git import GitConfig
+        from markdown_vault_mcp.exceptions import ConfigurationError
+
+        with pytest.raises(ConfigurationError, match="commit_mode must be one of"):
+            GitConfig(commit_mode="per-request")

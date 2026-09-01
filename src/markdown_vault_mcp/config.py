@@ -102,9 +102,10 @@ class ProjectConfig:
         metadata={
             "help": (
                 "Set to true to refuse a write that would overwrite an "
-                "existing file when no if_match etag is supplied. Deliberate "
-                "replacement (read first, pass if_match) still works, and "
-                "edit / append / delete / rename are unaffected."
+                "existing file when no if_match etag is supplied. "
+                "Deliberate replacement still works: read the file first, "
+                "then pass if_match. Unaffected: edit, append, delete, "
+                "rename."
             ),
             "tags": ("vault", "readme"),
         },
@@ -293,14 +294,15 @@ class ProjectConfig:
             "help": (
                 "How the okf_verify tool attributes a human review. This "
                 "applies only when OKF_WRITE is on, which gates the tool. With "
-                "elicit (the default), okf_verify asks the human to confirm the "
-                "review through an MCP elicitation and records the attestation "
-                "only on an affirmative reply. It fails closed when the client "
-                "cannot elicit or the human declines, so a model that holds the "
-                "human's token cannot self-attest. Use trust-auth to attribute "
-                "to the authenticated caller with no confirmation (safe only "
-                "when the sole caller is a human-driven UI), or off to hide the "
-                "tool so attestation happens through external tooling. A "
+                "elicit (the default), okf_verify asks the human to confirm "
+                "the review through an MCP elicitation, then records the "
+                "attestation only on an affirmative reply. It fails closed "
+                "when the client cannot elicit or the human declines, so a "
+                "model holding the human's token cannot self-attest. Set "
+                "trust-auth instead to attribute to the authenticated caller "
+                "with no confirmation, which is safe only when the sole "
+                "caller is a human-driven UI. Set off to hide the tool, "
+                "leaving attestation to external tooling. A "
                 "non-default value with OKF_WRITE off is a config error."
             ),
             "tags": ("content",),
@@ -613,6 +615,18 @@ class ProjectConfig:
             "wizard": {"group": "Git sync"},
         },
     )
+    git_commit_mode: str = field(
+        default="write",
+        metadata={
+            "help": (
+                "When a commit is made: 'write' commits each file as it is "
+                "written; 'tool-call' groups every write from one MCP tool "
+                "call into a single commit named after that tool."
+            ),
+            "tags": ("git",),
+            "wizard": {"group": "Git sync"},
+        },
+    )
     git_pull_interval_s: int = field(
         default=600,
         metadata={
@@ -872,6 +886,7 @@ class ProjectConfig:
             commit_email_claim=self.git_commit_email_claim,
             lfs=self.git_lfs,
             pull_interval_s=self.git_pull_interval_s,
+            commit_mode=self.git_commit_mode,
         )
 
     @property
@@ -1123,6 +1138,7 @@ class ProjectConfig:
                 env(_ENV_PREFIX, "GIT_REPO_URL"), _git_token, _ENV_PREFIX
             ),
             git_username=env(_ENV_PREFIX, "GIT_USERNAME") or "x-access-token",
+            git_commit_mode=env(_ENV_PREFIX, "GIT_COMMIT_MODE") or "write",
             git_pull_interval_s=env_int(_ENV_PREFIX, "GIT_PULL_INTERVAL_S", 600),
             git_push_delay_s=env_float(_ENV_PREFIX, "GIT_PUSH_DELAY_S", 30.0),
             git_commit_name=env(_ENV_PREFIX, "GIT_COMMIT_NAME") or "markdown-vault-mcp",

@@ -145,6 +145,7 @@ def _build_git_strategy(
         commit_name_claim=git.commit_name_claim,
         commit_email_claim=git.commit_email_claim,
         git_lfs=git.lfs,
+        commit_mode=git.commit_mode,
         repo_path=config.source_dir,
     )
 
