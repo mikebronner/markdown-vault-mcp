@@ -7,6 +7,13 @@ in :mod:`markdown_vault_mcp.indexing`.
 A single daemon worker thread drains a FIFO queue, invoking the configured
 ``on_write`` callback (typically a git commit) off the write path, so write
 methods return as soon as the FTS update lands.
+
+Writes fired inside a :class:`~markdown_vault_mcp._commit_scope.CommitScope`
+are buffered by scope token and dispatched together when that scope closes
+(#1264), so one tool call yields one commit rather than one per file. A write
+with no scope, and a callback that has not opted into
+:data:`~markdown_vault_mcp.types.ACCEPTS_BATCH_ATTR`, both keep the original
+one-call-per-write behaviour.
 """
 
 from __future__ import annotations

@@ -313,6 +313,23 @@ class TestMiddleware:
         assert await self._run(middleware, context, seen) == "ok"
 
     @pytest.mark.asyncio
+    async def test_an_unexpected_close_failure_does_not_destroy_the_result(
+        self,
+    ) -> None:
+        """Bookkeeping runs in a ``finally``; anything it raises replaces the
+        tool's result. Only RuntimeError/AttributeError were caught at first,
+        so a ValueError from get_vault destroyed a successful call."""
+        middleware = CommitScopeMiddleware()
+        context = _FakeMiddlewareContext("write", object())
+        seen: list[CommitScope | None] = []
+
+        with mock.patch(
+            "markdown_vault_mcp.domain.get_vault",
+            side_effect=ValueError("something unexpected"),
+        ):
+            assert await self._run(middleware, context, seen) == "ok"
+
+    @pytest.mark.asyncio
     async def test_a_vault_that_is_not_up_does_not_fail_the_tool_call(self) -> None:
         """Tool listing before startup must not raise out of the middleware."""
         middleware = CommitScopeMiddleware()

@@ -145,12 +145,18 @@ class CommitScopeMiddleware(Middleware):
             from markdown_vault_mcp.domain import get_vault
 
             get_vault(fastmcp_context).end_commit_scope(scope)
-        except (RuntimeError, AttributeError):
-            # No lifespan (import-surface tests, tool listing before startup)
-            # or a vault without a dispatcher. Neither is worth failing a tool
-            # call over: the writes simply commit per-file, as they did before.
-            logger.debug(
-                "commit_scope_close_skipped tool=%s token=%s",
+        except Exception:
+            # Deliberately broad, and deliberately swallowed. This runs in the
+            # ``finally`` of on_call_tool, so ANY exception escaping here
+            # replaces the tool's return value — or masks the tool's own
+            # exception — with a failure in commit bookkeeping. The known cases
+            # are a missing lifespan (RuntimeError) and a vault without a
+            # dispatcher (AttributeError), but catching only those let a
+            # ValueError from get_vault destroy a successful tool result.
+            # Losing the grouping degrades to per-file commits; losing the
+            # tool's result is a defect.
+            logger.warning(
+                "commit_scope_close_failed tool=%s token=%s",
                 scope.tool_name,
                 scope.token,
                 exc_info=True,

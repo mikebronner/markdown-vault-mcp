@@ -67,13 +67,18 @@ logger = logging.getLogger(__name__)
 
 
 class GitWriteStrategy:
-    """Stateful git strategy: commit per write, deferred push.
+    """Stateful git strategy: commit per tool call, deferred push.
 
     On each callback invocation:
 
     1. Stages the changed file (``git add`` or ``git add -u`` for deletes).
     2. Commits with an auto-generated message (``"operation: path"``).
     3. Resets the push timer — push fires after ``push_delay_s`` of idle.
+
+    When the dispatcher groups a tool call's writes (#1264) it calls
+    :meth:`on_write_batch` instead, which stages every path the same scoped way
+    and commits them once as ``"<tool>: N files"``. A write with no owning tool
+    call still takes the per-write path above.
 
     Push is deferred to a background ``threading.Timer`` that resets on
     each write.  When the timer fires (no writes for ``push_delay_s``),
