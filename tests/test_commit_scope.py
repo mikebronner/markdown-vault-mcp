@@ -9,6 +9,8 @@ commit contains.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -25,7 +27,7 @@ from markdown_vault_mcp._commit_scope import (
 from markdown_vault_mcp.write_callback import WriteCallbackDispatcher
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from markdown_vault_mcp.types import WriteBatchItem
 
@@ -505,6 +507,41 @@ class TestBatchCommitsForReal:
 
         assert len(_subjects(repo)) == before
 
+    def test_a_multi_file_batch_of_identical_content_commits_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """The same no-diff guard, on the batch path rather than the delegated one.
+
+        A one-item batch delegates to the single-write path and never reaches
+        the batch's own ``git diff --cached`` check, so this needs two files:
+        both stage successfully and neither changes a byte.
+        """
+        repo = _repo(tmp_path)
+        (repo / "second.md").write_text("# Second\n", encoding="utf-8")
+        import subprocess
+
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "-A"], capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-m", "second"],
+            capture_output=True,
+            check=True,
+        )
+        strategy = self._strategy(repo)
+        before = len(_subjects(repo))
+
+        strategy.on_write_batch(
+            [
+                (repo / "note.md", "write", None, None),
+                (repo / "second.md", "write", None, None),
+            ],
+            "okf_convert_links",
+        )
+        strategy.close()
+
+        assert len(_subjects(repo)) == before
+
     def test_a_delete_in_a_batch_stages_its_own_removal(self, tmp_path: Path) -> None:
         repo = _repo(tmp_path)
         strategy = self._strategy(repo)
@@ -632,5 +669,124 @@ class TestBatchCommitsForReal:
             "okf_convert_links",
         )
         strategy.close()
+
+        assert len(_subjects(repo)) == before
+
+
+class TestScopeSurvivesARealToolCall:
+    """The grouping through the real MCP path, not a hand-bound scope (#1264).
+
+    Every other test in this file binds the scope and calls ``fire`` on one
+    thread, which is the case that works trivially. The design's load-bearing
+    claim is the one those tests cannot reach: ``CommitScopeMiddleware`` binds
+    the contextvar in ``on_call_tool``, the tool body runs in
+    ``asyncio.to_thread``, and ``fire`` reads the scope back out of that
+    thread's copied context. If that chain ever breaks, the scope silently
+    reads as ``None`` and every commit goes back to being per file — the exact
+    silent-fallback shape of #1218 — with no other test noticing.
+
+    ``SOURCE_DIR`` being a git repository is enough: with no token and no
+    repo URL the assembly still builds a commit-only ``GitWriteStrategy``.
+    """
+
+    @staticmethod
+    def _vault_repo(tmp_path: Path) -> Path:
+        import subprocess
+
+        vault = tmp_path / "vault"
+        (vault / "src").mkdir(parents=True)
+        for cmd in (
+            ["git", "-C", str(vault), "init"],
+            ["git", "-C", str(vault), "config", "user.email", "t@t.com"],
+            ["git", "-C", str(vault), "config", "user.name", "T"],
+            ["git", "-C", str(vault), "config", "commit.gpgsign", "false"],
+        ):
+            subprocess.run(cmd, capture_output=True, check=True)
+        for name in ("a", "b", "c"):
+            (vault / "src" / f"{name}.md").write_text(f"# {name}\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(vault), "add", "-A"], capture_output=True, check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(vault), "commit", "-m", "seed"],
+            capture_output=True,
+            check=True,
+        )
+        return vault
+
+    @staticmethod
+    async def _drain() -> None:
+        """Wait for the queued scope-end marker to reach the git callback."""
+        from markdown_vault_mcp.domain import get_vault_singleton
+
+        vault = get_vault_singleton()
+        assert await asyncio.to_thread(vault._write_callback.drain, 30.0) is True
+
+    @pytest.fixture
+    def _git_vault_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Iterator[Path]:
+        for key in [k for k in os.environ if k.startswith("MARKDOWN_VAULT_MCP_")]:
+            monkeypatch.delenv(key, raising=False)
+        repo = self._vault_repo(tmp_path)
+        monkeypatch.setenv("MARKDOWN_VAULT_MCP_SOURCE_DIR", str(repo))
+        yield repo
+
+    async def test_a_bulk_tool_call_lands_in_one_commit(
+        self, _git_vault_env: Path
+    ) -> None:
+        """``move_folder`` moves three files and commits once, named for the tool."""
+        from fastmcp import Client
+
+        from tests.server_factory import make_server
+
+        repo = _git_vault_env
+        before = len(_subjects(repo))
+
+        server = make_server()
+        async with Client(server) as client:
+            await client.call_tool("move_folder", {"old_dir": "src", "new_dir": "dst"})
+            await self._drain()
+
+        subjects = _subjects(repo)
+        assert len(subjects) == before + 1, subjects
+        assert subjects[0] == "move_folder: 3 files"
+        assert _files_in_head(repo) == {f"dst/{n}.md" for n in ("a", "b", "c")}
+
+    async def test_a_single_file_tool_call_still_names_its_path(
+        self, _git_vault_env: Path
+    ) -> None:
+        """The common case keeps the subject it has always had."""
+        from fastmcp import Client
+
+        from tests.server_factory import make_server
+
+        repo = _git_vault_env
+        before = len(_subjects(repo))
+
+        server = make_server()
+        async with Client(server) as client:
+            await client.call_tool("write", {"path": "note.md", "content": "# Note\n"})
+            await self._drain()
+
+        subjects = _subjects(repo)
+        assert len(subjects) == before + 1, subjects
+        assert subjects[0] == "write: note.md"
+
+    async def test_a_read_only_tool_call_commits_nothing(
+        self, _git_vault_env: Path
+    ) -> None:
+        """A scope that wrote nothing closes without producing a commit."""
+        from fastmcp import Client
+
+        from tests.server_factory import make_server
+
+        repo = _git_vault_env
+        before = len(_subjects(repo))
+
+        server = make_server()
+        async with Client(server) as client:
+            await client.call_tool("list_documents", {})
+            await self._drain()
 
         assert len(_subjects(repo)) == before
