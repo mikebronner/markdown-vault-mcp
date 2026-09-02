@@ -3610,26 +3610,29 @@ Three git modes:
 Backward compatibility: `GIT_TOKEN` without `GIT_REPO_URL` keeps previous
 pull+push behavior against the existing checkout but logs a deprecation warning.
 
-In managed/legacy push-enabled modes, `GitWriteStrategy` commits per write —
-or per **tool call** when `MARKDOWN_VAULT_MCP_GIT_COMMIT_MODE=tool-call` — and
-defers push to a background timer
+In managed/legacy push-enabled modes, `GitWriteStrategy` commits per **tool
+call** and defers push to a background timer
 (`MARKDOWN_VAULT_MCP_GIT_PUSH_DELAY_S`, default 30 s). After the idle period
 elapses with no writes, all accumulated local commits are pushed in a single
 `git push`. On shutdown, `Vault.close()` flushes any pending push.
 
-**Commit scoping (#1264)**: `MARKDOWN_VAULT_MCP_GIT_COMMIT_MODE` selects the
-commit boundary. `write` (the default) commits each file as it is written;
-`tool-call` makes the boundary the MCP tool call. Per-write stays the default
-because #54 designed the two to coexist with the new mode opt-in, and only the
-knob it specified was ever missing.
+**Commit scoping (#1264)**: the commit boundary is the MCP tool call, not the
+file. One call that writes 2,595 files produces one commit, where per-file
+commits produced 2,595 and serialised every concurrent write behind them.
 
-Under `tool-call`, `CommitScopeMiddleware` (`_commit_scope.py`) binds a
-`CommitScope` —
+There is no mode knob. #54 anticipated one, but the two boundaries differ only
+where a call touches many files: a call that wrote a single file still commits
+under that file's own path (`write: notes/one.md`), so ordinary writes read in
+`git log` exactly as they did before. What remains is the bulk case, which is
+the defect #1264 reports rather than a preference to configure.
+
+`CommitScopeMiddleware` (`_commit_scope.py`) binds a `CommitScope` —
 a process-unique token plus the tool name — for the duration of each
 `on_call_tool`, and `WriteCallbackDispatcher.fire` snapshots it into the queue
 item. The worker buffers writes by token and dispatches each group once, via
 the `on_write_batch` opt-in (`ACCEPTS_BATCH_ATTR`), producing one commit
-subject of the form `<tool>: N files`.
+subject of the form `<tool>: N files` — or the single-file `<operation>: <path>`
+subject when the call staged exactly one path.
 
 Three properties this depends on:
 
@@ -3645,9 +3648,11 @@ Three properties this depends on:
   over writes that are on disk but in no commit.
 
 A write with no owning tool call — a background or startup write — still
-commits on its own, and a callback that does not set `ACCEPTS_BATCH_ATTR` still
-receives every write individually, so the previous contract is unchanged for
-third-party callbacks. Staging stays per item and scoped: a batch never widens
+commits on its own. A callback that does not set `ACCEPTS_BATCH_ATTR` is never
+buffered at all: `fire` attaches the scope only for a callback that can consume
+a batch, so a third-party callback keeps both its previous contract and its
+previous timing rather than having its writes held back for a grouping it
+cannot receive. Staging stays per item and scoped: a batch never widens
 what a delete or rename sweeps in; only the commit is shared.
 
 Startup recovery: `GitWriteStrategy` checks for unpushed local commits

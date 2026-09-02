@@ -820,14 +820,6 @@
       "advancedGroup": "Git sync"
     },
     {
-      "id": "git_commit_mode",
-      "label": "Git Commit Mode",
-      "type": "text",
-      "var": "MARKDOWN_VAULT_MCP_GIT_COMMIT_MODE",
-      "help": "When a commit is made: 'write' commits each file as it is written; 'tool-call' groups every write from one MCP tool call into a single commit named after that tool.",
-      "advancedGroup": "Git sync"
-    },
-    {
       "id": "git_pull_interval_s",
       "label": "Git Pull Interval S",
       "type": "number",

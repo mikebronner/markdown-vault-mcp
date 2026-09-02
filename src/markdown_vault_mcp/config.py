@@ -615,18 +615,6 @@ class ProjectConfig:
             "wizard": {"group": "Git sync"},
         },
     )
-    git_commit_mode: str = field(
-        default="write",
-        metadata={
-            "help": (
-                "When a commit is made: 'write' commits each file as it is "
-                "written; 'tool-call' groups every write from one MCP tool "
-                "call into a single commit named after that tool."
-            ),
-            "tags": ("git",),
-            "wizard": {"group": "Git sync"},
-        },
-    )
     git_pull_interval_s: int = field(
         default=600,
         metadata={
@@ -886,7 +874,6 @@ class ProjectConfig:
             commit_email_claim=self.git_commit_email_claim,
             lfs=self.git_lfs,
             pull_interval_s=self.git_pull_interval_s,
-            commit_mode=self.git_commit_mode,
         )
 
     @property
@@ -1138,7 +1125,6 @@ class ProjectConfig:
                 env(_ENV_PREFIX, "GIT_REPO_URL"), _git_token, _ENV_PREFIX
             ),
             git_username=env(_ENV_PREFIX, "GIT_USERNAME") or "x-access-token",
-            git_commit_mode=env(_ENV_PREFIX, "GIT_COMMIT_MODE") or "write",
             git_pull_interval_s=env_int(_ENV_PREFIX, "GIT_PULL_INTERVAL_S", 600),
             git_push_delay_s=env_float(_ENV_PREFIX, "GIT_PUSH_DELAY_S", 30.0),
             git_commit_name=env(_ENV_PREFIX, "GIT_COMMIT_NAME") or "markdown-vault-mcp",

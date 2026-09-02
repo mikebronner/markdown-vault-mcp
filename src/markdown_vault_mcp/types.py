@@ -885,15 +885,19 @@ class RenameAwareWriteCallback(Protocol):
 #: keeps working untouched.
 ACCEPTS_PRINCIPAL_ATTR = "accepts_principal"
 
-#: One buffered write, in the shape the dispatcher queues it:
-#: ``(path, content, operation, old_path, principal)``.
-WriteBatchItem = tuple[Path, str, "WriteOperation", "Path | None", "Principal | None"]
+#: One buffered write: ``(path, operation, old_path, principal)``.
+#:
+#: Deliberately narrower than the dispatcher's queue tuple, which also carries
+#: the written ``content``. Nothing on the batch path reads that content —
+#: staging reads the file from disk — so buffering it for the length of a tool
+#: call would retain every written file's text for no consumer.
+WriteBatchItem = tuple[Path, "WriteOperation", "Path | None", "Principal | None"]
 
 #: Attribute a :data:`WriteCallback` sets to ``True`` to receive a whole tool
 #: call's writes in one invocation via ``on_write_batch``, rather than one call
-#: per file. Without it the dispatcher fires each buffered write individually,
-#: so a third-party callback keeps its existing contract — grouping is an
-#: optimisation a callback opts into, mirroring :data:`ACCEPTS_OLD_PATH_ATTR`
+#: per file. A callback without it is never buffered at all: the dispatcher
+#: fires each write as it arrives, so a third-party callback keeps its existing
+#: contract and its existing timing, mirroring :data:`ACCEPTS_OLD_PATH_ATTR`
 #: and :data:`ACCEPTS_PRINCIPAL_ATTR`.
 ACCEPTS_BATCH_ATTR = "accepts_batch"
 
@@ -918,7 +922,9 @@ class BatchAwareWriteCallback(Protocol):
         Args:
             items: The buffered writes, in the order they were fired. Never
                 empty — the dispatcher discards empty groups.
-            tool_name: The MCP tool that produced them, for the commit subject.
+            tool_name: The MCP tool that produced them. An implementation is
+                free to prefer a per-file subject when *items* holds one
+                write, as the git strategy does.
         """
         ...
 

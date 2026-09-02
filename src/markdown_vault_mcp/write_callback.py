@@ -10,10 +10,18 @@ methods return as soon as the FTS update lands.
 
 Writes fired inside a :class:`~markdown_vault_mcp._commit_scope.CommitScope`
 are buffered by scope token and dispatched together when that scope closes
-(#1264), so one tool call yields one commit rather than one per file. A write
-with no scope, and a callback that has not opted into
-:data:`~markdown_vault_mcp.types.ACCEPTS_BATCH_ATTR`, both keep the original
-one-call-per-write behaviour.
+(#1264), so one tool call yields one commit rather than one per file.
+
+Buffering happens **only** for a callback that opted into
+:data:`~markdown_vault_mcp.types.ACCEPTS_BATCH_ATTR`. Without that opt-in there
+is nothing to group into, so holding the writes back would cost the delay and
+the retained state and buy nothing: such a callback is fired per write, as it
+arrives, exactly as before. A write with no owning scope — a background or
+startup write — takes the same immediate path.
+
+One tool call normally yields one commit, with one documented exception: a
+:class:`_DrainMarker` reached mid-call flushes what is buffered so far, so a
+call straddling a pull can land as two accurate commits rather than one.
 """
 
 from __future__ import annotations
@@ -176,7 +184,12 @@ class WriteCallbackDispatcher:
         # carries the variable, while the dispatcher's own thread has no request
         # context at all. Reading the scope on the worker would always see None
         # and silently reinstate per-file commits.
-        scope = current_commit_scope()
+        #
+        # Gated on the opt-in: a callback that cannot consume a batch must not
+        # pay for one. Attaching the scope unconditionally would buffer its
+        # writes for the length of the tool call and then replay them one by
+        # one — the delay and the retained state of grouping, with none of it.
+        scope = current_commit_scope() if self._accepts_batch else None
         with self._worker_lock:
             if self._closed:
                 logger.warning(
@@ -193,16 +206,18 @@ class WriteCallbackDispatcher:
     def end_scope(self, scope: CommitScope) -> None:
         """Close *scope*, committing everything fired under it as one group.
 
-        A no-op when no callback is configured, after :meth:`close`, or when
-        the worker was never started — in each case there is nothing buffered
-        to flush. Never blocks: the marker is enqueued and the worker flushes
-        it in FIFO order, behind every write the scope fired.
+        A no-op when no callback is configured, when the callback did not opt
+        into :data:`~markdown_vault_mcp.types.ACCEPTS_BATCH_ATTR`, after
+        :meth:`close`, or when the worker was never started — in each case
+        nothing was buffered under this scope, so there is nothing to flush.
+        Never blocks: the marker is enqueued and the worker flushes it in FIFO
+        order, behind every write the scope fired.
 
         Args:
             scope: The scope to close, as returned by
                 :func:`~markdown_vault_mcp._commit_scope.bound_commit_scope`.
         """
-        if self._on_write is None:
+        if self._on_write is None or not self._accepts_batch:
             return
         with self._worker_lock:
             if self._closed or self._worker is None:
@@ -223,14 +238,10 @@ class WriteCallbackDispatcher:
         if not items or on_write is None:
             return
         try:
-            if self._accepts_batch:
-                batch = cast("BatchAwareWriteCallback", on_write)
-                batch.on_write_batch(items, scope.tool_name)
-            else:
-                # No batch support: preserve the previous contract exactly
-                # rather than dropping writes a third-party callback expects.
-                for item in items:
-                    self._dispatch_one(*item)
+            # Only a callback that opted in is ever buffered (see ``fire``),
+            # so reaching here means ``on_write_batch`` exists.
+            batch = cast("BatchAwareWriteCallback", on_write)
+            batch.on_write_batch(items, scope.tool_name)
         except Exception:
             logger.error(
                 "write_callback_batch_failed tool=%s count=%s",
@@ -325,7 +336,10 @@ class WriteCallbackDispatcher:
                     )
                     continue
                 _, items = self._open_scopes.setdefault(scope.token, (scope, []))
-                items.append((abs_path, content, operation, old_path, principal))
+                # Content is deliberately dropped: staging reads the file from
+                # disk, so retaining it would hold every written file's text
+                # for the length of the call with nothing to read it.
+                items.append((abs_path, operation, old_path, principal))
         except BaseException:
             # A BaseException (SystemExit/KeyboardInterrupt/MemoryError) kills the
             # worker thread. Log it so drain()/close() are not the only signal —

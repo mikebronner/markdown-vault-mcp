@@ -151,12 +151,28 @@ class TestGrouping:
 
 
 class TestBatchOptIn:
-    def test_callback_without_opt_in_still_gets_every_write(self) -> None:
-        """Grouping is an optimisation, never a contract change."""
+    def test_a_callback_without_the_opt_in_is_never_buffered(self) -> None:
+        """Grouping costs nothing to a callback that cannot receive a group.
+
+        Buffering a non-batch callback's writes would hold them for the length
+        of the tool call and then replay them one by one — the delay and the
+        retained content of grouping, with none of the benefit. So the scope is
+        attached only for a callback that opted in, and these writes reach the
+        callback *while the call is still running*, exactly as before.
+        """
         cb = _PlainRecorder()
-        dispatcher = WriteCallbackDispatcher(cb)
+        arrived = threading.Event()
+        cb_call = cb.__call__
+
+        def recording(*args: object) -> None:
+            cb_call(*args)  # type: ignore[arg-type]
+            arrived.set()
+
+        dispatcher = WriteCallbackDispatcher(recording)
         with bound_commit_scope("okf_convert_links") as scope:
             dispatcher.fire(Path("a.md"), "body", "write")
+            assert arrived.wait(timeout=10), "write was buffered instead of dispatched"
+            assert dispatcher._open_scopes == {}
             dispatcher.fire(Path("b.md"), "body", "delete")
             dispatcher.end_scope(scope)
         dispatcher.close()
@@ -343,44 +359,6 @@ class TestMiddleware:
             assert await self._run(middleware, context, seen) == "ok"
 
 
-class TestCommitModeKnob:
-    """The mode is opt-in: #54 designed per-write commits to stay the default."""
-
-    def test_default_strategy_does_not_batch(self) -> None:
-        from markdown_vault_mcp.git.strategy import GitWriteStrategy
-
-        strategy = GitWriteStrategy(token=None, enable_pull=False, enable_push=False)
-        assert strategy.accepts_batch is False
-
-    def test_tool_call_mode_enables_batching(self) -> None:
-        from markdown_vault_mcp.git.strategy import GitWriteStrategy
-
-        strategy = GitWriteStrategy(
-            token=None,
-            enable_pull=False,
-            enable_push=False,
-            commit_mode="tool-call",
-        )
-        assert strategy.accepts_batch is True
-
-    def test_git_config_defaults_to_per_write(self) -> None:
-        from markdown_vault_mcp.config_sections.git import GitConfig
-
-        assert GitConfig().commit_mode == "write"
-
-    def test_git_config_accepts_tool_call(self) -> None:
-        from markdown_vault_mcp.config_sections.git import GitConfig
-
-        assert GitConfig(commit_mode="tool-call").commit_mode == "tool-call"
-
-    def test_an_unknown_mode_is_rejected(self) -> None:
-        from markdown_vault_mcp.config_sections.git import GitConfig
-        from markdown_vault_mcp.exceptions import ConfigurationError
-
-        with pytest.raises(ConfigurationError, match="commit_mode must be one of"):
-            GitConfig(commit_mode="per-request")
-
-
 def _repo(tmp_path: Path) -> Path:
     """A git repo holding one committed note."""
     import subprocess
@@ -448,7 +426,6 @@ class TestBatchCommitsForReal:
             managed=False,
             enable_pull=False,
             enable_push=False,
-            commit_mode="tool-call",
             repo_path=repo,
         )
 
@@ -472,33 +449,33 @@ class TestBatchCommitsForReal:
         assert subjects[0] == "okf_convert_links: 4 files"
         assert _files_in_head(repo) == {f"n{i}.md" for i in range(4)}
 
-    def test_per_write_mode_still_commits_each_file(self, tmp_path: Path) -> None:
-        from markdown_vault_mcp.git.strategy import GitWriteStrategy
-
+    def test_writes_with_no_owning_tool_call_commit_individually(
+        self, tmp_path: Path
+    ) -> None:
+        """Background and startup writes have no scope, so nothing groups them."""
         repo = _repo(tmp_path)
-        strategy = GitWriteStrategy(
-            token=None,
-            repo_url=None,
-            managed=False,
-            enable_pull=False,
-            enable_push=False,
-            repo_path=repo,
-        )
+        strategy = self._strategy(repo)
         dispatcher = WriteCallbackDispatcher(strategy)
         before = len(_subjects(repo))
 
-        with bound_commit_scope("okf_convert_links") as scope:
-            for i in range(3):
-                target = repo / f"n{i}.md"
-                target.write_text(f"# {i}\n", encoding="utf-8")
-                dispatcher.fire(target, f"# {i}\n", "write")
-            dispatcher.end_scope(scope)
+        for i in range(3):
+            target = repo / f"n{i}.md"
+            target.write_text(f"# {i}\n", encoding="utf-8")
+            dispatcher.fire(target, f"# {i}\n", "write")
         dispatcher.close()
         strategy.close()
 
         assert len(_subjects(repo)) == before + 3
+        assert _subjects(repo)[0] == "write: n2.md"
 
-    def test_a_single_file_commit_reads_naturally(self, tmp_path: Path) -> None:
+    def test_a_single_file_call_still_commits_under_its_path(
+        self, tmp_path: Path
+    ) -> None:
+        """#1264 is explicit that per-file granularity is right for one file.
+
+        Grouping must not turn every ordinary ``write`` into ``write: 1 file``
+        and cost ``git log`` the path it has always carried.
+        """
         repo = _repo(tmp_path)
         strategy = self._strategy(repo)
         dispatcher = WriteCallbackDispatcher(strategy)
@@ -511,7 +488,7 @@ class TestBatchCommitsForReal:
         dispatcher.close()
         strategy.close()
 
-        assert _subjects(repo)[0] == "write: 1 file"
+        assert _subjects(repo)[0] == "write: one.md"
 
     def test_a_batch_of_identical_content_commits_nothing(self, tmp_path: Path) -> None:
         """Rewriting the same bytes stages no diff, so there is nothing to commit."""
@@ -540,7 +517,7 @@ class TestBatchCommitsForReal:
         dispatcher.close()
         strategy.close()
 
-        assert _subjects(repo)[0] == "delete: 1 file"
+        assert _subjects(repo)[0] == "delete: note.md"
         assert _files_in_head(repo) == {"note.md"}
 
     def test_an_unstageable_path_does_not_cost_the_batch_its_commit(
@@ -571,9 +548,7 @@ class TestBatchCommitsForReal:
         strategy.close()
 
         (repo / "after.md").write_text("# After\n", encoding="utf-8")
-        strategy.on_write_batch(
-            [(repo / "after.md", "# After\n", "write", None, None)], "write"
-        )
+        strategy.on_write_batch([(repo / "after.md", "write", None, None)], "write")
 
         assert len(_subjects(repo)) == before
 
@@ -601,12 +576,11 @@ class TestBatchCommitsForReal:
             managed=False,
             enable_pull=False,
             enable_push=False,
-            commit_mode="tool-call",
             repo_path=outside,
         )
 
         # Must not raise.
-        strategy.on_write_batch([(note, "# N\n", "write", None, None)], "write")
+        strategy.on_write_batch([(note, "write", None, None)], "write")
         strategy.close()
 
     def test_a_failing_commit_is_logged_not_raised(
@@ -618,8 +592,13 @@ class TestBatchCommitsForReal:
 
         repo = _repo(tmp_path)
         strategy = self._strategy(repo)
-        note = repo / "x.md"
-        note.write_text("# X\n", encoding="utf-8")
+        # Two files: one item would delegate to the single-write path, and this
+        # is about the batch commit's own error handling.
+        notes = []
+        for name in ("x.md", "y.md"):
+            note = repo / name
+            note.write_text(f"# {name}\n", encoding="utf-8")
+            notes.append(note)
 
         real_run = subprocess.run
 
@@ -632,7 +611,9 @@ class TestBatchCommitsForReal:
             mock.patch("markdown_vault_mcp.git.strategy.subprocess.run", _explode),
             caplog.at_level(logging.ERROR),
         ):
-            strategy.on_write_batch([(note, "# X\n", "write", None, None)], "write")
+            strategy.on_write_batch(
+                [(note, "write", None, None) for note in notes], "okf_convert_links"
+            )
         strategy.close()
 
         assert any("git_batch_failed" in r.message for r in caplog.records)
@@ -645,8 +626,8 @@ class TestBatchCommitsForReal:
 
         strategy.on_write_batch(
             [
-                (repo / "ghost-a.md", "", "write", None, None),
-                (repo / "ghost-b.md", "", "write", None, None),
+                (repo / "ghost-a.md", "write", None, None),
+                (repo / "ghost-b.md", "write", None, None),
             ],
             "okf_convert_links",
         )

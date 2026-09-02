@@ -8,8 +8,10 @@ timed out.
 
 This module supplies the missing boundary. A :class:`CommitScopeMiddleware`
 binds a scope for the duration of each tool call; the dispatcher snapshots that
-scope when a write is fired and groups the call's writes into **one** commit,
-named after the tool that caused them.
+scope when a write is fired and groups the call's writes into **one** commit.
+A call that touched many files is named after the tool that caused them; a call
+that touched exactly one keeps that file's own path as the subject, so ordinary
+writes read in ``git log`` exactly as they always have.
 
 The scope travels in a :class:`~contextvars.ContextVar` and is read in
 ``fire``, never on the dispatcher's worker thread — the same constraint that
@@ -55,8 +57,9 @@ class CommitScope:
         token: Process-unique id distinguishing concurrent invocations. Two
             calls to the same tool get different tokens, so their writes are
             never merged into one commit.
-        tool_name: The MCP tool that opened the scope, used as the commit
-            subject.
+        tool_name: The MCP tool that opened the scope. Becomes the commit
+            subject when the call wrote more than one file; a single-file
+            call commits under that file's own path instead.
     """
 
     token: int

@@ -75,10 +75,12 @@ class GitWriteStrategy:
     2. Commits with an auto-generated message (``"operation: path"``).
     3. Resets the push timer — push fires after ``push_delay_s`` of idle.
 
-    When the dispatcher groups a tool call's writes (#1264) it calls
-    :meth:`on_write_batch` instead, which stages every path the same scoped way
-    and commits them once as ``"<tool>: N files"``. A write with no owning tool
-    call still takes the per-write path above.
+    Writes fired by one MCP tool call are grouped by the dispatcher (#1264)
+    and arrive at :meth:`on_write_batch`, which stages every path the same
+    scoped way and commits them once as ``"<tool>: N files"``. A call that
+    touched a single file commits under that file's own path instead, so
+    ordinary writes read in ``git log`` exactly as they always have. A write
+    with no owning tool call takes the per-write path above.
 
     Push is deferred to a background ``threading.Timer`` that resets on
     each write.  When the timer fires (no writes for ``push_delay_s``),
@@ -151,7 +153,6 @@ class GitWriteStrategy:
         commit_name_claim: str | None = None,
         commit_email_claim: str | None = None,
         git_lfs: bool = True,
-        commit_mode: str = "write",
         repo_path: Path | None = None,
     ) -> None:
         # Token is retained for GIT_ASKPASS credential forwarding in subprocesses.
@@ -168,10 +169,6 @@ class GitWriteStrategy:
         self._commit_name_claim = commit_name_claim
         self._commit_email_claim = commit_email_claim
         self._git_lfs = git_lfs
-        # accepts_batch is read once by the dispatcher at construction, so the
-        # mode has to be an instance attribute shadowing the class default
-        # rather than a check inside on_write_batch (#1264).
-        self.accepts_batch = commit_mode == "tool-call"
         # Retain the configured repo_path so methods invoked after construction
         # (e.g. force_pull / force_push) can reach the working tree without
         # the caller re-passing it.  Distinct from ``_pull_repo_path`` which
@@ -298,12 +295,13 @@ class GitWriteStrategy:
     accepts_principal: bool = True
 
     #: Opt into the dispatcher's batched dispatch (#1264), so every write from
-    #: one tool call lands in a single commit named after that tool instead of
-    #: one commit per file. Set per instance from ``commit_mode``; the class
-    #: default is ``False`` because #54 designed the new mode as opt-in with
-    #: per-write commits remaining the default. See
+    #: one tool call lands in a single commit instead of one commit per file.
+    #: Always on: with a single-file call still committing under its own path
+    #: (see :func:`_stage_and_commit_batch`), grouping differs from per-write
+    #: commits only where one call touches many files — which is the defect
+    #: #1264 reports, not a preference to configure. See
     #: :data:`~markdown_vault_mcp.types.ACCEPTS_BATCH_ATTR`.
-    accepts_batch: bool = False
+    accepts_batch: bool = True
 
     def on_write_batch(
         self,
@@ -313,9 +311,10 @@ class GitWriteStrategy:
         """Commit every write from one tool call as a single commit.
 
         Mirrors :meth:`__call__`'s guards and push scheduling; only the commit
-        boundary differs. The author identity is taken from the first item's
-        principal — one tool call has one acting principal, so the items cannot
-        legitimately disagree.
+        boundary differs, and for a call that wrote a single file not even
+        that — see :func:`_stage_and_commit_batch`. The author identity is
+        taken from the first item's principal: one tool call has one acting
+        principal, so the items cannot legitimately disagree.
 
         Args:
             items: The tool call's writes, in the order they were fired.
@@ -336,7 +335,7 @@ class GitWriteStrategy:
         if self._git_root is None:
             return
 
-        principal = items[0][4]
+        principal = items[0][3]
         principal_name = principal.display_name if principal is not None else None
         principal_email = principal.email if principal is not None else None
         effective_name = principal_name or self._commit_name
@@ -1898,15 +1897,38 @@ def _stage_and_commit_batch(
     batch never widens what gets swept in: a delete still stages only its own
     path, and a rename still stages exactly its two. Only the commit is shared.
 
+    A one-item batch delegates to :func:`_stage_and_commit` instead, so the
+    commit subject stays that file's own path rather than becoming the
+    pathless ``"write: 1 file"``; *tool_name* is unused on that branch.
+
     Args:
         git_root: Git repository root.
         items: The tool call's writes, in the order they were fired.
-        tool_name: MCP tool that produced them, used as the commit subject.
+        tool_name: MCP tool that produced them, used as the commit subject
+            when the batch holds more than one write.
         identity: Committer and author identity for the commit.
     """
+    if len(items) == 1:
+        # A single-file call is the overwhelmingly common one, and #1264 is
+        # explicit that per-file granularity is right for it. Delegating keeps
+        # its commit subject the path ("write: notes/one.md") rather than the
+        # pathless "write: 1 file", and keeps one copy of that subject format.
+        path, operation, old_path, _principal = items[0]
+        _stage_and_commit(
+            git_root,
+            path,
+            operation,
+            old_path=old_path,
+            commit_name=identity.commit_name,
+            commit_email=identity.commit_email,
+            author_name=identity.author_name,
+            author_email=identity.author_email,
+        )
+        return
+
     root = str(git_root)
     staged = 0
-    for path, _content, operation, old_path, _principal in items:
+    for path, operation, old_path, _principal in items:
         try:
             if _stage_one(root, path, operation, old_path):
                 staged += 1
